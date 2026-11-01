@@ -9,14 +9,14 @@
     * `SWEET EARLY 2: PE_init_platform done`
     * `SWEET EARLY 3: ml_parse_cpu_topology done`
     * `SWEET EARLY 4: cpu_bootstrap done`
-    * `SWEET EARLY PANIC: Undefined kernel instruction: pc=0xfffffe000734d530 instr=b0200020 @sleh.c:995`
+    * `SWEET EARLY PANIC: Undefined kernel instruction: pc=0xfffffe000734d530 instr=b8200020 @sleh.c:995`
   - **Root Cause Analysis:**
-    * In `0004-sweet-machine-config.patch`, machine flags were configured as `-march=armv8.2-a+crypto`.
-    * ARMv8.2 includes ARMv8.1-A Large System Extensions (LSE atomic instructions like `casa`, `ldset`, `swp`).
-    * Redmi Note 10 Pro (Cortex-A76) and Poco F1 (Cortex-A75) are ARMv8.2-A CPUs with hardware LSE.
-    * In contrast, Redmi Note 13 4G (SM6225 Bengal) Kryo 260 Gold cores are Cortex-A73 (ARMv8.0-A), which completely lacks ARMv8.1 LSE atomics.
-    * When `_lck_mtx_lock` attempted `casa x2, x21, [x9]` during startup locks bootstrap, the Cortex-A73 CPU trapped with `ESR_EC_UNCATEGORIZED` (undefined instruction exception).
-  - **Fix Applied:** Changed `MACHINE_FLAGS_ARM64_SWEET` from `-march=armv8.2-a+crypto` to `-march=armv8-a+crypto` in both `xnu/patches/0004-sweet-machine-config.patch` and `xnu/patches-11215/0004-sweet-machine-config.patch`. Clang now emits universal ARMv8.0-A load-linked / store-conditional (`ldaxr`/`stlxr`) loops for all locks and atomics, fully compatible with Cortex-A73.
+    * In `0004-sweet-machine-config.patch`, machine flags were previously configured as `-march=armv8.2-a+crypto`.
+    * Even after changing to `-march=armv8-a+crypto`, Apple Clang defaults `-arch arm64` to Apple Silicon targets where LSE (`FeatureLSE`) is enabled by default.
+    * This defined `__ARM_FEATURE_ATOMICS`, causing Clang and `OSAtomicOperations.s` to emit ARMv8.1-A LSE instructions (117 CAS instructions and 972 atomic ld/st instructions like `0xb8200020` = `ldadd w0, w0, [x1]`).
+    * Redmi Note 13 4G (SM6225 Bengal) Kryo 260 Gold cores are Cortex-A73 (ARMv8.0-A), which completely lacks ARMv8.1 LSE atomics.
+    * When `_OSAddAtomic` was called during kernel bootstrap, the Cortex-A73 Gold core trapped on `ldadd w0, w0, [x1]` with `ESR_EC_UNCATEGORIZED` (`Undefined kernel instruction`), triggering panic at `sleh.c:995`.
+  - **Fix Applied:** Changed `MACHINE_FLAGS_ARM64_SWEET` to `-march=armv8-a+crypto+nolse -mno-lse` in both `xnu/patches/0004-sweet-machine-config.patch` and `xnu/patches-11215/0004-sweet-machine-config.patch`. This explicitly disables LSE atomics in Apple Clang, preventing definition of `__ARM_FEATURE_ATOMICS` and forcing generation of universal ARMv8.0-A `ldxr`/`stxr` loops across the entire kernel.
 * **2026-11-01: Framebuffer Mapping & Console Handoff Fix (Milestone 4 -> Milestone 5):**
   - **Issue identified:** Physical device froze at `XNU jumping (fbcon clears screen)` because:
     1. Earlier CI runs on `main` defaulted to `MACOS_VERSION=13.5` (iOS 16 / xnu-8796) and ignored `xnu/patches-11215/`.
