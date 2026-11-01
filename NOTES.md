@@ -54,12 +54,12 @@
      - Ensure continuous splash framebuffer address `0x5c000000` is active.
   3. **Verification:**
      - Boot updated kernel via `fastboot boot enxerto/out/enxerto-boot.img`. Verify Darwin advances past context switch to rootfs mount (`IOFindBSDRoot`).
-* **2026-11-01: Automated CI & Source Patches for PAN/LSE Bypass (Sapphire / Cortex-A73):**
-  - **Patches Added:**
-    * `xnu/patches/0163-sweet-pcb-disable-pan-panic.patch` & `xnu/patches-11215/0254-sweet-pcb-disable-pan-panic.patch`: Disables PAN check panics in `machine_switch_context` and `machine_stack_handoff` when `#if __ARM_PAN_AVAILABLE__ && !defined(SWEET)`.
-    * `xnu/patches/0164-sweet-emulate-pan-lse-trap.patch` & `xnu/patches-11215/0255-sweet-emulate-pan-lse-trap.patch`: Hardware emulation/skip in `sleh_synchronous` for `msr pan`, `mrs pan` (returns 1), and stray `ldadd`/`stadd` instructions from prebuilt objects.
+* **2026-11-01: Automated CI & Source Patches for PAN/LSE Bypass (Sapphire / Cortex-A73 - iOS 18 Focus):**
+  - **Patches Added (iOS 18 series: `xnu/patches-11215/`):**
+    * `xnu/patches-11215/0254-sweet-pcb-disable-pan-panic.patch`: Disables PAN check panics in `machine_switch_context` and `machine_stack_handoff` when `#if __ARM_PAN_AVAILABLE__ && !defined(SWEET)`.
+    * `xnu/patches-11215/0255-sweet-emulate-pan-lse-trap.patch`: Hardware emulation/skip in `sleh_synchronous` for `msr pan`, `mrs pan` (returns 1), and stray `ldadd`/`stadd` instructions from prebuilt objects.
   - **CI Workflow Updated (`.github/workflows/xnu.yml`):**
-    * Default `MACOS_VERSION` on `main` set to `15.3` (xnu-11215).
+    * Default `MACOS_VERSION` on `main` set strictly to `15.3` (xnu-11215 / iOS 18).
     * Injected `OTHER_CFLAGS_arm64="-march=armv8-a+crypto+nolse -U__ARM_FEATURE_ATOMICS"` into `libfirehose_kernel` build.
     * Added automated post-build binary stubbing step in CI: stubs `_firehose_trace_metadata`, `___firehose_buffer_tracepoint_flush`, and `_firehose_buffer_ring_enqueue` with `RET` (`0xd65f03c0`) in the output kernel Mach-O.
     * Synced updated workflow to `C:\Users\hungtv\Downloads\xnu.yml`.
