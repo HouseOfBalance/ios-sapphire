@@ -3,17 +3,17 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
-* **Current Status (2026-11-01): HOME INDICATOR LIVE! SAPPHIRE TOUCH & PHYSICAL KEYS DRIVERS WIRED UP**
+* **Current Status (2026-11-01): DRIVERS LIVE & BOOTED! SAPPHIRE TOUCH & HARDWARE KEYS ARTIFACT RUNNING ON DEVICE**
   - **Live Hardware Milestone Confirmed on Physical AMOLED Screen (`media_1793547590432_f481bce7.png`):**
     - Darwin kernel booted all the way into userland!
     - `launchd`, `backboardd`, `SpringBoard`, and `CoreAnimation` initialized.
     - Native rounded horizontal iPhone Home Indicator / swipe bar is visible at the bottom of the AMOLED panel!
-  - **Identified Blocker: Lack of User Input / Touch Responsiveness:**
-    - User reported: "kh có thao tác phản hồi nào, cần patch thêm" (No response when touching screen or pressing buttons).
-    - *Root Cause 1 (Touch):* In `xnu/patches-11215/0251-sapphire-sm6225-board-support.patch`, `sweet_touch.c` was a no-op stub that printed a log line and immediately returned (`return;`). No I2C bus initialization, no GPIO configuration, and no touch event reports were active.
-    - *Root Cause 2 (Keys):* In `bsd/dev/sweet_keys.c`, Volume Up PPID defaulted to `0x4c1` (SID 4) which does not exist on sapphire (PM6125 is SID 0).
-    - *Root Cause 3 (TLMM Address):* `st.gpio` was mapping `TOUCH_NORTH_PA` (`0x03900000u`) instead of SM6225's TLMM WEST tile (`0x00500000u`).
-  - **Exhaustive Fixes Implemented in `xnu/patches-11215/0251-sapphire-sm6225-board-support.patch`:**
+  - **Driver Implementation & Build Details:**
+    - GitHub Actions Workflow Run `41325603836` completed with SUCCESS.
+    - Official artifact `xnu-kernel` (id `13090599726`) downloaded and verified containing strings `FT3519T`, `sapphire TLMM`, and `keys_gpio_base`.
+    - Boot image `enxerto-boot.img` (18825216 bytes) built with payload containing cmdline: `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam sweetearlyfb=1 sweethidtest=3`.
+    - Booted to physical device via `fastboot boot enxerto/out/enxerto-boot.img` at 23:31:59 local time.
+  - **Implemented Hardware Input Drivers:**
     1. **Sapphire Touchscreen Driver (`bsd/dev/sweet_touch.c`):**
        - Defined `touch_sapphire` with SE2 (`0x04a88000`), SDA GPIO 6, SCL GPIO 7, IRQ GPIO 80, reset GPIO 86, 1080x2400.
        - Implemented `touch_sapphire_start()`:
@@ -28,11 +28,9 @@
        - Configured PM6125 (SID 0) GPIO 5 for Volume Up: `keys_gpio_base = 0xc400u`, `keys_gpio_ppid = 0x0c4u`.
        - Power button (PON bit 0) and Volume Down (PON bit 1) read from SID 0 PON `0x0810`.
     3. **Automated Home Button Injection (`sweethidtest`):**
-       - Supports `sweethidtest=3` to dispatch `kHIDUsage_Csmr_Menu` (Home key) every 3 seconds to trigger lock screen unlock animation.
-  - **Validation & CI Status:**
-    - Validated all 379 patch files using `tools/validate-repo.py` (ALL PASSED).
-    - Verified clean `git apply` against tree with 0 errors.
-    - Official CI Run `41322260083` completed with SUCCESS, producing clean `xnu-kernel`.
+       - Enabled `sweethidtest=3` to dispatch `kHIDUsage_Csmr_Menu` (Home key) every 3 seconds to trigger lock screen unlock animation.
+    4. **Workflow Configuration Fix:**
+       - Corrected `.github/workflows/xnu.yml` line 58 from `'13.5'` to `'15.3'` so git pushes on `main` default to `macos-15` runner.
 
 * **Device Target & Hardware Profile:**
   - Codename: `sapphire` (Xiaomi Redmi Note 13 4G)
