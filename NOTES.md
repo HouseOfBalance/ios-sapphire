@@ -3,6 +3,27 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
+* **Current Status (2026-11-01): 100% GREEN CI BUILD FOR iOS 18 (xnu-11215) & BOOT IMAGE PACKAGED**
+  - **GitHub Actions Run 41307011249:** Succeeded 100% (conclusion: `success`) on commit `c7e2221`.
+  - **Root Cause & Fixes for iOS 18 Build Failures:**
+    1. *Patch Line Offsets for xnu-11215:* Patches `0251`, `0252`, `0254`, `0255` had old iOS 16 (`xnu-8796`) context. Extracted actual iOS 18 source tree from CI runner (`xnu-buildtree`) and realigned context:
+       - `SweetFramebuffer.cpp`: mdpProbe/AppleARMBacklight context lines updated to 659 and 784 (after patches 0210-0249).
+       - `arm_vm_init.c`: framebuffer VA mapping updated to line 1866.
+       - `start.s`: early splash band and bootstrap TTE mapping updated to line 524 and 697.
+       - `sweet_early.c`: `sweet_early_set_video` updated to line 201.
+       - `pcb.c`: context switch / stack handoff PAN check updated to line 311 and 782.
+       - `sleh.c`: `handle_uncategorized` emulation hook updated to line 1128.
+    2. *SweetAdreno.cpp Board Header:* Added `#include "../../../bsd/dev/sweet_board.h"` so `sweet_board_sapphire()` is declared.
+    3. *ARM64 Immediate Range in start.s:* `add x0, x0, #(2368 * 4320)` exceeded the 12-bit ARM64 immediate range; replaced with `MOV64 x1, (2368 * 4320)` followed by `add x0, x0, x1`.
+    4. *Workflow Firehose Stub Step:* Updated `.github/workflows/xnu.yml` to filter for real `Mach-O` binaries using `file "$k" | grep -q 'Mach-O'`, preventing it from trying to parse `.alias.exp` text files as Mach-O.
+  - **Local Artifacts:**
+    - Clean Official Kernel: `xnu/out/kernel.development.sweet` (18,986,256 bytes, downloaded from CI run 41307011249).
+    - Packed Kernel Payload: `enxerto/out/payload.bin` (generated via `tools/mkpayload.py`).
+    - Boot Image: `enxerto/out/enxerto-boot.img` (18,808,832 bytes, SHA256: `9f5a6b81b65c064e...`).
+  - **Ready for Hardware Boot:**
+    - Device detected in fastboot: `92d1151e fastboot`.
+    - Boot command: `c:\Users\hungtv\Downloads\platform-tools\fastboot.exe boot enxerto/out/enxerto-boot.img`.
+
 * **Device Target & Hardware Profile:**
   - Codename: `sapphire` (Xiaomi Redmi Note 13 4G)
   - SoC: Qualcomm Snapdragon 685 (SM6225 Bengal)
