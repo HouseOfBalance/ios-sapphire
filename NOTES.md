@@ -3,7 +3,7 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
-* **Current Status (2026-11-01): SWEET EARLY 1 THROUGH 20 PASSED! LDAPR (RCpc) TO NATIVE LDAR CONVERTED**
+* **Current Status (2026-11-01): SWEET EARLY 1 THROUGH 20 PASSED! LDAPR->LDAR & KPRINTF CONSOLE STREAM FIX**
   - **Live Observation from Photo (`media_1793538552651_e9d10230.jpg`):**
     - **CRITICAL MILESTONE ACHIEVED ON PHYSICAL HARDWARE:**
       * `SWEET EARLY 1: arm_init entered (MMU on)`
@@ -29,18 +29,24 @@
     - **Trap Encountered at Mark 20:**
       * `SWEET EARLY PANIC: Undefined kernel instruction: pc=0xfffffe00074e730c instr=b8bfc114 @sleh.c:1256`
   - **Root Cause & Technical Breakdown:**
-    - `pc=0xfffffe00074e730c` is inside `_kptimer_curcpu_up` (`kptimer.c`, invoked right after `cpu_timebase_init`).
-    - `0xb8bfc114` is `ldapr w20, [x8]` (ARMv8.3-A RCpc - Load-Acquire RCpc).
+    - `pc=0xfffffe00074e730c` was inside `_kptimer_curcpu_up` (`kptimer.c`, invoked right after `cpu_timebase_init`).
+    - `0xb8bfc114` was `ldapr w20, [x8]` (ARMv8.3-A RCpc - Load-Acquire RCpc).
     - Cortex-A73 is ARMv8.0-A and lacks the RCpc extension (`ARMv8.2-A-RCpc`).
     - Bitwise conversion from `LDAPR` to ARMv8.0-A native `LDAR`:
       `ldar = (ldapr & 0xc00003ff) | 0x08dffc00`
       `0xb8bfc114` (`ldapr w20, [x8]`) becomes `0x88dffd14` (`ldar w20, [x8]`).
-  - **Fixes Applied:**
-    1. *Kernel Binary:* Replaced all 280 `LDAPR` (`(w & 0x3ffffc00) == 0x38bfc000`) instructions in `__TEXT_EXEC` with native ARMv8.0-A `LDAR`.
-    2. *CI Workflow (`.github/workflows/xnu.yml`):* Added automated conversion of all `LDAPR` instructions to native `LDAR` in post-build step.
-    3. *Source Emulation (`0255-sweet-emulate-pan-lse-trap.patch`):* Added `LDAPR` / `LDAPRB` / `LDAPRH` emulation in `sleh.c` as a safety net.
-    4. *Commits:* `1dab6c6` pushed to `main`.
-    5. *Hardware Boot:* Rebuilt `payload.bin` and `enxerto-boot.img` (SHA256: `393dda07a71723b7...`). Executed `fastboot boot enxerto/out/enxerto-boot.img`.
+  - **Investigation of Freeze at Mark 20:**
+    1. Mark 20 is the *final* early diagnostic stage in XNU.
+    2. Right after Mark 20, `arm_init` calls `sweet_early_disable()`, setting `early_disabled = 1`.
+    3. In Apple's DEVELOPMENT kernels, `kprintf_output` is silenced by default unless `-enable_kprintf_spam` is present in the boot-args (`pe_kprintf.c`).
+    4. Without `-enable_kprintf_spam`, all subsequent kernel logs from Darwin startup (Mach zones, threads, scheduler, IOKit) were dropped, leaving the screen appearing frozen at Mark 20.
+    5. NOP'd `sweet_early_disable()` with `RET` (`0xd65f03c0`) at file offset `0x514044` so early console stays alive.
+    6. Re-generated `payload.bin` and `enxerto-boot.img` with command line:
+       `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam sweetearlyfb=1`.
+    7. Cleaned up patch format in `0252` (exact line counts matching c7e2221 with `b Lsweet_no_band`) and `0255` (3-line unique context).
+  - **Boot Test:**
+    - Re-packaged image `enxerto/out/enxerto-boot.img` (18,808,832 B, SHA256: `d54de8369aac5bdc...`).
+    - Sent via fastboot: `fastboot boot enxerto/out/enxerto-boot.img` (OKAY 0.914s).
 
 * **Device Target & Hardware Profile:**
   - Codename: `sapphire` (Xiaomi Redmi Note 13 4G)
