@@ -28,6 +28,16 @@
       * Physical Timer: INTID 18 (`0x12`), 30/30 IRQs received (`irqs=0x1e`).
       * SGI1: INTID 1, 10/10 IPIs received (`irqs=0x0a`, `other=0`).
       * Framebuffer: `0x5c000000` (1080x2400) rendering text on AMOLED panel perfectly.
+  - **XNU Kernel Payload Integration & Live Boot Hand-off (2026-11-01 - VERIFIED ON DEVICE):**
+    - Extracted `kernel.development.sweet` (17,496,224 B) from GitHub Actions run 41278542271 (`xnu-kernel.zip`).
+    - Fixed Silver-core 16K translation crash: Cortex-A53 Silver cores lack 16K granule (`TGran16 == 0`), which hung at `PAYLOAD OK`. Implemented Gold core hand-off in `enxerto/enxerto.c`: Silver core CPU0 wakes Gold core 0 (`MPIDR 0x100`, Cortex-A73) via `PSCI_CPU_ON`, Silver sleeps via `PSCI_CPU_OFF`, Gold prepares GIC redistributors (`gold_gicr_prepare`), sets max clock (`cpufreq_max`), and executes loader.
+    - Set kernel RAM in Highmem bank (`dram-base = 0x100000000`, 4GB) via `mkadt.py --highmem` so kernel segments never collide with the bootloader Image at `0x80080000`.
+    - Enabled `BOOTUI_LOG = 1` for on-screen debug log below the Bergamota logo.
+    - **Physical Device Boot Verification:** Live `fastboot boot enxerto/out/enxerto-boot.img` executed on Redmi Note 13 4G:
+      * Phone rendered BERGAMOTA PROJECT logo and progress bar to 100% ("STARTING IOS").
+      * Live console log: `ENTRY FFFFFFE00074A0488`, `MMU rc=00000000 l3=00000003`, `SEGS n=0000000A end=0253C000`, `BOOTARG pa=02540000 top=02544000`, `JUMP 00000001014A0488`, `XNU jumping (fbcon clears screen)`.
+      * Clean CPU jump to Darwin/XNU entry point `0x1014a0488` on Gold core `0x100`!
+    - Configured console redirect boot-args: `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam` so `sweet-fbcon` takes over the AMOLED display.
   - **Tool & Integrity Bug Fixes (2026-11-01):**
     - `tools/bergamota-flash.py`: Fixed Windows compatibility crash caused by missing `os.pread()` by implementing thread-safe `_lock` + `lseek` + `read` fallback and `O_BINARY` flag. Verified 45/45 checks pass in `tools/test_bergamota_flash.py`.
     - `tools/validate-repo.py`: Fixed Windows console `UnicodeEncodeError`, added support for sub-patch suffixes (`0082b`, `0102b`), validated both `xnu/patches` and `xnu/patches-11215` (158 + 216 patches verified).
