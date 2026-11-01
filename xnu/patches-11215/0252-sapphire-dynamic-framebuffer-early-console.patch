@@ -84,7 +84,7 @@ index 7dcca46..ebde5ed 100644
  static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
  static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
  static uint64_t early_off;
-@@ -200,11 +201,12 @@ sweet_early_flush_log(void)
+@@ -200,12 +201,12 @@ sweet_early_flush_log(void)
  void
  sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
  {
