@@ -3,6 +3,25 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> Port preparation for Redmi Note 13 4G (sapphire / SM6225 Bengal) on iOS 18 (xnu-11215) <<<
+* **2026-11-01: Darwin Kernel Console Streams on Sapphire AMOLED Display!**
+  - **Live Device Observation (Photo media_1793527740344_ffa0164f.jpg):**
+    * **DARWIN CONSOLE CLEARED TO BLACK AND STREAMED LOGS LIVE!**
+    * `xnu-8796.141.3`
+    * `pmap_startup() init/release time: 7840 microsec`
+    * `vm_page_bootstrap: 255413 free pages, 3403 wired pages`
+    * `VM bootstrap: 97 maps, 204 entries and 512 holes available`
+    * `zone_init: map VM ... RO ... GEN0 ... GEN1 ... GEN2 ... GEN3 ... DATA ... metadata ... metabits ...`
+    * `VM bootstrap done: 85 maps, 165 entries and 581 holes left`
+    * `IOKit IOMD setownership ENABLED`
+    * `... subsystem is initialized`
+    * Near end of log, panic encountered: `Undefined kernel instruction: pc=0xfffffe00072f8a0c instr=f8280128 @sleh.c:995`
+  - **Root Cause Analysis:**
+    * `pc=0xfffffe00072f8a0c` is inside `___firehose_buffer_tracepoint_flush` in `libfirehose_kernel.a` (Apple's prebuilt static library for unified logging).
+    * `0xf8280128` is `ldadd x8, x8, [x9]` (ARMv8.1-A atomic add).
+    * When `OSKextLogKextInfo` was called upon loading kexts / IOMD ownership, it invoked `_firehose_trace_metadata` to log to the unified log ring buffer, hitting `ldadd`.
+  - **Fix Applied:**
+    * Stubbed firehose logging entry points (`_firehose_trace_metadata`, `___firehose_buffer_tracepoint_flush`, and `_firehose_buffer_ring_enqueue`) with `ret` (`0xd65f03c0`). Firehose tracepoints are optional diagnostic logging and non-essential for kernel boot.
+    * Rebuilt `enxerto/out/payload.bin` and `enxerto/out/enxerto-boot.img`. Ready for immediate boot test.
 * **2026-11-01: Milestone 5 & 6 PASSED! ARMv8.1 PAN Incompatibility Discovered & NOP-ed:**
   - **Live Device Observation (Photo media_1793527434362_9f1b7d42.png):**
     * `SWEET EARLY 1: arm_init entered (MMU on)`
