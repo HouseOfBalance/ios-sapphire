@@ -200,11 +200,18 @@ jobs:
           # Apple's closed SDK objects that ignore our OTHER_CFLAGS_arm64. Stub the
           # three firehose tracepoint entry points with RET (0xd65f03c0) so they
           # never execute. The sleh.c emulation trap is a second safety net.
-          KERNEL=$(find dxb/fakeroot/System/Library/Kernels -name 'kernel.*' -type f | head -1)
+          KERNEL=""
+          for k in $(find dxb/fakeroot/System/Library/Kernels -name 'kernel.*' -type f); do
+            if file "$k" | grep -q 'Mach-O'; then
+              KERNEL="$k"
+              break
+            fi
+          done
           if [ -z "$KERNEL" ]; then
             echo "No kernel binary found, skipping firehose stub"
             exit 0
           fi
+          echo "Target kernel binary: $KERNEL"
           python3 - "$KERNEL" <<'STUB_PY'
           import struct, sys, subprocess
           kernel_path = sys.argv[1]
