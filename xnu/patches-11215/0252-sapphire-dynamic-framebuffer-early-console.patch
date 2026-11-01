@@ -6,6 +6,7 @@ sweet_early_map_final to take the framebuffer physical address dynamically
 from boot_args->Video.v_baseAddr. On sapphire (SM6225 / Bengal), ABL's continuous
 splash framebuffer is at 0x5c000000 (1080x2400), whereas on sweet it is at
 0x9c000000 and on beryllium at 0x9d400000.
+Remove Stage 0 direct MMIO write in start.s before MMU is turned on.
 ---
 diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
 index 3c2a9f7..dbb9d10 100644
@@ -34,27 +35,29 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e8f555e..b49426b 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -524,7 +524,10 @@ LEXT(start_first_cpu)
+@@ -524,18 +524,6 @@ LEXT(start_first_cpu)
  
- #if defined(SWEET)
- 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-#if defined(SWEET)
+-	/* Stage 0: white 64x32 band, no stack or page tables needed. */
 -	MOV64	x0, (0x9c000000 + 2368 * 4320)
-+	ldr		x0, [x20, #40]			// boot_args->Video.v_baseAddr
-+	cbz		x0, Lsweet_no_band
-+	MOV64	x1, (2368 * 4320)
-+	add		x0, x0, x1
- 	mov		w1, #-1
- 	mov		x2, #32
- 	mov		x4, #4320
-@@ -539,6 +541,7 @@ Lsweet_mark_pixel:
- 	subs	x2, x2, #1
- 	b.ne	Lsweet_mark_row
- 	dsb		sy
-+Lsweet_no_band:
- #endif
+-	mov		w1, #-1
+-	mov		x2, #32
+-	mov		x4, #4320
+-Lsweet_mark_row:
+-	mov		x3, #64
+-	mov		x5, x0
+-Lsweet_mark_pixel:
+-	str		w1, [x5], #4
+-	subs	x3, x3, #1
+-	b.ne	Lsweet_mark_pixel
+-	add		x0, x0, x4
+-	subs	x2, x2, #1
+-	b.ne	Lsweet_mark_row
+-	dsb		sy
+-#endif
  
  	// Set low reset vector before attempting any loads
-@@ -695,13 +698,16 @@ Lkernelcache_base_found:
+@@ -695,13 +683,16 @@ Lkernelcache_base_found:
  	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
  	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
  	 */
@@ -95,6 +98,6 @@ index 7dcca46..ebde5ed 100644
 +		return;
  	}
 +	sweet_early_block_pa = pa & ~(EARLY_BLOCK_SIZE - 1);
- 	early_off = pa - EARLY_BLOCK_PA;
++	early_off = pa - sweet_early_block_pa;
  	early_width = (unsigned int)width;
  	early_height = (unsigned int)height;
