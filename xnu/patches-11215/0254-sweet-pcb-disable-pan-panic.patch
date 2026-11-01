@@ -1,27 +1,32 @@
+diff --git a/osfmk/arm64/pcb.c b/osfmk/arm64/pcb.c
+index 946f30a..c9f177b 100644
 --- a/osfmk/arm64/pcb.c
 +++ b/osfmk/arm64/pcb.c
-@@ -165,11 +165,13 @@ machine_switch_context(
- 	thread_t                        old,
- 	thread_continue_t               continuation,
- 	thread_t                        new)
+@@ -308,11 +308,11 @@ machine_switch_context(thread_t old,
  {
+ 	thread_t retval;
+ 
+-#if __ARM_PAN_AVAILABLE__
 +#if __ARM_PAN_AVAILABLE__ && !defined(SWEET)
  	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
  		panic("context switch with PAN disabled");
  	}
+-#endif
 +#endif /* __ARM_PAN_AVAILABLE__ && !SWEET */
  
- 	if (old == new) {
- 		return old;
- 	}
-@@ -173,8 +177,10 @@ machine_stack_handoff(
- 	thread_t                        old,
- 	thread_t                        new)
+ #define machine_switch_context_kprintf(x...) \
+ 	/* kprintf("machine_switch_context: " x) */
+@@ -779,11 +779,11 @@ machine_stack_handoff(thread_t old,
  {
+ 	vm_offset_t  stack;
+ 
+-#if __ARM_PAN_AVAILABLE__
 +#if __ARM_PAN_AVAILABLE__ && !defined(SWEET)
  	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
  		panic("stack handoff with PAN disabled");
  	}
+-#endif
 +#endif /* __ARM_PAN_AVAILABLE__ && !SWEET */
  
- 	if (__improbable(new->reserved_stack)) {
+ #if CONFIG_CPU_COUNTERS
+ 	kpc_off_cpu(old);

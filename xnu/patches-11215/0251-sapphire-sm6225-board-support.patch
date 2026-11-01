@@ -28,17 +28,27 @@ Includes:
  #endif /* _SWEET_BOARD_H_ */
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -395,8 +395,8 @@ AppleCLCD::start(IOService *provider)
- 		uint32_t secs = 10;
- 		PE_parse_boot_argn("sweetfb_statlog", &secs, sizeof(secs));
- 		fStLogSecs = secs;
+@@ -659,7 +659,7 @@ AppleCLCD::start(IOService *provider)
+ 			IOLog("SWEET FB: sweetfb_hud=%d: performance HUD %s (sysctl kern.sweet_fb_hud)\n", hud, hud ? "on" : "off");
+ 		}
  	}
 -	if (sweet_board_beryllium()) {
 +	if (sweet_board_beryllium() || sweet_board_sapphire()) {
  		mdpProbe();
  		int flip = 0;
  		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
-@@ -730,8 +730,9 @@ AppleCLCD::mdpProbe(void)
+@@ -784,6 +784,10 @@ AppleCLCD::start(IOService *provider)
+ 		int blfade = 1;
+ 		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
+ 		if (blfade) {
+ 			blInit();
+ 			int blsvc = 0;  /* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on */
++			if (sweet_board_sapphire()) {
++				/* sapphire AMOLED panel: keep AppleARMBacklight off to avoid CPU digital dimming */
++				blsvc = 0;
++			}
+ 			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
+@@ -1426,8 +1430,9 @@ AppleCLCD::mdpProbe(void)
  /* Read-only: which pipe scans ABL's framebuffer, and the display path state. */
  void
  AppleCLCD::mdpProbe(void)
@@ -49,16 +59,6 @@ Includes:
  	if (fMdp == 0) {
  		IOLog("SWEET MDP: map failed\n");
  		return;
-@@ -785,5 +786,9 @@ AppleCLCD::start(IOService *provider)
- 		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
- 		if (blfade) {
- 			blInit();
- 			int blsvc = 0;  /* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on */
-+			if (sweet_board_sapphire()) {
-+				/* sapphire AMOLED panel: keep AppleARMBacklight off to avoid CPU digital dimming */
-+				blsvc = 0;
-+			}
- 			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
 --- a/iokit/Kernel/arm/SweetAdreno.cpp
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
 @@ -191,6 +191,9 @@ SweetAdrenoPublish(void)
