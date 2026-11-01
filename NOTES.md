@@ -2,7 +2,75 @@
 
 ## Agent handoff / active work (2026-11-01, latest)
 
-### >>> Port preparation for Redmi Note 13 4G (sapphire / SM6225 Bengal) on iOS 18 (xnu-11215) <<<
+### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
+* **Device Target & Hardware Profile:**
+  - Codename: `sapphire` (Xiaomi Redmi Note 13 4G)
+  - SoC: Qualcomm Snapdragon 685 (SM6225 Bengal)
+  - CPU Cluster: 4x Kryo 260 Gold (Cortex-A73, ARMv8.0-A, MPIDR `0x100`..`0x103`) + 4x Kryo 260 Silver (Cortex-A53, parked due to missing 16K granule MMU `TGran16 == 0`).
+  - Display / Framebuffer: ABL continuous splash framebuffer at Physical Address `0x5c000000` (1080x2400 AMOLED, 32bpp, stride 4320 bytes).
+  - Storage: UFS 2.2 (`ufshc@4804000`, base `0x04804000`, size `0x3000`).
+
+* **Milestones Successfully Achieved & Verified Live on Hardware:**
+  1. **Bootloader (`enxerto`) & PSCI Handoff:**
+     - Pure Python build system (`enxerto/build.py`) generates Android boot image header v4 (`enxerto-boot.img`).
+     - Gold Core 0 (`MPIDR 0x100`) powered on via PSCI `CPU_ON`, 16K MMU initialized, clean jump into XNU entry point.
+  2. **Early Console (`SWEET EARLY 1` through `6`):**
+     - Framebuffer at `0x5c000000` mapped and verified on physical AMOLED panel (`media_1793527434362_9f1b7d42.png`).
+     - `arm_init`, `PE_init_platform`, `ml_parse_cpu_topology`, `cpu_bootstrap`, `kernel_startup_bootstrap`, and `cpu_init` completed.
+  3. **Darwin Subsystems & Apple Clutch Scheduler Initialized:**
+     - Screen cleared to black, streaming native Darwin XNU console (`media_1793527740344_ffa0164f.jpg` & `media_1793528207960_fbf328e1.jpg`).
+     - `pmap_startup`, `vm_page_bootstrap` (255413 free pages), `zone_init`, `IOKit IOMD setownership`, `BANK` and `IPC_THREAD_PRIORITY` initialized.
+     - **Apple Clutch Scheduler started** (`Scheduler: Default of clutch`).
+
+* **Identified Hardware Incompatibilities & Blockers (Cortex-A73 ARMv8.0-A vs Apple Silicon / A76 ARMv8.2):**
+  1. **ARMv8.1-A Large System Extensions (LSE Atomics):**
+     - Cortex-A73 lacks LSE (`ldadd`, `casa`, `swp`). Traps with `ESR_EC_UNCATEGORIZED` (`sleh.c:995`).
+     - *Fixed in config:* Added `-march=armv8-a+crypto+nolse -U__ARM_FEATURE_ATOMICS -U__ARM_ARCH_8_2__` to `MACHINE_FLAGS_ARM64_SWEET` in `0004-sweet-machine-config.patch`.
+     - *Fixed in commpage:* Added `ldaxr`/`stxr` fallback in `0162-arm64-commpage-fallback-non-lse.patch` / `0253-...patch`.
+     - *Closed Firehose Lib:* `libfirehose_kernel.a` (compiled from `libdispatch` in CI) contains `ldadd`. Stubs for `_firehose_trace_metadata`, `___firehose_buffer_tracepoint_flush`, and `_firehose_buffer_ring_enqueue` prevent executing `ldadd`.
+  2. **ARMv8.1-A Privileged Access Never (PAN):**
+     - Cortex-A73 lacks PAN. Traps on `msr pan, #imm` and `mrs pan`.
+     - In `SWEET.h`: Removed `#define __ARM_PAN_AVAILABLE__ 1`.
+     - In `xnu/out/kernel.development.sweet`: Replaced 24 `msr pan` with `nop`, 14 `mrs x8, pan` with `mov x8, xzr`.
+  3. **Context Switch PAN Assertion Panic (`pcb.c:172` & `pcb.c:180`):**
+     - `machine_switch_context` and `machine_stack_handoff` in `osfmk/arm64/pcb.c` check PAN status. Because PAN reads 0, Darwin panics:
+       `panic(cpu 0 caller ...): context switch with PAN disabled @pcb.c:172`.
+     - Requires disabling the assertion in `osfmk/arm64/pcb.c` or emulating PAN in `sleh.c`.
+
+* **Key Files and Artifact Locations:**
+  - Local Boot Image: `enxerto/out/enxerto-boot.img` (fastboot bootable, 17,399,808 bytes).
+  - Packed Kernel Payload: `enxerto/out/payload.bin` (generated via `tools/mkpayload.py`).
+  - Kernel Binary: `xnu/out/kernel.development.sweet`.
+  - Machine Config Patch: `xnu/patches/0004-sweet-machine-config.patch` & `xnu/patches-11215/0004-sweet-machine-config.patch` (modifies `makedefs/MakeInc.def` and `SWEET.h`).
+  - CI Workflow: `.github/workflows/xnu.yml` (and downloaded copy `c:\Users\hungtv\Downloads\xnu.yml`).
+  - Fastboot binary: `c:\Users\hungtv\Downloads\platform-tools\fastboot.exe`.
+
+* **Next Concrete Actions for Incoming Agent:**
+  1. **Source Patch for PCB / SLEH:**
+     - In `xnu/patches/` (and `patches-11215/`), add patch for `osfmk/arm64/pcb.c` wrapping PAN panics with `#if __ARM_PAN_AVAILABLE__` so it compiles cleanly without PAN assertions.
+     - Add instruction skip / emulation in `osfmk/arm64/sleh.c` for any remaining ARMv8.1 opcodes.
+  2. **CI Workflow (`.github/workflows/xnu.yml`):**
+     - Ensure `libfirehose_kernel` build passes `-march=armv8-a+crypto+nolse` or stub firehose tracepoints during kernel link.
+     - Ensure continuous splash framebuffer address `0x5c000000` is active.
+  3. **Verification:**
+     - Boot updated kernel via `fastboot boot enxerto/out/enxerto-boot.img`. Verify Darwin advances past context switch to rootfs mount (`IOFindBSDRoot`).
+* **2026-11-01: Context Switch PAN Verification Bypass & New Boot Image Built:**
+  - **Live Device Observation (Photo media_1793529695172_de02dff0.jpg):**
+    * Darwin Scheduler (Clutch) and IPC Subsystem successfully initialized.
+    * First context switch initiated!
+    * Panic: `panic(cpu 0 caller 0xfffffe0007b0b0b0): context switch with PAN disabled @pcb.c:172`
+  - **Root Cause Analysis:**
+    * `osfmk/arm64/pcb.c` in `_machine_switch_context` and `_machine_stack_handoff` verifies PAN state before task switching:
+      ```c
+      if (__improbable(__builtin_arm_rsr("pan") == 0)) {
+          panic("context switch with PAN disabled");
+      }
+      ```
+    * Because `mrs x8, pan` was stubbed with `mov x8, xzr`, `x8 == 0`, triggering `cbz w8` straight into the panic handler.
+  - **Fix Applied:**
+    * NOP-ed the `cbz w8, ...` branches (`0xd503201f`) at file offsets `0x4a5e90` (`_machine_switch_context`) and `0x4a6264` (`_machine_stack_handoff`).
+    * Rebuilt `enxerto/out/payload.bin` and `enxerto/out/enxerto-boot.img` (SHA256: `66bc21459d75ce69446136c58ac470b2f7b9912a23435f6b35f51939b6507a38`).
+    * Device is in fastboot mode (`92d1151e`). Ready for immediate test with `fastboot boot enxerto/out/enxerto-boot.img`.
 * **2026-11-01: Darwin Clutch Scheduler & IPC Subsystems Initialized! mrs x8, pan Replaced:**
   - **Live Device Observation (Photo media_1793528207960_fbf328e1.jpg):**
     * `Telemetry: Sampling all tasks once per 1 second`
