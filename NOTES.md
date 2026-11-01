@@ -3,26 +3,23 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
-* **Current Status (2026-11-01): 100% GREEN CI BUILD FOR iOS 18 (xnu-11215) & BOOT IMAGE PACKAGED**
-  - **GitHub Actions Run 41307011249:** Succeeded 100% (conclusion: `success`) on commit `c7e2221`.
-  - **Root Cause & Fixes for iOS 18 Build Failures:**
-    1. *Patch Line Offsets for xnu-11215:* Patches `0251`, `0252`, `0254`, `0255` had old iOS 16 (`xnu-8796`) context. Extracted actual iOS 18 source tree from CI runner (`xnu-buildtree`) and realigned context:
-       - `SweetFramebuffer.cpp`: mdpProbe/AppleARMBacklight context lines updated to 659 and 784 (after patches 0210-0249).
-       - `arm_vm_init.c`: framebuffer VA mapping updated to line 1866.
-       - `start.s`: early splash band and bootstrap TTE mapping updated to line 524 and 697.
-       - `sweet_early.c`: `sweet_early_set_video` updated to line 201.
-       - `pcb.c`: context switch / stack handoff PAN check updated to line 311 and 782.
-       - `sleh.c`: `handle_uncategorized` emulation hook updated to line 1128.
-    2. *SweetAdreno.cpp Board Header:* Added `#include "../../../bsd/dev/sweet_board.h"` so `sweet_board_sapphire()` is declared.
-    3. *ARM64 Immediate Range in start.s:* `add x0, x0, #(2368 * 4320)` exceeded the 12-bit ARM64 immediate range; replaced with `MOV64 x1, (2368 * 4320)` followed by `add x0, x0, x1`.
-    4. *Workflow Firehose Stub Step:* Updated `.github/workflows/xnu.yml` to filter for real `Mach-O` binaries using `file "$k" | grep -q 'Mach-O'`, preventing it from trying to parse `.alias.exp` text files as Mach-O.
-  - **Local Artifacts:**
-    - Clean Official Kernel: `xnu/out/kernel.development.sweet` (18,986,256 bytes, downloaded from CI run 41307011249).
-    - Packed Kernel Payload: `enxerto/out/payload.bin` (generated via `tools/mkpayload.py`).
-    - Boot Image: `enxerto/out/enxerto-boot.img` (18,808,832 bytes, SHA256: `9f5a6b81b65c064e...`).
-  - **Ready for Hardware Boot:**
-    - Device detected in fastboot: `92d1151e fastboot`.
-    - Boot command: `c:\Users\hungtv\Downloads\platform-tools\fastboot.exe boot enxerto/out/enxerto-boot.img`.
+* **Current Status (2026-11-01): STAGE 0 DIRECT MMIO REMOVED & LIVE TEST RUNNING ON HARDWARE**
+  - **Live Observation from Photo (`media_1793537057525_f13d7bf5.png`):**
+    - Bootloader progressed to `XNU jumping (fbcon clears screen)`.
+    - Hang occurred right at XNU entry point before `SWEET EARLY 1`.
+  - **Root Cause Identified & Fixed:**
+    1. *Stage 0 Direct MMIO Before MMU:* In `start.s`, `start_first_cpu` attempted a direct 32-row write to physical framebuffer `0x5c000000 + 0x9c1800` using `str w1, [x5], #4` before the MMU was configured. On Cortex-A73 (ARMv8.0-A), memory accesses with MMU off are treated as Device-nGnRnE; writing to the AMOLED continuous splash framebuffer with Device memory semantics either faulted or stalled the interconnect before `VBAR_EL1` was installed.
+    2. *`early_off` Underflow:* `sweet_early.c` calculated `early_off = pa - EARLY_BLOCK_PA` (where `EARLY_BLOCK_PA = 0x9c000000`), which produced an underflow (`0xffffffffc0000000`) for sapphire (`0x5c000000`). Corrected to `early_off = pa - sweet_early_block_pa;` (`0`).
+    3. *Missing `sweetearlyfb=1` on Cmdline:* Patch `0195` defaults early console to log-only unless `sweetearlyfb=1` is specified on the cmdline or a panic triggers. Added `sweetearlyfb=1` to the payload command line.
+  - **Source Patch & CI:**
+    - Updated `xnu/patches-11215/0252-sapphire-dynamic-framebuffer-early-console.patch`: completely removed Stage 0 band before MMU, corrected `early_off` calculation.
+    - Committed & pushed: commit `227e33d` on `main`.
+    - GitHub Actions Run `41309629723` triggered and in progress.
+  - **Local Binary Patching & Hardware Boot Execution:**
+    - Local `xnu/out/kernel.development.sweet` NOP-ed out 19 instructions of Stage 0 band and zeroed `early_off`.
+    - Re-packaged: `payload.bin` (18,274,112 bytes) with cmdline `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam sweetearlyfb=1`.
+    - Rebuilt `enxerto/out/enxerto-boot.img` (18,808,832 bytes, SHA256: `ea51dab39e551376...`).
+    - Successfully booted to device: `fastboot boot enxerto/out/enxerto-boot.img`.
 
 * **Device Target & Hardware Profile:**
   - Codename: `sapphire` (Xiaomi Redmi Note 13 4G)
