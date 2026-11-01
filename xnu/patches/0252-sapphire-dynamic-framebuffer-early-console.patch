@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] sapphire: dynamic early framebuffer console mapping for 0x5c000000
+
+Adapt start.s bootstrap pagetable mapping, sweet_early_set_video, and
+sweet_early_map_final to take the framebuffer physical address dynamically
+from boot_args->Video.v_baseAddr. On sapphire (SM6225 / Bengal), ABL's continuous
+splash framebuffer is at 0x5c000000 (1080x2400), whereas on sweet it is at
+0x9c000000 and on beryllium at 0x9d400000.
+---
+ osfmk/arm64/arm_vm_init.c |  7 ++++++-
+ osfmk/arm64/start.s       | 16 ++++++++++++----
+ osfmk/arm64/sweet_early.c | 15 ++++++++-------
+ 3 files changed, 26 insertions(+), 12 deletions(-)
+
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index 4291e99..694edc9 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1830,6 +1830,8 @@
+ #define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+ 
+ #if defined(SWEET)
++extern uint64_t sweet_early_block_pa;
++
+ static void
+ sweet_early_map_final(void)
+ {
+@@ -1840,7 +1842,8 @@ sweet_early_map_final(void)
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	assert(*slot == ARM_TTE_EMPTY);
+-	*slot = 0x9c000000ULL | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++	uint64_t block_pa = sweet_early_block_pa ? sweet_early_block_pa : 0x9c000000ULL;
++	*slot = block_pa | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 777aca4..9fd1cb9 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -465,7 +465,9 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	ldr		x0, [x20, #40]			// boot_args->Video.v_baseAddr
++	cbz		x0, Lsweet_no_band
++	add		x0, x0, #(2368 * 4320)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+ 	mov		x4, #4320
+@@ -478,6 +480,7 @@ Lsweet_mark_pixel:
+ 	subs	x2, x2, #1
+ 	b.ne	Lsweet_mark_row
+ 	dsb		sy
++Lsweet_no_band:
+ #endif
+ 
+ 	// Set low reset vector before attempting any loads
+@@ -637,7 +640,9 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	ldr		x10, [x20, #40]			// boot_args->Video.v_baseAddr
++	cbz		x10, Lsweet_no_fb
++	and		x10, x10, #~(0x2000000 - 1)
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+@@ -645,6 +650,7 @@ Lkernelcache_base_found:
+ 	add		x13, x25, #(2 * PGBYTES)
+ 	str		x11, [x13, x12, lsl #TTE_SHIFT]
++Lsweet_no_fb:
+ #endif
+ 
+ 	/* Ensure TTEs are visible */
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 8f4c808..ec4affd 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -16,6 +16,8 @@
+ #define EARLY_BLOCK_PA 0x9c000000ull
+ #define EARLY_BLOCK_SIZE 0x2000000ull
++uint64_t sweet_early_block_pa = EARLY_BLOCK_PA;
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
+ static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
+ static uint64_t early_off;
+@@ -158,11 +160,10 @@ sweet_early_flush_log(void)
+ void
+ sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
+ {
+-	if (pa < EARLY_BLOCK_PA || width == 0 || height <= 32 || rowbytes < width * 4 ||
+-	    pa + height * rowbytes > EARLY_BLOCK_PA + EARLY_BLOCK_SIZE) {
+-		return; /* keep the sweet default */
+-	}
++	if (width == 0 || height <= 32 || rowbytes < width * 4) {
++		return;
++	}
++	uint64_t block = pa & ~(EARLY_BLOCK_SIZE - 1);
++	sweet_early_block_pa = block;
+ 	early_fb = (volatile uint32_t *)(uintptr_t)pa;
+ 	early_width = (unsigned int)width;
+ 	early_height = (unsigned int)height;
+ 	early_stride = (unsigned int)(rowbytes / 4);
+-	early_off = pa - EARLY_BLOCK_PA;
++	early_off = pa - block;
+ }
+-- 

@@ -32,7 +32,7 @@ concurrency:
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
-  MACOS_VERSION: ${{ inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3') }}
+  MACOS_VERSION: ${{ inputs.macos_version || '15.3' }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
   # Bump to throw away every cache (host tools + ccache) at once. See docs/CI_CACHE.md.
