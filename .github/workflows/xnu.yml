@@ -265,10 +265,24 @@ jobs:
                           patched += 1
 
           if patched > 0:
-              open(kernel_path, 'wb').write(data)
               print(f"firehose: {patched} symbols stubbed with RET")
           else:
               print("firehose: no symbols found to stub (sleh.c trap will handle stray LSE)")
+
+          # Convert all ARMv8.3-A RCpc (LDAPR) to native ARMv8.0-A (LDAR)
+          ldapr_count = 0
+          for vmaddr, vmsize, fileoff, filesize, segname in segs:
+              if 'TEXT' in segname:
+                  for i in range(fileoff, fileoff + filesize - 4, 4):
+                      w, = struct.unpack_from('<I', data, i)
+                      if (w & 0x3ffffc00) == 0x38bfc000:
+                          ldar = (w & 0xc00003ff) | 0x08dffc00
+                          struct.pack_into('<I', data, i, ldar)
+                          ldapr_count += 1
+          if ldapr_count > 0:
+              print(f"rcpc: converted {ldapr_count} LDAPR instructions to native LDAR")
+
+          open(kernel_path, 'wb').write(data)
           STUB_PY
 
       - name: ccache stats
