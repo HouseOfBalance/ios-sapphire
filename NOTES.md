@@ -3,6 +3,23 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> Port preparation for Redmi Note 13 4G (sapphire / SM6225 Bengal) on iOS 18 (xnu-11215) <<<
+* **2026-11-01: Milestone 5 & 6 PASSED! ARMv8.1 PAN Incompatibility Discovered & NOP-ed:**
+  - **Live Device Observation (Photo media_1793527434362_9f1b7d42.png):**
+    * `SWEET EARLY 1: arm_init entered (MMU on)`
+    * `SWEET EARLY 2: PE_init_platform done`
+    * `SWEET EARLY 3: ml_parse_cpu_topology done`
+    * `SWEET EARLY 4: cpu_bootstrap done`
+    * `SWEET EARLY 5: kernel_startup_bootstrap done` (VERIFIED: LSE elimination fix completely resolved mutex/startup lock panics!)
+    * `SWEET EARLY 6: cpu_init done` (VERIFIED: Core initialization succeeded!)
+    * `SWEET EARLY PANIC: Undefined kernel instruction: pc=0xfffffe0007b0990c instr=d500419f @sleh.c:995`
+  - **Root Cause Analysis:**
+    * `0xd500419f` is `msr pan, #1` (ARMv8.1-A Privileged Access Never).
+    * `SWEET.h` defined `#define __ARM_PAN_AVAILABLE__ 1` for Cortex-A76.
+    * Cortex-A73 (ARMv8.0-A) lacks hardware PAN support, trapping on `msr pan, #1` right before Mark 7 (`entering arm_vm_init`).
+  - **Fix Applied:**
+    * Removed `__ARM_PAN_AVAILABLE__` from `SWEET.h` in `0004-sweet-machine-config.patch` (both `xnu/patches/` and `xnu/patches-11215/`).
+    * Replaced all 24 `msr pan` instructions in `xnu/out/kernel.development.sweet` with `nop` (`0xd503201f`).
+    * Rebuilt `enxerto/out/payload.bin` and `enxerto/out/enxerto-boot.img`. Ready for immediate device boot.
 * **2026-11-01: ARMv8.0 vs ARMv8.2 Architecture Incompatibility Discovered & Fixed:**
   - **Live Device Observation:** Bootloader handoff to XNU on Gold core `0x100` succeeded completely; continuous splash framebuffer at `0x5c000000` rendered live debug output:
     * `SWEET EARLY 1: arm_init entered (MMU on)`
