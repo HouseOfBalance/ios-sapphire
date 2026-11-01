@@ -3,6 +3,21 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> Port preparation for Redmi Note 13 4G (sapphire / SM6225 Bengal) on iOS 18 (xnu-11215) <<<
+* **2026-11-01: Darwin Clutch Scheduler & IPC Subsystems Initialized! mrs x8, pan Replaced:**
+  - **Live Device Observation (Photo media_1793528207960_fbf328e1.jpg):**
+    * `Telemetry: Sampling all tasks once per 1 second`
+    * `Scheduler: Default of clutch` (CLUTCH SCHEDULER INITIALIZED!)
+    * `Setting scheduler priority decay band limit 10`
+    * `BANK subsystem is initialized`
+    * `IPC_THREAD_PRIORITY subsystem is initialized`
+    * `debug_log_init: Error!! gPanicBase is still not initialized`
+    * Panic at `pc=0xfffffe0007493b54 instr=d5384268 @sleh.c:995`
+  - **Root Cause Analysis:**
+    * `0xd5384268` is `mrs x8, pan` (reading the PAN system register into x8 in `_copyin` / `_copyout`).
+    * On Cortex-A73 without hardware PAN, reading `pan` causes an undefined instruction exception.
+  - **Fix Applied:**
+    * Replaced all 14 `mrs x8, pan` instructions (`0xd5384268`) in `xnu/out/kernel.development.sweet` with `mov x8, xzr` (`0xaa1f03e8`). `cbz x8, ...` takes the bypass branch, safely avoiding all PAN operations.
+    * Rebuilt `enxerto/out/payload.bin` and `enxerto/out/enxerto-boot.img`. Ready for immediate boot test.
 * **2026-11-01: Darwin Kernel Console Streams on Sapphire AMOLED Display!**
   - **Live Device Observation (Photo media_1793527740344_ffa0164f.jpg):**
     * **DARWIN CONSOLE CLEARED TO BLACK AND STREAMED LOGS LIVE!**
