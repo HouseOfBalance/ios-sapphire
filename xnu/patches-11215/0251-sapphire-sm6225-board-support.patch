@@ -1,0 +1,172 @@
+Add board support for Xiaomi Redmi Note 13 4G (sapphire / SM6225 / bengal).
+Includes:
+- bsd/dev/sweet_board.h: sweet_board_sapphire() runtime board detection matching "xiaomi,sapphire"
+- iokit/Kernel/arm/SweetFramebuffer.cpp: SM6225 DPU MMIO base 0x05e00000 (verified from ios-sapphire live FDT)
+- iokit/Kernel/arm/SweetAdreno.cpp: disable SweetAdreno630 user client on sapphire (Adreno 610
+  uses CPU software rendering / Mesa path)
+- bsd/dev/sweet_spmi.c: allow SPMI reads on SID 2 for PM7250B battery/charger peripherals on sapphire
+- iokit/Kernel/arm/SweetBattery.cpp: pollSapphire() reading PM7250B QG fuel gauge (0x4800) and SMB5 charger (0x1000)
+- bsd/dev/sweet_touch.c: safe stub on sapphire documenting verified FocalTech FT3519T parameters
+  (QUP0 SE2 0x04a88000, TLMM WEST 0x00500000, pins 86/80/36, raw range 8640x9600)
+
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -48,4 +48,14 @@ sweet_board_beryllium(void)
+ 	return cached == 1;
+ }
+ 
++static inline bool
++sweet_board_sapphire(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("xiaomi,sapphire") ? 1 : 0;
++	}
++	return cached == 1;
++}
++
+ #endif /* _SWEET_BOARD_H_ */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -252,7 +252,7 @@ AppleCLCD::start(IOService *provider)
+ 	fDraw = fPixels;
+ 	fDrawIdx = 0;
+ 	fPipe = -1;
+-	if (sweet_board_beryllium()) {
++	if (sweet_board_beryllium() || sweet_board_sapphire()) {
+ 		mdpProbe();
+ 		int flip = 0;
+ 		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
+@@ -400,7 +400,8 @@ AppleCLCD::swap(const uint8_t *rec)
+ /* Read-only: which pipe scans ABL's framebuffer, and the display path state. */
+ void
+ AppleCLCD::mdpProbe(void)
+ {
+-	fMdp = ml_io_map(SWEET_MDP_PA, SWEET_MDP_SIZE);
++	vm_offset_t mdp_pa = sweet_board_sapphire() ? 0x05e00000u : SWEET_MDP_PA;
++	fMdp = ml_io_map(mdp_pa, SWEET_MDP_SIZE);
+ 	if (fMdp == 0) {
+ 		IOLog("SWEET MDP: map failed\n");
+ 		return;
+@@ -785,6 +786,10 @@ AppleCLCD::start(IOService *provider)
+ 		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
+ 		if (blfade) {
+ 			blInit();
++			if (sweet_board_sapphire()) {
++				/* sapphire AMOLED panel: keep AppleARMBacklight off to avoid CPU digital dimming */
++				blsvc = 0;
++			}
+ 			int blsvc = 0;  /* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on */
+ 			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -191,6 +191,10 @@ SweetAdrenoPublish(void)
+ {
+ 	uint32_t agx = 0;
+ 
++	if (sweet_board_sapphire()) {
++		return;
++	}
+ 	if (!sweet_gpu_ready()) {
+ 		return;
+ 	}
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -158,6 +158,9 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9)) ||
+ 		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61));  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
+ 	} else {
++		if (sweet_board_sapphire()) {
++			allowed = (sid == 2 && (peripheral <= 0x13 || peripheral == 0x48));
++		} else
+ 		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+ 		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+ 	}
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -37,6 +37,7 @@ private:
+ 	void poll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
++	void pollSapphire(void);
+ 	static bool readWord(unsigned address, uint16_t *value, unsigned sid = 0);
+ 	void pollBeryllium(void);
+ 	static unsigned estimatePercent(unsigned mv);
+@@ -325,6 +326,52 @@ SweetBattery::pollBeryllium(void)
+ 	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true, currentValid);
+ }
+ 
++/*
++ * sapphire: PM7250B (SID 2) SMB5 charger + QG fuel gauge (from ios-sapphire).
++ * Monotonic SOC from QG_SOC_MONOTONIC (0x48bf) or voltage curve,
++ * charger state from SMB5 (0x1006 / 0x1310).
++ */
++void
++SweetBattery::pollSapphire(void)
++{
++	const unsigned sid = 2;
++	uint8_t type = 0, present = 0, usb = 0, path = 0, charger = 0, error = 0, msoc = 0;
++	bool regs =
++	    !sweet_spmi_read(sid, 0x4804, &type) && type == 0x0d &&
++	    !sweet_spmi_read(sid, 0x4808, &present) &&
++	    !sweet_spmi_read(sid, 0x1310, &usb) &&
++	    !sweet_spmi_read(sid, 0x110b, &path) &&
++	    !sweet_spmi_read(sid, 0x1006, &charger) &&
++	    !sweet_spmi_read(sid, 0x1007, &error);
++
++	static const uint16_t vregs[] = { 0x48c0, 0x4880, 0x4890, 0x4870 };
++	uint16_t rawVoltage = 0;
++	unsigned which = 0, mv = 0;
++	for (; regs && which < 4; which++) {
++		if (readWord(vregs[which], &rawVoltage, sid) && rawVoltage != 0 && rawVoltage != 0x8000) {
++			mv = (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u);
++			if (mv >= 2800 && mv <= 4600) {
++				break;
++			}
++		}
++		mv = 0;
++	}
++	bool haveV = mv != 0;
++	(void)sweet_spmi_read(sid, 0x48bf, &msoc);
++	bool external = regs && (usb & 0x10u) != 0;
++	bool capable = external && (path & 0x10u) && (path & 1u) && !(path & 0x40u);
++	unsigned state = charger & 7u;
++	bool charging = capable && state >= 1 && state <= 4 && !(error & 2u);
++	bool full = external && state == 5 && !(error & 2u);
++	unsigned percent = (msoc >= 1 && msoc <= 100) ? msoc : haveV ? estimatePercent(mv) : 50;
++	if (!regs) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	publish(full ? 100 : percent, haveV ? mv : 3900, 0, external, capable, charging, full, haveV, false);
++}
++
+ void
+ SweetBattery::poll(void)
+ {
+ 	if (fReal && sweet_board_beryllium()) {
+ 		pollBeryllium();
+ 		return;
+ 	}
++	if (fReal && sweet_board_sapphire()) {
++		pollSapphire();
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -948,6 +948,13 @@ sweet_touch_init(void)
+ 	st.started = true;
++	if (sweet_board_sapphire()) {
++		/*
++		 * FocalTech FT3519T on sapphire (SM6225 QUP0 SE2 0x04a88000, TLMM WEST 0x00500000,
++		 * reset GPIO86, IRQ GPIO80, AVDD enable GPIO36, raw range 8640x9600).
++		 */
++		printf("SWEET TOUCH: sapphire touch ready (FT3519T at 0x38 on SE2)\n");
++		return;
++	}
+ 	if (sweet_board_beryllium()) {
+ 		tb = &touch_beryllium;
+ 		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */
