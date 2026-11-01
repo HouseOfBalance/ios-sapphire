@@ -3,33 +3,25 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
-* **Current Status (2026-11-01): FBCON SCREEN CLEARED TO BLACK! FIREHOSE LSE TRAP BYPASSED & SOURCE PATCHES FIXED**
-  - **Live Observation from Photo (`media_1793545613881_6b674c5d.png`):**
-    - `SWEET EARLY 1` through `20` passed completely.
-    - Mark 20 silent lockup resolved: `BL fbcon_init` executed unconditionally, successfully initializing the display grid (67 cols x 75 rows) and clearing AMOLED screen to solid black!
-    - Execution advanced past early diagnostic bootstrap into `libfirehose_kernel.a`:
-      `SWEET EARLY PANIC: Undefined kernel instruction: pc=0xfffffe0007334a40 instr=f8288128 @sleh.c:1256`.
+* **Current Status (2026-11-01): FIREHOSE ATOMIC BYPASSED! SWEETCPU BOOT MPIDR ASSERTION RESOLVED**
+  - **Live Observation from Photo (`media_1793547181234_c39bb630.png`):**
+    - All early marks, fbcon screen clear, and firehose initialization PASSED completely!
+    - Advanced into IOKit CPU matching / startup:
+      `SWEET EARLY PANIC: SWEET CPU: expected boot MPIDR 0 and logical CPU 0 @SweetCPU.cpp:184`.
   - **Exhaustive Root Causes & Complete Fix Chain:**
-    1. **Firehose Atomic Trap at `0xfffffe0007334a40` (`___firehose_buffer_tracepoint_flush`):**
-       - `pc = 0xfffffe0007334a40` is inside `___firehose_buffer_tracepoint_flush` (file offset `0x330a40`), executing `0xf8280128` (`ldadd x8, x8, [x9]`).
-       - Cortex-A73 (ARMv8.0-A) lacks hardware ARMv8.1-A LSE atomics and traps with `ESR_EC_UNCATEGORIZED`.
-       - *Local Binary Fix:* Stubbed tracepoint entry points in `xnu/out/kernel.development.sweet`:
-         * `0x33068c` (`___firehose_buffer_tracepoint_reserve`): `mov x0, xzr; ret` (`0xaa1f03e0`, `0xd65f03c0`) - returns NULL so callers immediately skip logging.
-         * `0x3301ec` (`_firehose_buffer_tracepoint_reserve_slow`): `mov x0, xzr; ret`.
-         * `0x330a28` (`___firehose_buffer_tracepoint_flush`): `ret` (`0xd65f03c0`).
-         * `0x33013c` (`_firehose_buffer_ring_enqueue`): `ret` (`0xd65f03c0`).
-         * `0x330328` (`_firehose_buffer_stream_chunk_install`): `ret` (`0xd65f03c0`).
-         * `0x330a6c` (`___firehose_merge_updates`): `ret` (`0xd65f03c0`).
-         * Also patched all 7 individual LSE opcodes in firehose range (`0x330188`, `0x330300`, `0x330398`, `0x330a40`, `0x330b1c`, `0x330b30`, `0x330b44`) with `nop`/`ret`.
-    2. **Source Patch Syntax & Context Line Discrepancies Fixed:**
-       - `0252-sapphire-dynamic-framebuffer-early-console.patch`: Hunk 7 context was missing trailing `early_fb = ...;`, causing patch reject on `osfmk/arm64/sweet_early.c:200`. Restored context and adjusted hunk count (`-200,13 +201,13`).
-       - `0255-sweet-emulate-pan-lse-trap.patch`: Hunk 1 had line count mismatch (`+98` counted vs `+97` declared in header), causing `corrupt patch at line 104`. Expanded LSE mask to catch all atomic variants (`0x3b000c00 == 0x38000000` for memory atomics, `0x3f200c00 == 0x08200000/08a00000` for CAS/CASP) and corrected headers (`-1120,9 +1120,98` and `-1198,6 +1287,17`).
-       - `.github/workflows/xnu.yml`: Updated post-build Mach-O stubber to stub both NULL-returning firehose functions (`___firehose_buffer_tracepoint_reserve`, `_firehose_buffer_tracepoint_reserve_slow`) and RET-stubbed functions.
-       - Validated all 379 repository patches with `tools/validate-repo.py` (all checks passed).
-       - Committed `b1c14c7` and `8644255`, pushed to `origin/main`, active CI Run: `41321486842`.
+    1. **SweetCPU Boot MPIDR 0x100 Assertion (`SweetCPU.cpp:184`):**
+       - Upstream `SweetCPU::startAll` asserted `if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0)`.
+       - On `sweet` (SM7150), boot core is Silver 0 (`MPIDR 0`).
+       - On `sapphire` (SM6225), Silver cluster lacks 16K granule (`TGran16 == 0`), so enxerto hands off to Gold core 0 (`MPIDR 0x100`, Cortex-A73).
+       - Because `boot_cpu->phys_id == 0x100` (non-zero), `cbnz w9, ...` at `0xfffffe0007b45890` (file offset `0xb41890`) branched straight to panic.
+       - *Local Binary Fix:* Replaced `cbnz w9, ...` (`0x35000989`) with `NOP` (`0xd503201f`) at file offset `0xb41890`.
+       - *Source Patch Fix:* Updated `xnu/patches-11215/0065-sweet-smp-psci.patch` to accept `phys_id == 0x100` for sapphire Gold boot core.
+       - Committed `a567a85`, pushed to `origin/main`.
+    2. **Firehose Atomic Trap at `0xfffffe0007334a40` (`___firehose_buffer_tracepoint_flush`):**
+       - Verified completely bypassed by stubbing tracepoint entry points (`___firehose_buffer_tracepoint_reserve`, `_flush`, `_ring_enqueue`, etc.) with `mov x0, xzr; ret` and `ret`.
     3. **Live Hardware Boot:**
        - Rebuilt `payload.bin` (18,274,112 B) and `enxerto-boot.img` (18,808,832 B, header v4).
-       - Fastboot boot executed: `fastboot boot enxerto/out/enxerto-boot.img` (OKAY 0.907s).
+       - Fastboot boot executed: `fastboot boot enxerto/out/enxerto-boot.img` (OKAY 0.912s).
 
 * **Device Target & Hardware Profile:**
   - Codename: `sapphire` (Xiaomi Redmi Note 13 4G)
