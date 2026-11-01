@@ -2,7 +2,7 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 index 3d3dbca..f95bec7 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -1120,9 +1120,97 @@ sweet_emulate_fjcvtzs(arm_saved_state_t *state, uint32_t instr)
+@@ -1120,9 +1120,98 @@ sweet_emulate_fjcvtzs(arm_saved_state_t *state, uint32_t instr)
  		printf("SWEET: emulating FJCVTZS (first at pc=0x%llx, w%u <- d%u)\n",
  		    (unsigned long long)(get_saved_state_pc(state) - 4), rd, rn);
  	}
@@ -101,7 +101,7 @@ index 3d3dbca..f95bec7 100644
  /*
   * Uncategorized exceptions are a catch-all for general execution errors.
   * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
-@@ -1198,6 +1286,17 @@ handle_uncategorized(arm_saved_state_t *state)
+@@ -1198,6 +1287,17 @@ handle_uncategorized(arm_saved_state_t *state)
  		}
  	}
  
