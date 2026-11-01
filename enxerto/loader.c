@@ -151,10 +151,15 @@ const char *loader_check(uintptr_t rd_start, uintptr_t rd_end)
 	return 0;
 }
 
+extern char _end[];
+
 int loader_has_payload(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
+	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
 
+	if (magic_ok((const char *)emb))
+		return 1;
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end) || rd_end < rd_start + 8)
 		return 0;
@@ -164,7 +169,14 @@ int loader_has_payload(uintptr_t dtb)
 const char *loader_boot(uintptr_t dtb)
 {
 	uint64_t rd_start, rd_end;
+	uintptr_t emb = ((uintptr_t)_end + 0xfff) & ~0xfffUL;
 
+	if (magic_ok((const char *)emb)) {
+		rd_start = emb;
+		rd_end = emb + 0x8000000;
+		con_hex("EMBED", emb);
+		return loader_boot_payload(rd_start, rd_end, 0);
+	}
 	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
 	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
 		return "no initrd in /chosen";

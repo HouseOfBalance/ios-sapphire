@@ -169,6 +169,12 @@ static uintptr_t find_gicr(void);
 
 void secondary_main(uint64_t idx)
 {
+#if defined(BOARD_SAPPHIRE)
+	extern volatile uint64_t gold_dtb;
+	void gold_main(uint64_t dtb);
+	if (gold_dtb)
+		gold_main(gold_dtb);
+#endif
 	sec_mpidr[idx] = rsr("mpidr_el1") | (1ULL << 63);
 	if (idx == 1) {
 		uintptr_t r = find_gicr();
@@ -353,6 +359,84 @@ static void test_gic(void)
 	isb();
 }
 
+#if defined(BOARD_SAPPHIRE)
+volatile uint64_t gold_dtb;
+
+static void gold_gicr_prepare(void)
+{
+	static const uint32_t affs[] = { 0x101, 0x102, 0x103, 0x0, 0x1, 0x2, 0x3 };
+	for (unsigned int k = 0; k < sizeof(affs) / sizeof(affs[0]); k++) {
+		uint32_t aff = affs[k];
+		uintptr_t r = 0;
+		for (uintptr_t off = 0; off < GICR_SIZE; off += GICR_PE_SIZE) {
+			uint64_t typer = rd64(GICR_BASE + off + GICR_TYPER);
+			if ((uint32_t)(typer >> 32) == aff) {
+				r = GICR_BASE + off;
+				break;
+			}
+			if (typer & (1 << 4))	/* Last */
+				break;
+		}
+		if (!r)
+			continue;
+		uint32_t waker = rd32(r + GICR_WAKER);
+		if (waker & 2) {
+			wr32(r + GICR_WAKER, waker & ~2U);
+			for (int i = 0; i < 100000 && (rd32(r + GICR_WAKER) & 4); i++)
+				;
+		}
+		wr32(r + GICR_IGROUPR0, 0xffffffff);
+		for (int id = 0; id < 32; id++)
+			wr8(r + GICR_IPRIORITYR + id, 0xa0);
+		wr32(r + GICR_ISENABLER0, (1U << VTIMER_INTID) | (1U << PTIMER_INTID) | (1U << SGI_INTID));
+	}
+}
+
+static void cpufreq_max(uintptr_t b)
+{
+	uint32_t best = 0, best_khz = 0, prev = 0;
+	for (uint32_t i = 0; i < 12; i++) {
+		uint32_t v = rd32(b + 0x110 + i * 0x20);
+		uint32_t khz = ((v >> 30) & 3) ? 19200 * (v & 0xff) : 300000;
+		if (i && khz == prev)
+			break;
+		prev = khz;
+		if (khz > best_khz) {
+			best_khz = khz;
+			best = i;
+		}
+	}
+	uint32_t old = rd32(b + 0x920);
+	wr32(b + 0x920, best);
+	__asm__ volatile("dsb sy" ::: "memory");
+	(void)old;
+}
+
+void __attribute__((noreturn)) gold_main(uint64_t dtb)
+{
+	uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
+	con_hex2("GOLD", "midr=", (uint32_t)rsr("midr_el1"), "mpidr=", (uint32_t)rsr("mpidr_el1"));
+	con_hex2("MMFR0", "lo=", (uint32_t)mmfr0, "tg16=", (mmfr0 >> 20) & 0xf);
+	if (((mmfr0 >> 20) & 0xf) == 0) {
+		con_str("GOLD", "no 16K granule here either");
+	} else {
+		test_gic();
+		gold_gicr_prepare();
+		cpufreq_max(0x0f523000);
+		cpufreq_max(0x0f521000);
+		const char *why = loader_boot(dtb);
+		if (bootui_active()) {
+			bootui_fail(why);
+			delay_ms(8000);
+		}
+		con_clear(BG_BOOT);
+		con_str("LOADER", why);
+	}
+	for (;;)
+		__asm__ volatile("wfe");
+}
+#endif
+
 /* ---- main ---- */
 
 static void __attribute__((unused)) psci_line(const char *label, uint64_t fn)
@@ -427,6 +511,25 @@ void enxerto_main(uint64_t dtb)
 
 	/* An xnu payload in the ramdisk means: boot it (MMU stays off). */
 	stage = "loader";
+#if defined(BOARD_SAPPHIRE)
+	if (loader_has_payload(dtb)) {
+		uint64_t mmfr0 = rsr("id_aa64mmfr0_el1");
+		if (((mmfr0 >> 20) & 0xf) == 0) {
+			con_str("SILVER", "no 16K: handing off to gold CPU 0x100");
+			gold_dtb = dtb;
+			__asm__ volatile("dsb sy" ::: "memory");
+			int64_t r = smc(PSCI_CPU_ON, 0x100, (uintptr_t)secondary_entry, 4);
+			if (r == 0) {
+				__asm__ volatile("dsb sy" ::: "memory");
+				smc(PSCI_CPU_OFF, 0, 0, 0);
+				for (;;)
+					__asm__ volatile("wfi");
+			}
+			gold_dtb = 0;
+			con_hex("CPU_ON", (uint64_t)r);
+		}
+	}
+#endif
 	const char *why = loader_boot(dtb);
 	if (bootui_active()) {
 		/* Branded boot screen is up: show the error on it (log stays readable), then fall back to text. */

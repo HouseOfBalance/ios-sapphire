@@ -467,8 +467,22 @@ def main():
         if not p.is_file():
             print(f"[!] Error: payload file '{p}' not found", file=sys.stderr)
             sys.exit(1)
-        shutil.copyfile(p, ramdisk_path)
-        print(f"  Copied payload from {p.name} ({p.stat().st_size} bytes)")
+        if args.board == "sapphire":
+            # GKI ABL ignores v4 boot ramdisk; append payload directly to Image at 4K boundary
+            payload_data = p.read_bytes()
+            pad_sz = align_up(end_size, 4096)
+            with open(image_path, "r+b") as f:
+                f.truncate(pad_sz)
+                f.seek(pad_sz)
+                f.write(payload_data)
+                new_total = f.tell()
+                f.seek(16)
+                f.write(struct.pack("<Q", new_total))
+            print(f"  Appended payload to Image at 4K boundary: {len(payload_data)} bytes (total Image: {new_total} bytes)")
+            ramdisk_path.write_bytes(empty_rd_bytes)
+        else:
+            shutil.copyfile(p, ramdisk_path)
+            print(f"  Copied payload from {p.name} ({p.stat().st_size} bytes)")
     else:
         ramdisk_path.write_bytes(empty_rd_bytes)
         print("  Using empty ramdisk as default payload")
