@@ -61,7 +61,13 @@ Includes:
  		return;
 --- a/iokit/Kernel/arm/SweetAdreno.cpp
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -191,6 +191,9 @@ SweetAdrenoPublish(void)
+@@ -45,4 +45,5 @@
+ #include "SweetAdrenoABI.h"
+ #include "SweetSurface.h"
++#include "../../../bsd/dev/sweet_board.h"
+ 
+ extern "C" {
+@@ -191,6 +192,9 @@ SweetAdrenoPublish(void)
  {
  	uint32_t agx = 0;
  

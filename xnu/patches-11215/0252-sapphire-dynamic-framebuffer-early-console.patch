@@ -34,14 +34,15 @@ diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
 index e8f555e..b49426b 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -524,7 +524,9 @@ LEXT(start_first_cpu)
+@@ -524,7 +524,10 @@ LEXT(start_first_cpu)
  
  #if defined(SWEET)
  	/* Stage 0: white 64x32 band, no stack or page tables needed. */
 -	MOV64	x0, (0x9c000000 + 2368 * 4320)
 +	ldr		x0, [x20, #40]			// boot_args->Video.v_baseAddr
 +	cbz		x0, Lsweet_no_band
-+	add		x0, x0, #(2368 * 4320)
++	MOV64	x1, (2368 * 4320)
++	add		x0, x0, x1
  	mov		w1, #-1
  	mov		x2, #32
  	mov		x4, #4320
