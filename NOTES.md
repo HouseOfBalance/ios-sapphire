@@ -3,6 +3,16 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> Port preparation for Redmi Note 13 4G (sapphire / SM6225 Bengal) on iOS 18 (xnu-11215) <<<
+* **2026-11-01: Framebuffer Mapping & Console Handoff Fix (Milestone 4 -> Milestone 5):**
+  - **Issue identified:** Physical device froze at `XNU jumping (fbcon clears screen)` because:
+    1. Earlier CI runs on `main` defaulted to `MACOS_VERSION=13.5` (iOS 16 / xnu-8796) and ignored `xnu/patches-11215/`.
+    2. Stock `sweet` early bootstrap mappings in `start.s`, `sweet_early.c`, and `arm_vm_init.c` hardcoded `0x9c000000` (Redmi Note 10 Pro) instead of `0x5c000000` (Redmi Note 13 4G continuous splash framebuffer).
+  - **Fixes applied:**
+    1. Workflow `.github/workflows/xnu.yml` updated to default `MACOS_VERSION: '15.3'` on `main` (commit `87a2aaa`).
+    2. Ported `0252-sapphire-dynamic-framebuffer-early-console.patch` to both `xnu/patches-11215/` and `xnu/patches/`.
+    3. Patched `xnu/out/kernel.development.sweet` directly at verified ARM64 instruction and data offsets (`0x49e104` Stage 0 band -> `0x5c9c1800`, `0x49e340` TTBR0 mapping -> `0x5c000000`, `0x49445c` `sweet_early_map_final` -> `0x5c000000`, `0xb916e0` `early_fb` -> `0x5c000000`).
+    4. Rebuilt `enxerto/out/payload.bin` (16,866,000 B) and `enxerto/out/enxerto-boot.img` (17,399,808 B) with cmdline `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam`.
+  - **Ready for device boot:** User reboots phone to fastboot mode and runs `fastboot boot enxerto/out/enxerto-boot.img`. Expected on screen: Stage 0 white band at base of AMOLED, `sweet_early_mark` logs, followed by screen clear to black and Darwin kernel console stream.
 * **2026-11-01: Sapphire hardware integration from reference `ios-sapphire` (iOS 16.7.16 port):**
   - **UFS**: Host controller `ufshc@4804000` base `0x04804000`, size `0x3000` (corrected from earlier placeholder `0x01d84000`). XNU reads `/sweet-ufs` reg dynamically from ADT.
   - **GICv3**: GICD `0x0f200000` (size `0x10000`), GICR `0x0f300000` (size `0x100000`, stride `0x20000`, 8 cores), VTIMER INTID `19`.
