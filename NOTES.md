@@ -3,23 +3,44 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
-* **Current Status (2026-11-01): STAGE 0 DIRECT MMIO REMOVED & LIVE TEST RUNNING ON HARDWARE**
-  - **Live Observation from Photo (`media_1793537057525_f13d7bf5.png`):**
-    - Bootloader progressed to `XNU jumping (fbcon clears screen)`.
-    - Hang occurred right at XNU entry point before `SWEET EARLY 1`.
-  - **Root Cause Identified & Fixed:**
-    1. *Stage 0 Direct MMIO Before MMU:* In `start.s`, `start_first_cpu` attempted a direct 32-row write to physical framebuffer `0x5c000000 + 0x9c1800` using `str w1, [x5], #4` before the MMU was configured. On Cortex-A73 (ARMv8.0-A), memory accesses with MMU off are treated as Device-nGnRnE; writing to the AMOLED continuous splash framebuffer with Device memory semantics either faulted or stalled the interconnect before `VBAR_EL1` was installed.
-    2. *`early_off` Underflow:* `sweet_early.c` calculated `early_off = pa - EARLY_BLOCK_PA` (where `EARLY_BLOCK_PA = 0x9c000000`), which produced an underflow (`0xffffffffc0000000`) for sapphire (`0x5c000000`). Corrected to `early_off = pa - sweet_early_block_pa;` (`0`).
-    3. *Missing `sweetearlyfb=1` on Cmdline:* Patch `0195` defaults early console to log-only unless `sweetearlyfb=1` is specified on the cmdline or a panic triggers. Added `sweetearlyfb=1` to the payload command line.
-  - **Source Patch & CI:**
-    - Updated `xnu/patches-11215/0252-sapphire-dynamic-framebuffer-early-console.patch`: completely removed Stage 0 band before MMU, corrected `early_off` calculation.
-    - Committed & pushed: commit `227e33d` on `main`.
-    - GitHub Actions Run `41309629723` triggered and in progress.
-  - **Local Binary Patching & Hardware Boot Execution:**
-    - Local `xnu/out/kernel.development.sweet` NOP-ed out 19 instructions of Stage 0 band and zeroed `early_off`.
-    - Re-packaged: `payload.bin` (18,274,112 bytes) with cmdline `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam sweetearlyfb=1`.
-    - Rebuilt `enxerto/out/enxerto-boot.img` (18,808,832 bytes, SHA256: `ea51dab39e551376...`).
-    - Successfully booted to device: `fastboot boot enxerto/out/enxerto-boot.img`.
+* **Current Status (2026-11-01): SWEET EARLY 1 THROUGH 20 PASSED! LDAPR (RCpc) TO NATIVE LDAR CONVERTED**
+  - **Live Observation from Photo (`media_1793538552651_e9d10230.jpg`):**
+    - **CRITICAL MILESTONE ACHIEVED ON PHYSICAL HARDWARE:**
+      * `SWEET EARLY 1: arm_init entered (MMU on)`
+      * `SWEET EARLY 2: PE_init_platform done`
+      * `SWEET EARLY 3: ml_parse_cpu_topology done`
+      * `SWEET EARLY 4: cpu_bootstrap done`
+      * `SWEET EARLY 5: kernel_startup_bootstrap done`
+      * `SWEET EARLY 6: cpu_init done`
+      * `SWEET EARLY 7: entering arm_vm_init`
+      * `SWEET EARLY 8: leaving bootstrap TTBR0`
+      * `SWEET EARLY 9: kernel framebuffer VA live`
+      * `SWEET EARLY 10: TTBR0 off; TLB flushed`
+      * `SWEET EARLY 11: physmap table pointers rebound`
+      * `SWEET EARLY 12: calling pmap_bootstrap`
+      * `SWEET EARLY 13: pmap_bootstrap done`
+      * `SWEET EARLY 14: early I/O page tables ready`
+      * `SWEET EARLY 15: arm_vm_init returned`
+      * `SWEET EARLY 16: calling serial_init`
+      * `SWEET EARLY 17: fbcon config read; mapping`
+      * `SWEET EARLY 18: fbcon mapping returned`
+      * `SWEET EARLY 19: serial_init returned`
+      * `SWEET EARLY 20: kprintf startup complete`
+    - **Trap Encountered at Mark 20:**
+      * `SWEET EARLY PANIC: Undefined kernel instruction: pc=0xfffffe00074e730c instr=b8bfc114 @sleh.c:1256`
+  - **Root Cause & Technical Breakdown:**
+    - `pc=0xfffffe00074e730c` is inside `_kptimer_curcpu_up` (`kptimer.c`, invoked right after `cpu_timebase_init`).
+    - `0xb8bfc114` is `ldapr w20, [x8]` (ARMv8.3-A RCpc - Load-Acquire RCpc).
+    - Cortex-A73 is ARMv8.0-A and lacks the RCpc extension (`ARMv8.2-A-RCpc`).
+    - Bitwise conversion from `LDAPR` to ARMv8.0-A native `LDAR`:
+      `ldar = (ldapr & 0xc00003ff) | 0x08dffc00`
+      `0xb8bfc114` (`ldapr w20, [x8]`) becomes `0x88dffd14` (`ldar w20, [x8]`).
+  - **Fixes Applied:**
+    1. *Kernel Binary:* Replaced all 280 `LDAPR` (`(w & 0x3ffffc00) == 0x38bfc000`) instructions in `__TEXT_EXEC` with native ARMv8.0-A `LDAR`.
+    2. *CI Workflow (`.github/workflows/xnu.yml`):* Added automated conversion of all `LDAPR` instructions to native `LDAR` in post-build step.
+    3. *Source Emulation (`0255-sweet-emulate-pan-lse-trap.patch`):* Added `LDAPR` / `LDAPRB` / `LDAPRH` emulation in `sleh.c` as a safety net.
+    4. *Commits:* `1dab6c6` pushed to `main`.
+    5. *Hardware Boot:* Rebuilt `payload.bin` and `enxerto-boot.img` (SHA256: `393dda07a71723b7...`). Executed `fastboot boot enxerto/out/enxerto-boot.img`.
 
 * **Device Target & Hardware Profile:**
   - Codename: `sapphire` (Xiaomi Redmi Note 13 4G)
