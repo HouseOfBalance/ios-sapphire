@@ -228,6 +228,12 @@ jobs:
               '_firehose_trace_metadata',
               '___firehose_buffer_tracepoint_flush',
               '_firehose_buffer_ring_enqueue',
+              '_firehose_buffer_stream_chunk_install',
+              '___firehose_merge_updates',
+          ]
+          stub_null_syms = [
+              '___firehose_buffer_tracepoint_reserve',
+              '_firehose_buffer_tracepoint_reserve_slow',
           ]
 
           # Parse Mach-O segments for VA-to-fileoffset mapping
@@ -251,18 +257,24 @@ jobs:
               return None
 
           RET = struct.pack('<I', 0xd65f03c0)
+          MOV_X0_XZR_RET = struct.pack('<II', 0xaa1f03e0, 0xd65f03c0)
           patched = 0
           for line in nm_out.splitlines():
               parts = line.strip().split()
               if len(parts) >= 3:
                   addr_str, typ, name = parts[0], parts[1], parts[2]
-                  if name in stub_syms and typ.upper() == 'T':
+                  if typ.upper() == 'T':
                       va = int(addr_str, 16)
                       fo = va_to_fileoff(va)
                       if fo is not None:
-                          data[fo:fo+4] = RET
-                          print(f"  stubbed {name} at VA 0x{va:x} (file 0x{fo:x}) -> RET")
-                          patched += 1
+                          if name in stub_syms:
+                              data[fo:fo+4] = RET
+                              print(f"  stubbed {name} at VA 0x{va:x} (file 0x{fo:x}) -> RET")
+                              patched += 1
+                          elif name in stub_null_syms:
+                              data[fo:fo+8] = MOV_X0_XZR_RET
+                              print(f"  stubbed {name} at VA 0x{va:x} (file 0x{fo:x}) -> mov x0, xzr; ret")
+                              patched += 1
 
           if patched > 0:
               print(f"firehose: {patched} symbols stubbed with RET")

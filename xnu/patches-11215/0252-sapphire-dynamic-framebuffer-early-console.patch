@@ -46,7 +46,7 @@ index e8f555e..b49426b 100644
  	mov		w1, #-1
  	mov		x2, #32
  	mov		x4, #4320
-@@ -539,6 +541,7 @@ Lsweet_mark_pixel:
+@@ -539,6 +542,7 @@ Lsweet_mark_pixel:
  	subs	x2, x2, #1
  	b.ne	Lsweet_mark_row
  	dsb		sy
@@ -84,7 +84,7 @@ index 7dcca46..ebde5ed 100644
  static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
  static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
  static uint64_t early_off;
-@@ -200,12 +201,12 @@ sweet_early_flush_log(void)
+@@ -200,13 +201,13 @@ sweet_early_flush_log(void)
  void
  sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
  {
@@ -100,4 +100,5 @@ index 7dcca46..ebde5ed 100644
  	early_width = (unsigned int)width;
  	early_height = (unsigned int)height;
  	early_stride = (unsigned int)(rowbytes / 4);
+ 	early_fb = (volatile uint32_t *)(uintptr_t)pa; /* bootstrap V=P */
  }
