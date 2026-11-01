@@ -37,7 +37,7 @@ Includes:
  		mdpProbe();
  		int flip = 0;
  		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
-@@ -400,7 +400,8 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -400,8 +400,9 @@ AppleCLCD::swap(const uint8_t *rec)
  /* Read-only: which pipe scans ABL's framebuffer, and the display path state. */
  void
  AppleCLCD::mdpProbe(void)
@@ -48,19 +48,19 @@ Includes:
  	if (fMdp == 0) {
  		IOLog("SWEET MDP: map failed\n");
  		return;
-@@ -785,6 +786,10 @@ AppleCLCD::start(IOService *provider)
+@@ -785,5 +786,9 @@ AppleCLCD::start(IOService *provider)
  		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
  		if (blfade) {
  			blInit();
+ 			int blsvc = 0;  /* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on */
 +			if (sweet_board_sapphire()) {
 +				/* sapphire AMOLED panel: keep AppleARMBacklight off to avoid CPU digital dimming */
 +				blsvc = 0;
 +			}
- 			int blsvc = 0;  /* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on */
  			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
 --- a/iokit/Kernel/arm/SweetAdreno.cpp
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -191,6 +191,10 @@ SweetAdrenoPublish(void)
+@@ -191,6 +191,9 @@ SweetAdrenoPublish(void)
  {
  	uint32_t agx = 0;
  
@@ -92,7 +92,7 @@ Includes:
  	static bool readWord(unsigned address, uint16_t *value, unsigned sid = 0);
  	void pollBeryllium(void);
  	static unsigned estimatePercent(unsigned mv);
-@@ -325,6 +326,52 @@ SweetBattery::pollBeryllium(void)
+@@ -325,13 +326,62 @@ SweetBattery::pollBeryllium(void)
  	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true, currentValid);
  }
  
@@ -157,7 +157,7 @@ Includes:
  	bool valid = fReal &&
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -948,6 +948,13 @@ sweet_touch_init(void)
+@@ -948,4 +948,12 @@ sweet_touch_init(void)
  	st.started = true;
 +	if (sweet_board_sapphire()) {
 +		/*

@@ -1,6 +1,6 @@
 --- a/osfmk/arm64/pcb.c
 +++ b/osfmk/arm64/pcb.c
-@@ -165,12 +165,16 @@ machine_switch_context(
+@@ -165,11 +165,13 @@ machine_switch_context(
  	thread_t                        old,
  	thread_continue_t               continuation,
  	thread_t                        new)
@@ -14,7 +14,7 @@
  	if (old == new) {
  		return old;
  	}
-@@ -173,12 +177,16 @@ machine_stack_handoff(
+@@ -173,8 +177,10 @@ machine_stack_handoff(
  	thread_t                        old,
  	thread_t                        new)
  {

@@ -2,7 +2,7 @@ diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
 index 3d3dbcaede42..a1c2d3f4e5b6 100644
 --- a/osfmk/arm64/sleh.c
 +++ b/osfmk/arm64/sleh.c
-@@ -1081,6 +1081,73 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+@@ -1081,6 +1081,65 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
  #endif
  }
  
