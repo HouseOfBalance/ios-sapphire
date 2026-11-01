@@ -3,50 +3,33 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
-* **Current Status (2026-11-01): SWEET EARLY 1 THROUGH 20 PASSED! LDAPR->LDAR & KPRINTF CONSOLE STREAM FIX**
-  - **Live Observation from Photo (`media_1793538552651_e9d10230.jpg`):**
-    - **CRITICAL MILESTONE ACHIEVED ON PHYSICAL HARDWARE:**
-      * `SWEET EARLY 1: arm_init entered (MMU on)`
-      * `SWEET EARLY 2: PE_init_platform done`
-      * `SWEET EARLY 3: ml_parse_cpu_topology done`
-      * `SWEET EARLY 4: cpu_bootstrap done`
-      * `SWEET EARLY 5: kernel_startup_bootstrap done`
-      * `SWEET EARLY 6: cpu_init done`
-      * `SWEET EARLY 7: entering arm_vm_init`
-      * `SWEET EARLY 8: leaving bootstrap TTBR0`
-      * `SWEET EARLY 9: kernel framebuffer VA live`
-      * `SWEET EARLY 10: TTBR0 off; TLB flushed`
-      * `SWEET EARLY 11: physmap table pointers rebound`
-      * `SWEET EARLY 12: calling pmap_bootstrap`
-      * `SWEET EARLY 13: pmap_bootstrap done`
-      * `SWEET EARLY 14: early I/O page tables ready`
-      * `SWEET EARLY 15: arm_vm_init returned`
-      * `SWEET EARLY 16: calling serial_init`
-      * `SWEET EARLY 17: fbcon config read; mapping`
-      * `SWEET EARLY 18: fbcon mapping returned`
-      * `SWEET EARLY 19: serial_init returned`
-      * `SWEET EARLY 20: kprintf startup complete`
-    - **Trap Encountered at Mark 20:**
-      * `SWEET EARLY PANIC: Undefined kernel instruction: pc=0xfffffe00074e730c instr=b8bfc114 @sleh.c:1256`
-  - **Root Cause & Technical Breakdown:**
-    - `pc=0xfffffe00074e730c` was inside `_kptimer_curcpu_up` (`kptimer.c`, invoked right after `cpu_timebase_init`).
-    - `0xb8bfc114` was `ldapr w20, [x8]` (ARMv8.3-A RCpc - Load-Acquire RCpc).
-    - Cortex-A73 is ARMv8.0-A and lacks the RCpc extension (`ARMv8.2-A-RCpc`).
-    - Bitwise conversion from `LDAPR` to ARMv8.0-A native `LDAR`:
-      `ldar = (ldapr & 0xc00003ff) | 0x08dffc00`
-      `0xb8bfc114` (`ldapr w20, [x8]`) becomes `0x88dffd14` (`ldar w20, [x8]`).
-  - **Investigation of Freeze at Mark 20:**
-    1. Mark 20 is the *final* early diagnostic stage in XNU.
-    2. Right after Mark 20, `arm_init` calls `sweet_early_disable()`, setting `early_disabled = 1`.
-    3. In Apple's DEVELOPMENT kernels, `kprintf_output` is silenced by default unless `-enable_kprintf_spam` is present in the boot-args (`pe_kprintf.c`).
-    4. Without `-enable_kprintf_spam`, all subsequent kernel logs from Darwin startup (Mach zones, threads, scheduler, IOKit) were dropped, leaving the screen appearing frozen at Mark 20.
-    5. NOP'd `sweet_early_disable()` with `RET` (`0xd65f03c0`) at file offset `0x514044` so early console stays alive.
-    6. Re-generated `payload.bin` and `enxerto-boot.img` with command line:
-       `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam sweetearlyfb=1`.
-    7. Cleaned up patch format in `0252` (exact line counts matching c7e2221 with `b Lsweet_no_band`) and `0255` (3-line unique context).
-  - **Boot Test:**
-    - Re-packaged image `enxerto/out/enxerto-boot.img` (18,808,832 B, SHA256: `d54de8369aac5bdc...`).
-    - Sent via fastboot: `fastboot boot enxerto/out/enxerto-boot.img` (OKAY 0.914s).
+* **Current Status (2026-11-01): FBCON SCREEN CLEARED TO BLACK! FIREHOSE LSE TRAP BYPASSED & SOURCE PATCHES FIXED**
+  - **Live Observation from Photo (`media_1793545613881_6b674c5d.png`):**
+    - `SWEET EARLY 1` through `20` passed completely.
+    - Mark 20 silent lockup resolved: `BL fbcon_init` executed unconditionally, successfully initializing the display grid (67 cols x 75 rows) and clearing AMOLED screen to solid black!
+    - Execution advanced past early diagnostic bootstrap into `libfirehose_kernel.a`:
+      `SWEET EARLY PANIC: Undefined kernel instruction: pc=0xfffffe0007334a40 instr=f8288128 @sleh.c:1256`.
+  - **Exhaustive Root Causes & Complete Fix Chain:**
+    1. **Firehose Atomic Trap at `0xfffffe0007334a40` (`___firehose_buffer_tracepoint_flush`):**
+       - `pc = 0xfffffe0007334a40` is inside `___firehose_buffer_tracepoint_flush` (file offset `0x330a40`), executing `0xf8280128` (`ldadd x8, x8, [x9]`).
+       - Cortex-A73 (ARMv8.0-A) lacks hardware ARMv8.1-A LSE atomics and traps with `ESR_EC_UNCATEGORIZED`.
+       - *Local Binary Fix:* Stubbed tracepoint entry points in `xnu/out/kernel.development.sweet`:
+         * `0x33068c` (`___firehose_buffer_tracepoint_reserve`): `mov x0, xzr; ret` (`0xaa1f03e0`, `0xd65f03c0`) - returns NULL so callers immediately skip logging.
+         * `0x3301ec` (`_firehose_buffer_tracepoint_reserve_slow`): `mov x0, xzr; ret`.
+         * `0x330a28` (`___firehose_buffer_tracepoint_flush`): `ret` (`0xd65f03c0`).
+         * `0x33013c` (`_firehose_buffer_ring_enqueue`): `ret` (`0xd65f03c0`).
+         * `0x330328` (`_firehose_buffer_stream_chunk_install`): `ret` (`0xd65f03c0`).
+         * `0x330a6c` (`___firehose_merge_updates`): `ret` (`0xd65f03c0`).
+         * Also patched all 7 individual LSE opcodes in firehose range (`0x330188`, `0x330300`, `0x330398`, `0x330a40`, `0x330b1c`, `0x330b30`, `0x330b44`) with `nop`/`ret`.
+    2. **Source Patch Syntax & Context Line Discrepancies Fixed:**
+       - `0252-sapphire-dynamic-framebuffer-early-console.patch`: Hunk 7 context was missing trailing `early_fb = ...;`, causing patch reject on `osfmk/arm64/sweet_early.c:200`. Restored context and adjusted hunk count (`-200,13 +201,13`).
+       - `0255-sweet-emulate-pan-lse-trap.patch`: Hunk 1 had line count mismatch (`+98` counted vs `+97` declared in header), causing `corrupt patch at line 104`. Expanded LSE mask to catch all atomic variants (`0x3b000c00 == 0x38000000` for memory atomics, `0x3f200c00 == 0x08200000/08a00000` for CAS/CASP) and corrected headers (`-1120,9 +1120,98` and `-1198,6 +1287,17`).
+       - `.github/workflows/xnu.yml`: Updated post-build Mach-O stubber to stub both NULL-returning firehose functions (`___firehose_buffer_tracepoint_reserve`, `_firehose_buffer_tracepoint_reserve_slow`) and RET-stubbed functions.
+       - Validated all 379 repository patches with `tools/validate-repo.py` (all checks passed).
+       - Committed `b1c14c7` and `8644255`, pushed to `origin/main`, active CI Run: `41321486842`.
+    3. **Live Hardware Boot:**
+       - Rebuilt `payload.bin` (18,274,112 B) and `enxerto-boot.img` (18,808,832 B, header v4).
+       - Fastboot boot executed: `fastboot boot enxerto/out/enxerto-boot.img` (OKAY 0.907s).
 
 * **Device Target & Hardware Profile:**
   - Codename: `sapphire` (Xiaomi Redmi Note 13 4G)
