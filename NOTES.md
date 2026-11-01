@@ -3,25 +3,36 @@
 ## Agent handoff / active work (2026-11-01, latest)
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
-* **Current Status (2026-11-01): FIREHOSE ATOMIC BYPASSED! SWEETCPU BOOT MPIDR ASSERTION RESOLVED**
-  - **Live Observation from Photo (`media_1793547181234_c39bb630.png`):**
-    - All early marks, fbcon screen clear, and firehose initialization PASSED completely!
-    - Advanced into IOKit CPU matching / startup:
-      `SWEET EARLY PANIC: SWEET CPU: expected boot MPIDR 0 and logical CPU 0 @SweetCPU.cpp:184`.
-  - **Exhaustive Root Causes & Complete Fix Chain:**
-    1. **SweetCPU Boot MPIDR 0x100 Assertion (`SweetCPU.cpp:184`):**
-       - Upstream `SweetCPU::startAll` asserted `if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0)`.
-       - On `sweet` (SM7150), boot core is Silver 0 (`MPIDR 0`).
-       - On `sapphire` (SM6225), Silver cluster lacks 16K granule (`TGran16 == 0`), so enxerto hands off to Gold core 0 (`MPIDR 0x100`, Cortex-A73).
-       - Because `boot_cpu->phys_id == 0x100` (non-zero), `cbnz w9, ...` at `0xfffffe0007b45890` (file offset `0xb41890`) branched straight to panic.
-       - *Local Binary Fix:* Replaced `cbnz w9, ...` (`0x35000989`) with `NOP` (`0xd503201f`) at file offset `0xb41890`.
-       - *Source Patch Fix:* Updated `xnu/patches-11215/0065-sweet-smp-psci.patch` to accept `phys_id == 0x100` for sapphire Gold boot core.
-       - Committed `a567a85`, pushed to `origin/main`.
-    2. **Firehose Atomic Trap at `0xfffffe0007334a40` (`___firehose_buffer_tracepoint_flush`):**
-       - Verified completely bypassed by stubbing tracepoint entry points (`___firehose_buffer_tracepoint_reserve`, `_flush`, `_ring_enqueue`, etc.) with `mov x0, xzr; ret` and `ret`.
-    3. **Live Hardware Boot:**
-       - Rebuilt `payload.bin` (18,274,112 B) and `enxerto-boot.img` (18,808,832 B, header v4).
-       - Fastboot boot executed: `fastboot boot enxerto/out/enxerto-boot.img` (OKAY 0.912s).
+* **Current Status (2026-11-01): HOME INDICATOR LIVE! SAPPHIRE TOUCH & PHYSICAL KEYS DRIVERS WIRED UP**
+  - **Live Hardware Milestone Confirmed on Physical AMOLED Screen (`media_1793547590432_f481bce7.png`):**
+    - Darwin kernel booted all the way into userland!
+    - `launchd`, `backboardd`, `SpringBoard`, and `CoreAnimation` initialized.
+    - Native rounded horizontal iPhone Home Indicator / swipe bar is visible at the bottom of the AMOLED panel!
+  - **Identified Blocker: Lack of User Input / Touch Responsiveness:**
+    - User reported: "kh có thao tác phản hồi nào, cần patch thêm" (No response when touching screen or pressing buttons).
+    - *Root Cause 1 (Touch):* In `xnu/patches-11215/0251-sapphire-sm6225-board-support.patch`, `sweet_touch.c` was a no-op stub that printed a log line and immediately returned (`return;`). No I2C bus initialization, no GPIO configuration, and no touch event reports were active.
+    - *Root Cause 2 (Keys):* In `bsd/dev/sweet_keys.c`, Volume Up PPID defaulted to `0x4c1` (SID 4) which does not exist on sapphire (PM6125 is SID 0).
+    - *Root Cause 3 (TLMM Address):* `st.gpio` was mapping `TOUCH_NORTH_PA` (`0x03900000u`) instead of SM6225's TLMM WEST tile (`0x00500000u`).
+  - **Exhaustive Fixes Implemented in `xnu/patches-11215/0251-sapphire-sm6225-board-support.patch`:**
+    1. **Sapphire Touchscreen Driver (`bsd/dev/sweet_touch.c`):**
+       - Defined `touch_sapphire` with SE2 (`0x04a88000`), SDA GPIO 6, SCL GPIO 7, IRQ GPIO 80, reset GPIO 86, 1080x2400.
+       - Implemented `touch_sapphire_start()`:
+         * Maps TLMM WEST `0x00500000`.
+         * Drives GPIO 36 high for AVDD power rail.
+         * Configures GPIO 80 as active-low interrupt with pull-up.
+         * Configures GPIO 6 (SDA) and GPIO 7 (SCL) for bit-banged I2C (`st.bitbang = true`).
+         * Releases reset via GPIO 86 (with 15 ms reset pulse fallback).
+         * Probes FocalTech FT3519T at I2C address `0x38`, queries chip ID register `0xa3`.
+         * Hooks into `TOUCH_FT8719` standard FocalTech multitouch parser polling every 2 ms on IRQ edge, reporting through `sweet_hid_touch(finger, down, x, y)`.
+    2. **Sapphire Hardware Keys (`bsd/dev/sweet_keys.c`):**
+       - Configured PM6125 (SID 0) GPIO 5 for Volume Up: `keys_gpio_base = 0xc400u`, `keys_gpio_ppid = 0x0c4u`.
+       - Power button (PON bit 0) and Volume Down (PON bit 1) read from SID 0 PON `0x0810`.
+    3. **Automated Home Button Injection (`sweethidtest`):**
+       - Supports `sweethidtest=3` to dispatch `kHIDUsage_Csmr_Menu` (Home key) every 3 seconds to trigger lock screen unlock animation.
+  - **Validation & CI Status:**
+    - Validated all 379 patch files using `tools/validate-repo.py` (ALL PASSED).
+    - Verified clean `git apply` against tree with 0 errors.
+    - Official CI Run `41322260083` completed with SUCCESS, producing clean `xnu-kernel`.
 
 * **Device Target & Hardware Profile:**
   - Codename: `sapphire` (Xiaomi Redmi Note 13 4G)
