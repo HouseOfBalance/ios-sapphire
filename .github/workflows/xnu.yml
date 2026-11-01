@@ -32,7 +32,7 @@ concurrency:
 env:
   DXB_REPO: https://github.com/blacktop/darwin-xnu-build
   DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
-  MACOS_VERSION: ${{ inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3') }}
+  MACOS_VERSION: ${{ inputs.macos_version || (github.ref_name == 'main' && '15.3' || '15.3') }}
   KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
   MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
   # Bump to throw away every cache (host tools + ccache) at once. See docs/CI_CACHE.md.
@@ -79,9 +79,31 @@ jobs:
             cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
             PDIR=dxb/patches
           fi
-          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
+          # Also inject -march=armv8-a+nolse so the arm64 slice avoids LSE atomics
+          # (Cortex-A73 on sapphire is ARMv8.0-A, no LDADD/CAS/SWP).
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # Patch the libfirehose_kernel xcodebuild invocation to pass nolse for the arm64 slice
+          python3 - <<'FIREHOSE_PY'
+          import re
+          p = 'dxb/build.sh'
+          s = open(p).read()
+          # Find the xcodebuild line that builds libfirehose_kernel and append OTHER_CFLAGS
+          # for the arm64 (non-arm64e) slice to avoid LSE atomics.
+          # dxb's build.sh calls: xcodebuild install ... -target libfirehose_kernel ...
+          # We add XCCONFIG_FILE or OTHER_CFLAGS_arm64 to force -march=armv8-a+nolse on that slice.
+          # Strategy: after VALID_ARCHS line, inject OTHER_CFLAGS for arm64 only.
+          needle = 'VALID_ARCHS="x86_64 arm64e arm64"'
+          if needle in s:
+              # Add arch-specific CFLAGS so arm64 slice gets nolse
+              s = s.replace(needle,
+                  needle + ' OTHER_CFLAGS_arm64="-march=armv8-a+crypto+nolse -U__ARM_FEATURE_ATOMICS"')
+              open(p, 'w').write(s)
+              print("firehose: injected OTHER_CFLAGS_arm64 for nolse")
+          else:
+              print("WARNING: firehose VALID_ARCHS pattern not found; LSE may remain in libfirehose_kernel arm64")
+          FIREHOSE_PY
           # dxb only warns and carries on when a patch does not apply; for ours that would silently
           # produce a kernel without it, so make it fatal.
           python3 - <<'PY'
@@ -170,6 +192,77 @@ jobs:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
         run: bash build.sh
+
+      - name: Stub firehose LSE in kernel binary (sapphire safety net)
+        if: success()
+        run: |
+          # libfirehose_kernel.a may still contain prebuilt LSE atomics (ldadd) from
+          # Apple's closed SDK objects that ignore our OTHER_CFLAGS_arm64. Stub the
+          # three firehose tracepoint entry points with RET (0xd65f03c0) so they
+          # never execute. The sleh.c emulation trap is a second safety net.
+          KERNEL=$(find dxb/fakeroot/System/Library/Kernels -name 'kernel.*' -type f | head -1)
+          if [ -z "$KERNEL" ]; then
+            echo "No kernel binary found, skipping firehose stub"
+            exit 0
+          fi
+          python3 - "$KERNEL" <<'STUB_PY'
+          import struct, sys, subprocess
+          kernel_path = sys.argv[1]
+          data = bytearray(open(kernel_path, 'rb').read())
+
+          # Parse Mach-O to find symbol addresses via nm
+          try:
+              nm_out = subprocess.check_output(['nm', '-defined-only', kernel_path], text=True, stderr=subprocess.DEVNULL)
+          except Exception:
+              nm_out = ""
+
+          # Firehose symbols to stub with RET
+          stub_syms = [
+              '_firehose_trace_metadata',
+              '___firehose_buffer_tracepoint_flush',
+              '_firehose_buffer_ring_enqueue',
+          ]
+
+          # Parse Mach-O segments for VA-to-fileoffset mapping
+          magic = struct.unpack_from('<I', data, 0)[0]
+          assert magic == 0xfeedfacf, f'not a 64-bit Mach-O: {magic:#x}'
+          ncmds, = struct.unpack_from('<I', data, 16)
+          segs = []
+          off = 32
+          for _ in range(ncmds):
+              cmd, cmdsize = struct.unpack_from('<II', data, off)
+              if cmd == 0x19:  # LC_SEGMENT_64
+                  segname = data[off+8:off+24].rstrip(b'\x00').decode('latin1')
+                  vmaddr, vmsize, fileoff, filesize = struct.unpack_from('<QQQQ', data, off+24)
+                  segs.append((vmaddr, vmsize, fileoff, filesize, segname))
+              off += cmdsize
+
+          def va_to_fileoff(va):
+              for vmaddr, vmsize, fileoff, filesize, _ in segs:
+                  if vmaddr <= va < vmaddr + vmsize:
+                      return fileoff + (va - vmaddr)
+              return None
+
+          RET = struct.pack('<I', 0xd65f03c0)
+          patched = 0
+          for line in nm_out.splitlines():
+              parts = line.strip().split()
+              if len(parts) >= 3:
+                  addr_str, typ, name = parts[0], parts[1], parts[2]
+                  if name in stub_syms and typ.upper() == 'T':
+                      va = int(addr_str, 16)
+                      fo = va_to_fileoff(va)
+                      if fo is not None:
+                          data[fo:fo+4] = RET
+                          print(f"  stubbed {name} at VA 0x{va:x} (file 0x{fo:x}) -> RET")
+                          patched += 1
+
+          if patched > 0:
+              open(kernel_path, 'wb').write(data)
+              print(f"firehose: {patched} symbols stubbed with RET")
+          else:
+              print("firehose: no symbols found to stub (sleh.c trap will handle stray LSE)")
+          STUB_PY
 
       - name: ccache stats
         if: always()

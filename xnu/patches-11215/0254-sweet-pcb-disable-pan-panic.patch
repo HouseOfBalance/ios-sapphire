@@ -1,0 +1,27 @@
+--- a/osfmk/arm64/pcb.c
++++ b/osfmk/arm64/pcb.c
+@@ -165,12 +165,16 @@ machine_switch_context(
+ 	thread_t                        old,
+ 	thread_continue_t               continuation,
+ 	thread_t                        new)
+ {
++#if __ARM_PAN_AVAILABLE__ && !defined(SWEET)
+ 	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
+ 		panic("context switch with PAN disabled");
+ 	}
++#endif /* __ARM_PAN_AVAILABLE__ && !SWEET */
+ 
+ 	if (old == new) {
+ 		return old;
+ 	}
+@@ -173,12 +177,16 @@ machine_stack_handoff(
+ 	thread_t                        old,
+ 	thread_t                        new)
+ {
++#if __ARM_PAN_AVAILABLE__ && !defined(SWEET)
+ 	if (__improbable(__builtin_arm_rsr("pan") == 0)) {
+ 		panic("stack handoff with PAN disabled");
+ 	}
++#endif /* __ARM_PAN_AVAILABLE__ && !SWEET */
+ 
+ 	if (__improbable(new->reserved_stack)) {
