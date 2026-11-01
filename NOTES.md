@@ -16,7 +16,9 @@
     * This defined `__ARM_FEATURE_ATOMICS`, causing Clang and `OSAtomicOperations.s` to emit ARMv8.1-A LSE instructions (117 CAS instructions and 972 atomic ld/st instructions like `0xb8200020` = `ldadd w0, w0, [x1]`).
     * Redmi Note 13 4G (SM6225 Bengal) Kryo 260 Gold cores are Cortex-A73 (ARMv8.0-A), which completely lacks ARMv8.1 LSE atomics.
     * When `_OSAddAtomic` was called during kernel bootstrap, the Cortex-A73 Gold core trapped on `ldadd w0, w0, [x1]` with `ESR_EC_UNCATEGORIZED` (`Undefined kernel instruction`), triggering panic at `sleh.c:995`.
-  - **Fix Applied:** Changed `MACHINE_FLAGS_ARM64_SWEET` to `-march=armv8-a+crypto+nolse -U__ARM_FEATURE_ATOMICS -U__ARM_ARCH_8_2__` in both `xnu/patches/0004-sweet-machine-config.patch` and `xnu/patches-11215/0004-sweet-machine-config.patch`. Apple Clang driver rejected `-mno-lse` (`unknown argument '-mno-lse'`); target feature `+nolse` and undefining `__ARM_FEATURE_ATOMICS` correctly disables LSE atomics in Apple Clang and forces generation of universal ARMv8.0-A `ldxr`/`stxr` loops in `OSAtomicOperations.s` and throughout the kernel.
+  - **Fix Applied:**
+    * Changed `MACHINE_FLAGS_ARM64_SWEET` to `-march=armv8-a+crypto+nolse -U__ARM_FEATURE_ATOMICS -U__ARM_ARCH_8_2__` in both `xnu/patches/0004-sweet-machine-config.patch` and `xnu/patches-11215/0004-sweet-machine-config.patch`.
+    * Added patches `0162-arm64-commpage-fallback-non-lse.patch` (in `xnu/patches/`) and `0253-arm64-commpage-fallback-non-lse.patch` (in `xnu/patches-11215/`) to provide ARMv8.0 `ldaxr`/`stxr` fallbacks for `casa` in `osfmk/arm/commpage/commpage_asm.s` when `__ARM_FEATURE_ATOMICS` is disabled. All atomic operations across the kernel are now 100% ARMv8.0 compliant.
 * **2026-11-01: Framebuffer Mapping & Console Handoff Fix (Milestone 4 -> Milestone 5):**
   - **Issue identified:** Physical device froze at `XNU jumping (fbcon clears screen)` because:
     1. Earlier CI runs on `main` defaulted to `MACOS_VERSION=13.5` (iOS 16 / xnu-8796) and ignored `xnu/patches-11215/`.
