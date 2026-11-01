@@ -18,7 +18,10 @@
     * When `_OSAddAtomic` was called during kernel bootstrap, the Cortex-A73 Gold core trapped on `ldadd w0, w0, [x1]` with `ESR_EC_UNCATEGORIZED` (`Undefined kernel instruction`), triggering panic at `sleh.c:995`.
   - **Fix Applied:**
     * Changed `MACHINE_FLAGS_ARM64_SWEET` to `-march=armv8-a+crypto+nolse -U__ARM_FEATURE_ATOMICS -U__ARM_ARCH_8_2__` in both `xnu/patches/0004-sweet-machine-config.patch` and `xnu/patches-11215/0004-sweet-machine-config.patch`.
-    * Added patches `0162-arm64-commpage-fallback-non-lse.patch` (in `xnu/patches/`) and `0253-arm64-commpage-fallback-non-lse.patch` (in `xnu/patches-11215/`) to provide ARMv8.0 `ldaxr`/`stxr` fallbacks for `casa` in `osfmk/arm/commpage/commpage_asm.s` when `__ARM_FEATURE_ATOMICS` is disabled. All atomic operations across the kernel are now 100% ARMv8.0 compliant.
+    * Added patches `0162-arm64-commpage-fallback-non-lse.patch` (in `xnu/patches/`) and `0253-arm64-commpage-fallback-non-lse.patch` (in `xnu/patches-11215/`) to provide ARMv8.0 `ldaxr`/`stxr` fallbacks for `casa` in `osfmk/arm/commpage/commpage_asm.s` when `__ARM_FEATURE_ATOMICS` is disabled.
+    * **CI Build Verified (Run 41294987541, commit ef73279):** Successfully built with zero errors. Verified in `kernel.development.sweet` binary: `_OSAddAtomic` (formerly `0xb8200020` `ldadd`) is now a native ARMv8.0 `ldxr`/`stxr` loop (`0x885f7c28` / `0x880a7c29`).
+    * **Framebuffer patched for sapphire (0x5c000000):** Stage 0 band at `0x49f104`, TTBR0 mapping at `0x49f340`, `sweet_early_map_final` at `0x495a70`, and `_early_fb` at `0xb916e0`.
+    * Rebuilt `enxerto/out/payload.bin` (16,866,016 B) and `enxerto/out/enxerto-boot.img` (17,399,808 B). Ready for hardware boot testing.
 * **2026-11-01: Framebuffer Mapping & Console Handoff Fix (Milestone 4 -> Milestone 5):**
   - **Issue identified:** Physical device froze at `XNU jumping (fbcon clears screen)` because:
     1. Earlier CI runs on `main` defaulted to `MACOS_VERSION=13.5` (iOS 16 / xnu-8796) and ignored `xnu/patches-11215/`.
