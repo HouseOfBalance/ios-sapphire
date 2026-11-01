@@ -28,16 +28,17 @@ Includes:
  #endif /* _SWEET_BOARD_H_ */
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -252,7 +252,7 @@ AppleCLCD::start(IOService *provider)
- 	fDraw = fPixels;
- 	fDrawIdx = 0;
- 	fPipe = -1;
+@@ -395,8 +395,8 @@ AppleCLCD::start(IOService *provider)
+ 		uint32_t secs = 10;
+ 		PE_parse_boot_argn("sweetfb_statlog", &secs, sizeof(secs));
+ 		fStLogSecs = secs;
+ 	}
 -	if (sweet_board_beryllium()) {
 +	if (sweet_board_beryllium() || sweet_board_sapphire()) {
  		mdpProbe();
  		int flip = 0;
  		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
-@@ -400,8 +400,9 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -730,8 +730,9 @@ AppleCLCD::mdpProbe(void)
  /* Read-only: which pipe scans ABL's framebuffer, and the display path state. */
  void
  AppleCLCD::mdpProbe(void)
