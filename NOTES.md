@@ -1,6 +1,21 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-11-01, latest)
+## Agent handoff / active work (2026-11-02, Agent E: Full Codebase Audit Completed)
+
+### >>> COMPLETE ARCHITECTURE & SECURITY AUDIT (SAPPHIRE / SM6225 BENGAL - 2026-11-02) <<<
+* **Status**: **PASS (All 7 Critical/Architecture Bugs Resolved)**
+* **Scope**: Full codebase scan of `hakios-arm64e-dada-main` (iOS 26 / XNU `xnu-12377.121.6` arm64e on Snapdragon 685 / Xiaomi Redmi Note 13 4G `sapphire`).
+* **Artifact**: `full_codebase_audit_report.md`
+* **Defects Fixed & Verified**:
+  1. `base/xnu/files/osfmk/arm64/lse_patch.c`: Fixed Register 31 stack corruption. Added `lse_get_reg` (returns 0 for XZR), `lse_set_reg` (discards write to XZR, prevents overwriting SP in thread frame), and `lse_get_addr` (uses `get_saved_state_sp` for Rn == 31).
+  2. `base/xnu/files/osfmk/arm64/lse_patch.c`: Enforced ARM ARM constraint `Ws != Xt` in `stlxr` generation; added atomic stack saving (`stp x14, x15, [sp, #-16]!`) preserving Darwin Red Zone.
+  3. `base/xnu/files/osfmk/arm64/lse_patch.c`: Fixed branch offset overflow in `encode_branch` by adding signed ±128MB immediate range verification and graceful fallback to software emulation.
+  4. `tools/unpack_bootv2.py`: Fixed `ZeroDivisionError: division by zero` by properly parsing Android Boot Image v4 headers (GKI layout) with implicit 4096-byte page size. Verified unpack of `enxerto-boot.img`.
+  5. `enxerto/build.sh`: Added GKI v4 Image payload appending at 4K boundary and `image_size` field update at offset 16 to match `build.py` (preventing payload drop by ABL).
+  6. `enxerto/mmu.c`: Increased `MAX_L3` from 10 to 20 to prevent L3 page table allocation exhaustion when mapping large DTB + ramdisk payloads.
+  7. `base/xnu/files/osfmk/arm64/lse_decode.h`: Added missing 8/16-bit support, `CASP` 128-bit pair, and logic/extremum opcodes (`LDCLR`, `LDSET`, `LDEOR`, `LDSMAX`, `LDSMIN`, `LDUMAX`, `LDUMIN`). Verified with freestanding selftest.
+* **Bootloader Build**: Built clean with ARM GNU Toolchain `13.3.rel1` (0 absolute relocations, generated valid `Image` and `enxerto-boot.img`).
+* **Device Tree & Hardware**: Verified `sapphire.adt` (Highmem 4GB at `0x100000000`, GICv3 `0x0f200000`/`0x0f300000`, vtimer INTID 19, Kryo Gold cores `0x100`..`0x103`, framebuffer `0x5c000000`).
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
 * **Current Status (2026-11-01): DRIVERS LIVE & BOOTED! SAPPHIRE TOUCH & HARDWARE KEYS ARTIFACT RUNNING ON DEVICE**
