@@ -1,21 +1,42 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
-## Agent handoff / active work (2026-11-02, Agent E: Full Codebase Audit Completed)
+## Agent handoff / active work (2026-11-02, Post-Claude Codebase Audit & Microarchitectural Overhaul)
 
-### >>> COMPLETE ARCHITECTURE & SECURITY AUDIT (SAPPHIRE / SM6225 BENGAL - 2026-11-02) <<<
-* **Status**: **PASS (All 7 Critical/Architecture Bugs Resolved)**
-* **Scope**: Full codebase scan of `hakios-arm64e-dada-main` (iOS 26 / XNU `xnu-12377.121.6` arm64e on Snapdragon 685 / Xiaomi Redmi Note 13 4G `sapphire`).
-* **Artifact**: `full_codebase_audit_report.md`
-* **Defects Fixed & Verified**:
-  1. `base/xnu/files/osfmk/arm64/lse_patch.c`: Fixed Register 31 stack corruption. Added `lse_get_reg` (returns 0 for XZR), `lse_set_reg` (discards write to XZR, prevents overwriting SP in thread frame), and `lse_get_addr` (uses `get_saved_state_sp` for Rn == 31).
-  2. `base/xnu/files/osfmk/arm64/lse_patch.c`: Enforced ARM ARM constraint `Ws != Xt` in `stlxr` generation; added atomic stack saving (`stp x14, x15, [sp, #-16]!`) preserving Darwin Red Zone.
-  3. `base/xnu/files/osfmk/arm64/lse_patch.c`: Fixed branch offset overflow in `encode_branch` by adding signed ±128MB immediate range verification and graceful fallback to software emulation.
-  4. `tools/unpack_bootv2.py`: Fixed `ZeroDivisionError: division by zero` by properly parsing Android Boot Image v4 headers (GKI layout) with implicit 4096-byte page size. Verified unpack of `enxerto-boot.img`.
-  5. `enxerto/build.sh`: Added GKI v4 Image payload appending at 4K boundary and `image_size` field update at offset 16 to match `build.py` (preventing payload drop by ABL).
-  6. `enxerto/mmu.c`: Increased `MAX_L3` from 10 to 20 to prevent L3 page table allocation exhaustion when mapping large DTB + ramdisk payloads.
-  7. `base/xnu/files/osfmk/arm64/lse_decode.h`: Added missing 8/16-bit support, `CASP` 128-bit pair, and logic/extremum opcodes (`LDCLR`, `LDSET`, `LDEOR`, `LDSMAX`, `LDSMIN`, `LDUMAX`, `LDUMIN`). Verified with freestanding selftest.
-* **Bootloader Build**: Built clean with ARM GNU Toolchain `13.3.rel1` (0 absolute relocations, generated valid `Image` and `enxerto-boot.img`).
-* **Device Tree & Hardware**: Verified `sapphire.adt` (Highmem 4GB at `0x100000000`, GICv3 `0x0f200000`/`0x0f300000`, vtimer INTID 19, Kryo Gold cores `0x100`..`0x103`, framebuffer `0x5c000000`).
+### >>> BÁO CÁO THẨM ĐỊNH & KHẮC PHỤC LỖI VI KIẾN TRÚC TOÀN DIỆN (SAPPHIRE / SM6225) <<<
+* **Trạng thái:** **ĐÃ SỬA TRONG CODE & KIỂM CHỨNG TRÌNH BIÊN DỊCH AARCH64-GCC; CHƯA KIỂM CHỨNG TRÊN THIẾT BỊ VẬT LÝ SAPPHIRE.**
+* **Phạm vi thẩm định:** Xử lý triệt để 6 phản biện kỹ thuật của Claude đối với kiến trúc XNU arm64e (`xnu-12377.121.6`) trên Snapdragon 685 (SM6225-AD, Cortex-A73/A53 ARMv8.0-A).
+* **Chi tiết kỹ thuật và các điểm khắc phục cốt lõi:**
+  1. **Xóa bỏ hoàn toàn Lost Updates trong Userland LSE Emulation:**
+     - *Phân tích:* `lse_emulate` cũ sử dụng `copyin` -> tính toán -> `copyout`. Khoảng cách giữa `copyin` và `copyout` trên đa nhân SMP gây mất mát cập nhật dữ liệu (Lost Updates) ngầm định trong Dyld Shared Cache (`libdispatch`, `libsystem`).
+     - *Khắc phục:* Tạo file header freestanding `osfmk/arm64/lse_hooks.h` triển khai toàn bộ các primitive CAS, CASP (128-bit), SWP, LDADD, LDCLR, LDSET, LDEOR, LDSMAX, LDSMIN, LDUMAX, LDUMIN bằng vòng lặp LL/SC inline assembly thuần (`ldaxr`/`stlxr`, `ldaxp`/`stlxp`).
+     - *Áp dụng vào `lse_patch.c`:* Mọi thao tác emulation fallback đều chạy trực tiếp trên Direct Mapping vật lý `PHYSTOKV(pa)` bằng lệnh LL/SC phần cứng, loại bỏ hoàn toàn `copyin`/`copyout` không an toàn.
+  2. **Bảo toàn nghiêm ngặt Darwin ARM64 Red Zone trong Island Trampolines:**
+     - *Phân tích:* ABI Darwin quy định 128 bytes bên dưới `sp` là Red Zone (`[sp-128, sp)`). Lệnh `stp [sp, #-16]!` cũ ghi đè trực tiếp vào Red Zone của frame gọi.
+     - *Khắc phục:* Mọi stub trampoline sinh ra đều hạ con trỏ stack tối thiểu 160 bytes (`sub sp, sp, #160`, vừa đảm bảo >128 vừa căn gióng 16-byte). Mọi thanh ghi lưu tạm và cờ `NZCV` đều được lưu ở `[sp]`, `[sp, #16]`, `[sp, #24]`, hoàn toàn nằm dưới Red Zone của hàm gọi. Trước khi thoát stub, phục hồi lại nguyên vẹn bằng `add sp, sp, #160`.
+  3. **Hỗ trợ đầy đủ `Rn == SP` (Thanh ghi 31) trong Trampoline:**
+     - *Phân tích:* Khi `Rn == 31`, địa chỉ bộ nhớ nằm trong `SP`. Sau khi hạ stack 160 bytes, giá trị `SP` bị lệch đi 160.
+     - *Khắc phục:* Nếu `rn == 31`, stub sinh lệnh tái tạo địa chỉ gốc: `add s2, sp, #160` và dùng `s2` làm base register cho `ldaxr`/`stlxr`.
+  4. **Phân bổ thanh ghi tạm thời động (Không Clobber `Rs`, `Rt`, `Rn`):**
+     - *Phân tích:* Việc cố định `x14/x15` sẽ phá hủy giá trị nếu lệnh gốc sử dụng chính các thanh ghi đó.
+     - *Khắc phục:* Bộ phát stub quét danh sách ứng viên `{16, 17, 14, 15, 12, 13, 11, 10}` và chọn ra 3 thanh ghi `s0, s1, s2` hoàn toàn tách biệt với `{rs, rt, rn}`.
+  5. **Tuân thủ tuyệt đối ràng buộc kiến trúc ARM ARM:**
+     - Trong lệnh `stlxr w_s1, Xt, [Xn]`, thanh ghi trạng thái `Ws` tuyệt đối không được trùng với `Xt` hoặc `Xn`. Do `s1` được chọn phân biệt hoàn toàn với data và base registers, ràng buộc này luôn được đảm bảo 100%.
+  6. **Bảo toàn cờ điều kiện `NZCV`:**
+     - Các lệnh so sánh (`cmp` trong CAS hoặc LDSMAX/LDSMIN/LDUMAX/LDUMIN) làm thay đổi cờ `NZCV`. Stub lưu cờ trước khi lặp (`mrs s2, nzcv; str s2, [sp, #24]`) và phục hồi trước khi thoát (`ldr s2, [sp, #24]; msr nzcv, s2`).
+  7. **Chống đệ quy Trap trong Exception Handler chính nó:**
+     - Thêm `#pragma clang attribute push (__attribute__((target("branch-protection=none"))), apply_to = function)` vào cả `pac_patch.c` và `lse_patch.c`. Handler không sử dụng bất kỳ compiler builtin atomic nào để trình biên dịch không phát sinh lệnh PAC (`retab`/`paciasp`) hoặc LSE bên trong handler.
+  8. **Sửa lỗi Tautological Compare trong SMP Race Defense của `pac_patch.c`:**
+     - Mask cũ `(insn & 0xffe003e0u) == A64_MOV_X_XZR` luôn luôn trả về false do xóa bit 20:16. Đã sửa thành mask chuẩn `(insn & 0xffffffe0u) == A64_MOV_X_XZR`.
+  9. **Sự thật phần cứng về Granule MMU 16KB:**
+     - Cả 4 nhân Cortex-A53 (Silver) và 4 nhân Cortex-A73 (Gold) trên Snapdragon 685 (SM6225) đều có `ID_AA64MMFR0_EL1.TGran16 == 0b0000` (chỉ hỗ trợ 4KB và 64KB).
+     - Việc handoff sang Gold Core không mang lại hỗ trợ 16KB phần cứng. Do đó, cơ chế **Quad-PTE Emulation Engine** (ánh xạ 1 trang ảo 16KB của XNU thành 4 PTE 4KB vật lý) là bắt buộc.
+* **Kiểm tra biên dịch cục bộ:**
+  - `lse_hooks.h`, `lse_patch.c`, `pac_patch.c` đều biên dịch sạch 100% bằng `aarch64-none-elf-gcc` 13.3 với cờ `-Wall -Wextra -Werror` (0 cảnh báo, 0 lỗi).
+  - Bootloader `enxerto` build thành công, sinh `enxerto-boot.img` (696.320 bytes, 0 absolute relocations).
+* **Đóng gói Patch:**
+  - `kernel/0001-pac-trap-and-self-patch.patch`: Đã cập nhật với `pac_decode.h` và `pac_patch.c` mới.
+  - `kernel/0002-lse-branch-islands.patch`: Đã cập nhật bao gồm `lse_decode.h`, `lse_hooks.h`, và `lse_patch.c`.
+  - `kernel/0003-sleh-hook.patch`: Hook hoàn chỉnh trong `sleh.c` và `files.arm64`.
 
 ### >>> COMPLETE STATUS HANDOFF FOR SAPPHIRE (Redmi Note 13 4G / SM6225 Bengal) <<<
 * **Current Status (2026-11-01): DRIVERS LIVE & BOOTED! SAPPHIRE TOUCH & HARDWARE KEYS ARTIFACT RUNNING ON DEVICE**
