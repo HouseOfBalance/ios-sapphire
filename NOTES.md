@@ -22,10 +22,14 @@
     - Nhúng `payload.bin` (10,025,152 bytes) vào sau Loader Image tại biên 4K (`0xa2000`).
     - Cập nhật header Android boot v4: `kernel_size = 10,688,704`, `ramdisk_size = 69` (empty cpio).
     - Image hoàn chỉnh: `enxerto-boot.img` (10,698,752 bytes, SHA256: `0885a93a252fc959...`).
-  * **4. Triển khai Sẵn sàng vào Thư mục Thực thi:**
+  * **4. Triển khai Sẵn sàng vào Thư mục Thực thi & GitHub Release:**
     - Đã sao lưu bản cũ thành `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img.bak_pre_rd`.
     - Đã ghi đè file mới tại `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img` (10,698,752 bytes, 11/5/2026 7:31 PM).
     - Cập nhật CI workflow: commit `fda2553` đã push lên GitHub repo `HouseOfBalance/ios26-sapphire`.
+    - **Đã tạo GitHub Release tải trực tiếp về điện thoại:**
+      * Release: https://github.com/HouseOfBalance/ios26-sapphire/releases/tag/boot-20261105-ramdisk
+      * Tải trực tiếp `enxerto-boot.img`: https://github.com/HouseOfBalance/ios26-sapphire/releases/download/boot-20261105-ramdisk/enxerto-boot.img
+      * Tải trực tiếp `bergamota-fastboot.img`: https://github.com/HouseOfBalance/ios26-sapphire/releases/download/boot-20261105-ramdisk/bergamota-fastboot.img
 - **Lệnh Khởi động cho Người dùng (Fastboot Boot):**
   ```powershell
   cd C:\Users\hungtv\Downloads\platform-tools
