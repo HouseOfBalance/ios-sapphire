@@ -1,10 +1,10 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-06: Userland PID 1 Lifecycle Ladder, Console Unhang & Video Console Display, Commit `3729ddd`)
+## Agent handoff / active work (2026-11-06: Userland PID 1 First Syscall Verified, Forced Text Console Mode & Verbose Boot, Commit `3fda45e`)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 + A53).
-- **Phân tích Thực tế từ 5 Ảnh Boot Thiết bị Mới Nhất (Run ID `42061456645`, Commit `88c3b3b`):**
-  - Màn hình Enxerto: `ENTRY FFFFFFFF0075194A0`, `SEGS n=0000000B end=82E6C000`, nhảy vào XNU tại `0x815194a8`.
-  - Toàn bộ thang vạch boot kernel & BSD đã sáng đèn hoàn chỉnh:
+- **Phân tích Thực tế từ Ảnh Boot Thiết bị (Run ID `42128156318`, Commit `3729ddd`):**
+  - Màn hình Enxerto: `ENTRY FFFFFFFF0075194A0`, `SEGS n=0000000B end=82E64000`, nhảy vào XNU tại `0x815194a8`.
+  - Toàn bộ thang vạch boot kernel, BSD và Userland PID 1 đã sáng đèn hoàn chỉnh:
     - Row 280 (Lime): `vm_pages` stolen thành công.
     - Row 288 (Dark Orange): `vm_pages_end` tính toán xong.
     - Row 296 (Vivid Yellow): `PRE-LOCK` vượt qua.
@@ -15,34 +15,31 @@
     - Row 186 (Hot Pink): `kernel_bootstrap_thread` entry.
     - Row 500..580: `bsd_init` (`bcache_init`, `vfs_init`, `devfs_kernel_mount`, `mbuf_init`, `net_init`, `bsd_autoconf`) hoàn tất 100%.
     - Row 600 (Dark Cyan): `IOFindBSDRoot` entry.
+    - Row 610 (Lime): `rd=md0` selected.
+    - Row 615 (Spring Green): `vfs_mountroot()` thành công (Mockfs rootfs đã mount).
+    - Row 620 (Deep Sky Blue): `bsd_utaskbootstrap()` tạo PID 1 task thành công.
+    - Row 630 (Dark Orange): `bsdinit_task` thread của PID 1 bắt đầu chạy.
+    - Row 640 (Magenta): `load_init_program(p)` nạp `/sbin/launchd` Mach-O arm64e thành công và handoff sang EL0.
+    - **Row 650 (Vivid Yellow):** Bắt trúng system call `svc #0x80` đầu tiên từ Userland EL0 của PID 1 trong `bsd/dev/arm/systemcalls.c`!
     - Row 660 (Red Panic) & Row 680 (Magenta Fault): **HOÀN TOÀN KHÔNG XUẤT HIỆN**! XNU không hề panic hay crash.
-- **Nguyên nhân Gốc Được Định vị Chính xác Khiến Màn Hình Chưa Hiện Text:**
-  1. **Treo Vòng lặp Vô hạn trong `dummy_init` (`tools/mkramdisk.py`):**
-     - Đoạn code `assemble_dummy_init()` cũ:
-       ```assembly
-       ADR x0, path_console   # "/dev/console"
-       movz x1, #2            # O_RDWR
-       movz x2, #0
-       movz x16, #5           # SYS_open
-       svc #0x80
-       b.cs hang              # Nếu mở lỗi (carry set), nhảy thẳng vào b hang!
-       ```
-     - Trên hệ thống Mockfs RAMDisk sớm, `/dev/console` chưa sẵn sàng cho `O_RDWR` (hoặc trả về Carry Set).
-     - Instruction `b.cs hang` khiến tiến trình PID 1 lập tức nhảy vào vòng lặp spin `hang: b hang` ở userland EL0, không bao giờ chạy đến đoạn in banner!
-  2. **`serial=3` Trong Command Line Cướp Mất Console Của Màn Hình:**
-     - Trong `.github/workflows/build-xnu-12377.yml` và `tools/mkpayload.py`, cờ `serial=3` kích hoạt bit `SERIALMODE_OUTPUT`, khiến `osfmk/arm/arm_init.c` gọi `switch_to_serial_console()` chuyển hướng toàn bộ text console sang chân UART phần cứng thay vì framebuffer `video_console` (AMOLED).
-  3. **Thiếu Vạch Chẩn đoán cho Giai đoạn Userland PID 1:**
-     - Sau Row 600 chưa có vạch đánh dấu `vfs_mountroot`, `bsd_utaskbootstrap`, `load_init_program` và syscall của PID 1.
-- **Biện pháp Khắc phục Triệt để Đã Áp dụng & Đẩy lên GitHub (Commit `3729ddd`):**
-  1. **Khắc phục Hoàn toàn `dummy_init` trong `tools/mkramdisk.py`:**
-     - Bổ sung opcode hỗ trợ điều kiện `B_CC` (Carry Clear, condition 3) trong mini assembler.
-     - Triệt tiêu hoàn toàn lệnh `b.cs hang`. Khi mở `/dev/console` với `O_RDWR=2` gặp lỗi, tự động fallback sang `O_WRONLY=1`; nếu vẫn lỗi thì fallback sang `fd = 1` (stdout) và tiếp tục thực thi ghi banner thay vì treo máy.
-     - Vượt qua 100% (7/7) bài test trong bộ unit test của `mkramdisk.py`.
-  2. **Bảo tồn Màn hình `video_console` Cho Console Text:**
-     - Sửa `serial=3` thành `serial=0` trong `tools/mkpayload.py` và `.github/workflows/build-xnu-12377.yml`.
-     - Giữ nguyên hiển thị video console trên AMOLED bắt đầu từ hàng pixel 720 theo thiết kế dual-region của `video_console.c`.
-  3. **Định vị Chuẩn Anchor `rd=md0` trong `kernel/patch_iokit_root.py`:**
-     - Khớp chính xác pattern `rootName[0] = 'm';` trong `iokit/bsddev/IOKitBSDInit.cpp` của XNU 12377.121.6 để vẽ Row 610 (Lime `0x0000FF00`).
+- **Nguyên nhân Khiến Chữ Chưa Hiện Dưới Hàng 720:**
+  1. Trong `pexpert/arm/pe_init.c`: Khi `PE_state.video.v_display` khác 0, XNU mặc định gọi `PE_initialize_console(&PE_state.video, kPEGraphicsMode)`. Chế độ Graphics Mode này tắt cờ `gc_enabled = FALSE` (dành cho màn hình hiện logo Apple/thanh loading trên iPhone), khiến mọi ký tự do `printf`, `kprintf`, và PID 1 `SYS_write` gửi tới `/dev/console` đều bị rơi vào khoảng không (`dropped` trong `vcputc_options`).
+  2. Thiếu boot-arg `-v` (verbose boot) trong command line để bật luồng console text.
+- **Biện pháp Khắc phục Đã Áp dụng & Đẩy lên GitHub (Commit `3fda45e`):**
+  1. **Ép Buộc Text Mode trong `pexpert/arm/pe_init.c` (`kernel/patch_cortex_a73.py`):**
+     - Sửa lệnh khởi tạo sang luôn gọi `PE_initialize_console(&PE_state.video, kPETextMode);`.
+  2. **Bảo Vệ Luồng Ký Tự Trong `osfmk/console/video_console.c` (`kernel/patch_cortex_a73.py`):**
+     - Trong `vcputc_options`, luôn set `gc_enabled = TRUE` khi `gc_initialized` để đảm bảo mọi ký tự đều được `gc_putchar(c)` vẽ lên màn hình, không bao giờ bị discard.
+  3. **Thêm Verbose Boot Flag (`-v`) Trong Command Line:**
+     - Bổ sung `-v` vào `--cmdline` trong cả `.github/workflows/build-xnu-12377.yml` và `tools/mkpayload.py`.
+- **CI Build Hiện tại (2026-11-06):**
+  - Commit: `3fda45e`
+  - GitHub Actions Run ID: `42131512777` (`HouseOfBalance/ios26-sapphire`).
+  - Giao thức nhận file: Người dùng tự tải trực tiếp artifact từ GitHub Actions run để test.
+  ```powershell
+  cd C:\Users\hungtv\Downloads\platform-tools
+  .\fastboot.exe boot enxerto-boot.img
+  ```
   4. **Bổ sung Thang Vạch Giám sát Toàn diện Vòng đời Userland PID 1 (`kernel/patch_bsd_init.py`):**
      - Row 615 (Spring Green `0x0000FF7F`): `vfs_mountroot()` thành công (Mockfs rootfs đã mount).
      - Row 620 (Deep Sky Blue `0x0000BFFF`): `bsd_utaskbootstrap()` hoàn tất (PID 1 task đã tạo).
