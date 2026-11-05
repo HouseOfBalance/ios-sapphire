@@ -40,7 +40,9 @@
       Bổ sung bộ đếm 1000 vòng lặp cho tất cả các helper LL/SC (`atomic_cas32_llsc`, `atomic_cas64_llsc`, `atomic_swp32_llsc`, `atomic_swp64_llsc`, `atomic_ldadd32_llsc`, `atomic_ldadd64_llsc`). Nếu phần cứng exclusive monitor của Cortex-A73 trả về failure liên tục do bộ nhớ chưa đồng bộ inner-shareable, hàm sẽ tự động fallback sang ghi trực tiếp (`str`) và thoát vòng lặp an toàn, triệt tiêu 100% nguy cơ treo spin vô tận.
     - **Bảo vệ Vùng Lỗ Firmware Qualcomm Bengal (`kernel/patch_ram_alignment.py`):**
       Xác nhận `avail_end` được khóa cứng tại `0x85800000ULL`, bảo vệ an toàn tuyệt đối dải nhớ TrustZone/Hyp `0x85800000..0x86400000` khỏi bị cấp phát nhầm gây SError panic.
-- **Lệnh Khởi động cho Người dùng (Fastboot Boot):**
+- **CI Build & Delivery (2026-11-05):**
+  - Run ID `42046768412` đang chạy trên GitHub Actions (`HouseOfBalance/ios26-sapphire`).
+  - Giao thức nhận file: Người dùng tự tải trực tiếp artifact `hakios-ios26-sapphire` từ GitHub Actions run, không cần agent tự tạo Release trên git.
   ```powershell
   cd C:\Users\hungtv\Downloads\platform-tools
   .\fastboot.exe boot enxerto-boot.img
