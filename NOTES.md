@@ -25,10 +25,15 @@
      - `redwood_adsp.c` (4 errors): Stub các hàm public adsp (`redwood_adsp_apr`, `redwood_adsp_fw_file`, `redwood_adsp_fw_free`, `redwood_adsp_init`, `redwood_adsp_stop`, `redwood_adsp_quiesce`).
      - `redwood_wifi.c` (8 errors): Stub các hàm public wifi (`redwood_wifi_say`, `redwood_wifi_tell`, `redwood_wifi_option`, `redwood_wifi_file`, `redwood_wifi_radio_map`, `redwood_wifi_dsp_is_up`, `redwood_wifi_stop`, `redwood_wifi_quiesce`, `redwood_wifi_init`).
      - `redwood_lx.c` (4 errors): Stub các hàm bridge Wi-Fi LinuxKPI (`lx_os_*`, `redwood_lx_*`).
-  6. *Sửa lỗi thiếu định danh `NULL` và Kích hoạt CI:*
-     - Run `42016092032` xác nhận toàn bộ 68 lỗi API đã sạch 100%, chỉ còn 7 cảnh báo thiếu `<stddef.h>` cho `NULL` trong 3 stub (`redwood_adsp.c`, `redwood_lx.c`, `redwood_wifi.c`).
-     - Bổ sung `#include <stddef.h>` cho cả 3 file (Commit `c669283`).
-     - GitHub Actions Run ID `42016873366` đang chạy trên macOS-15 runner.
+  6. *Định nghĩa đầy đủ 29 ký hiệu Linker cho GPU, RPMh, ADSP và Crash Report (Commit `5a13826`):*
+     - Sau khi toàn bộ các file C/C++ biên dịch thành công 100%, linker báo thiếu 29 symbol từ driver cũ:
+       * 18 hàm Redwood GPU & biến `gpu_log`, `gpu_va` (`redwood_adreno.c` -> phục vụ `RedwoodGPU.cpp`).
+       * `redwood_ddr_quiesce` (`redwood_cpufreq.c` -> phục vụ `loader_return.c`).
+       * `redwood_touch_last` (`redwood_input.c` -> phục vụ `hakios_dada_cpu.c`).
+       * `hk_crash_report` (`loader_return.c` -> phục vụ `kern_sig.c`).
+       * 7 hàm Bengal RPMh/ADSP/MPSS (`redwood_adsp.c` -> `hakios_adsp_gpr*`, `hakios_aop_send`, `hakios_mpss_state`, `hakios_rpmh_*`).
+     - Đã bổ sung định nghĩa chuẩn xác 100% cho toàn bộ 29 symbol (Commit `5a13826`).
+     - GitHub Actions Run ID `42018209259` đang chạy trên macOS-15 runner.
 - **Hoàn thành tự động toàn bộ 4 Đợt theo nguyên tắc "Mỗi file chỉ một chủ" (Single File Ownership) và không giẫm chân nhau:**
   1. *ĐỢT 0 - Nền tảng Bắt buộc & Định vị Lỗi (Đã hoàn thành & test pass 100%):*
      - **Agent 0.1 (`osfmk/arm64/sleh.c` qua `0003-sleh-hook.patch`):** Bẫy ngoại lệ `VBAR_EL1` kết nối trực tiếp với bộ vẽ font ASCII `hk_render_screen_asm`, dump PC, LR, SP, ESR, FAR, insn ra màn hình.
