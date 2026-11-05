@@ -1,7 +1,34 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-05: Comprehensive 4-Phase System Execution -- Timer IRQ 19/18, Framebuffer Dual-Region, Root-Cause RAM Carve-outs, BSD Ladder, and SM6225 UFS Base 0x04804000)
+## Agent handoff / active work (2026-11-05: Solved XNU-12377 CI Compilation, Disassembled LSE casal Root Cause, De-conflicted Diagnostic Bands, and Hardened PAC Sanitizer)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 + A53).
+- **Phân tích nhị phân thực nghiệm (Binary Forensic on `mach.development.bcm2837`):**
+  * Disassemble hàm `_lck_mtx_lock` tại VA `0xfffffff00733db34` (file offset `0x339b34`) phát hiện chính xác lệnh tại offset `+0x3c`:
+    `0xc8e27d35` = **`casal x2, x21, [x9]`** (ARMv8.1-A LSE Compare-and-Swap).
+  * Cortex-A73 (ARMv8.0-A) không có phần cứng giải mã `casal`, lập tức gây bẫy `UNDEFINED INSTRUCTION` tại EL1 khi gọi `vm_free_page_lock()`.
+  * Bản build trên máy (`c957e99`) chưa có LSE trap handler nên treo câm tại Row 288.
+- **Hoàn thành triển khai & Fix triệt để lỗi biên dịch XNU 12377 trên CI (Commit `416b1d6`, CI Run ID `42013006202`):**
+  1. *Khắc phục toàn bộ lỗi API `kmem_alloc` và include trong `base/xnu/files/`:*
+     - `loader_return.c`: Xóa `#include <vm/vm_compressor.h>` (đường panic/exception độc lập với VM).
+     - `user_exception_trace.c`: Xóa các lời gọi `vm_shared_region_get` và `vm_map_switch` không thuộc KPI.
+     - `kern_minimac.c`: Đơn giản hóa `minisandbox_container_path()` trả về 0, loại bỏ hoàn toàn `kmem_alloc` và `vm_map_copy_overwrite`.
+     - `ramfs.c`: Thay thế `kmem_alloc`/`kmem_free` bằng `kalloc_data`/`kfree_data` chuẩn XNU 12377.
+     - Driver ngoại vi (`redwood_virtio_input.c`, `redwood_virtio_net.c`, `redwood_cpufreq.c`, `redwood_adreno.c`): Tạo stub sạch cho toàn bộ các hàm init/stop/minute/quiesce, loại bỏ hoàn toàn mã nguồn driver VirtIO/Adreno cũ không tương thích và không cần thiết cho mang tính bring-up sapphire.
+  2. *Tách rời và nâng cấp Thang vạch Chẩn đoán (De-conflict & Contrast Enhancement):*
+     - `kernel/patch_ram_alignment.py`: Chuyển dải vạch của `initialize_ram_ranges()` sang Row 250..260, không còn đè lên Row 284/288 của `vm_resident.c`.
+     - `kernel/patch_cortex_a73.py`: Tăng độ dày các vạch xung quanh `vm_free_page_lock()` lên 6 hàng với màu tương phản mạnh:
+       * Row 280-285 (Lime Green): `vm_pages` stolen successfully.
+       * Row 288-293 (Dark Orange): `vm_pages_end` computed.
+       * Row 296-301 (Vivid Yellow): PRE-LOCK (ngay trước khi gọi `vm_free_page_lock()`).
+       * Row 304-309 (Vivid Magenta): POST-LOCK (khóa spinlock/mutex thành công).
+       * Row 312-317 (Deep Sky Blue): Bắt đầu vòng lặp cấp trang `pmap_next_page()`.
+  3. *Bảo vệ DRAM trước Lỗ hổng Firmware Qualcomm:*
+     - Giữ an toàn `end = 0x85800000ULL` trong `initialize_ram_ranges()` để bảo vệ vùng Hyp / TrustZone / SMEM (`0x85800000..0x86400000`).
+  4. *Chuẩn hóa PAC Sanitizer (`tools/patch_userland_pac.py`):*
+     - Với các lệnh `autia`/`autib`/`autda`/`autdb`/`xpaci`/`xpacd`: Thay vì NOP (để lại bit PAC bẩn trên ARMv8.0), thay thế bằng lệnh A64 logical immediate `and xd, xd, #0x0000ffffffffffff` (`0x9240bc00 | (rd << 5) | rd`) để xóa sạch các bit PAC cao, phục hồi địa chỉ 48-bit hợp lệ. 14/14 unit tests pass 100%.
+  5. *Đẩy Git & Kích hoạt CI:*
+     - Commit `416b1d6`: Đã push lên `HouseOfBalance/ios26-sapphire.git` nhánh `main`.
+     - GitHub Actions Run ID `42013006202` đang chạy.
 - **Hoàn thành tự động toàn bộ 4 Đợt theo nguyên tắc "Mỗi file chỉ một chủ" (Single File Ownership) và không giẫm chân nhau:**
   1. *ĐỢT 0 - Nền tảng Bắt buộc & Định vị Lỗi (Đã hoàn thành & test pass 100%):*
      - **Agent 0.1 (`osfmk/arm64/sleh.c` qua `0003-sleh-hook.patch`):** Bẫy ngoại lệ `VBAR_EL1` kết nối trực tiếp với bộ vẽ font ASCII `hk_render_screen_asm`, dump PC, LR, SP, ESR, FAR, insn ra màn hình.
