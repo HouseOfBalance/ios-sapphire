@@ -1,35 +1,53 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-05: Real Hardware Boot Breakthrough - LSE Casal Emulation PASSED, Kernel Reached BSD Subsystem bsd_init at Row 500, Polling for Root Device rd=md0)
+## Agent handoff / active work (2026-11-05: Embedded Mockfs RAMDisk with PID 1 Launchd into enxerto-boot.img, ADT RAMDisk Registered, Deployed to platform-tools)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 + A53).
-- **Phân tích Quang phổ & Vi kiến trúc Đột phá từ 2 Ảnh Boot Thực tế (`media_1793878465933_20783bbf.jpg` & `media_1793878466385_f8a6d892.jpg`):**
-  * **1. Bẫy & Mô phỏng LSE Atomics `casal` THÀNH CÔNG 100%:**
-    - Lệnh `0xc8e27d35` (`casal x2, x21, [x9]`) tại `_lck_mtx_lock + 0x3c` đã được bẫy chính xác qua `VBAR_EL1` -> `sleh_synchronous` -> `lse_patch_handle_trap`.
-    - Trình xử lý đã mô phỏng CAS bằng chuỗi LL/SC (`ldaxr`/`stlxr`) nguyên tử trên Direct Map vật lý `PHYSTOKV(pa)` mà không clobber stack hay register.
-    - Điểm nghẽn lịch sử tại `vm_free_page_lock` đã được vượt qua hoàn toàn!
-  * **2. Khắc phục ngộ nhận về điểm treo `pmap_startup`:**
-    - Script phân tích cũ (`scratch/analyze_new_bands.py`) crop ảnh ở độ cao 240px (`Crop2 size: 850x240`), vô tình cắt mất nửa dưới của thang vạch chẩn đoán.
-    - Phân tích toàn diện 576px (`scratch/all_bands_crop.png`) trên ảnh xoay thẳng đứng (`ladder_rot90.png`) xác nhận thang vạch tiếp tục chạy sâu xuống phía dưới:
-      * **Band 2 (y=87..178):** Toàn bộ chuỗi `arm_init` -> `cpu_data_init` -> `arm_vm_init` -> `pmap_startup` -> `vm_mem_bootstrap` (Lime, Cyan, Magenta, Yellow, Violet, White, Orange, Chartreuse) -> **PASSED**.
-      * **Band 3 (y=188..194, peak y=192, Hex `#e7af8c` / RGB 231,175,140):** **Row 360 (Coral `#00FF7F50`)** = `minimac_policy` -> **PASSED**.
-      * **Band 4 (y=234..241, peak y=238, Hex `#16db98` / RGB 22,219,152):** **Rows 376..384 (Mint/Spring Green `#0098FF98` / `#0000FF7F`)** = `STARTUP_SUB_LOCKDOWN` -> `scale_setup()` -> `handoff to bsd_init` -> **PASSED**.
-      * **Band 5 (y=274..293):**
-        - Peak y=278 (Hex `#d7a03e` / RGB 215,160,62): **Row 500 (Goldenrod `#00DAA520`) = `bsd_init` ENTERED -> PASSED!**
-        - y=281..283 (Hex `#99be83` / RGB 153,190,131): **Row 520 (Yellow-Green `#009ACD32`) = `vfs_init` done -> PASSED!**
-        - y=284..287 (Hex `#89aedd` / RGB 137,174,221): **Row 530/580 (Blue/Cyan) = `devfs` / `calling bsd_autoconf` -> PASSED!**
-  * **3. Không có Panic / Không có Exception SError / Không Reset:**
-    - Hoàn toàn KHÔNG có vạch Đỏ tại row 200 (UNDEF), row 210 (PANIC) hay row 220 (LOADER_RETURN).
-    - Màn hình giữ nguyên màu xanh đồng nhất và không có văn bản crash dump `=== HAKIOS KERNEL PANIC ===`.
-  * **4. Xác định chính xác Điểm dừng Hiện tại (Root Cause of Pause):**
-    - Kernel đang thực thi trong `IOFindBSDRoot()` (`iokit/bsddev/IOKitBSDInit.cpp`) thuộc chuỗi `bsd_autoconf()` -> `vfs_mountroot()`.
-    - Bootargs truyền vào là `rd=md0` (yêu cầu mount rootfs từ RAMDisk `md0`).
-    - Tuy nhiên, image `enxerto-boot.img` hiện tại chưa được nhúng RAMDisk (`RAMDisk occurrences in boot image = 0`), khiến ADT `/chosen/memory-map` không có thuộc tính `RAMDisk`.
-    - Do không có property `RAMDisk`, `mdevinit()` không khởi tạo device node `md0`.
-    - `IOFindBSDRoot()` rơi vào vòng lặp chờ chuẩn: `IOSleep(kSecondScale / 10)` để đợi driver `md0` xuất hiện. Vì không có timeout crash, CPU sleep im lặng chờ thiết bị root.
-- **Hành động Tiếp theo (Next Concrete Action):**
-  1. Sử dụng công cụ `tools/mkramdisk.py` để đóng gói RAMDisk (HFS+ hoặc Mockfs) chứa binary tĩnh `/sbin/launchd` đã được xử lý PAC (`tools/patch_userland_pac.py`).
-  2. Dùng `tools/mkpayload.py --ramdisk <ramdisk_image>` đóng gói lại `payload.bin`, tự động đăng ký `/chosen/memory-map/RAMDisk = <phys, size>` vào ADT.
-  3. Khi boot với `rd=md0`, `mdevinit()` sẽ tạo `md0`, `IOFindBSDRoot()` khớp ngay lập tức, vẽ vạch Lime (Row 610), mount rootfs và kích hoạt `load_init_program()` gọi PID 1 (`launchd`)!
+- **Hoàn thành Đóng gói & Triển khai RAMDisk Trực tiếp vào Boot Image (Commit `fda2553` trên `ios26-sapphire`):**
+  * **1. Tạo Mockfs RAMDisk Chứa PID 1 (`/sbin/launchd`):**
+    - Sử dụng `tools/mkramdisk.py --format mockfs --arch arm64e out/ramdisk.img`:
+      * Tạo binary Mach-O tĩnh ARM64E (subtype `0x80000002`) thuần túy cho PID 1 (`org.sweet.init`).
+      * Căn chỉnh SP 16-byte khi khởi động để triệt tiêu lỗi SP alignment fault phần cứng Cortex-A73.
+      * Mở `/dev/console`, in banner chào `=== HAKIOS USERLAND PID 1 ALIVE ===`, lấy PID qua `getpid()` và lặp nhịp tim mỗi 5 giây qua `select()`.
+      * Ký ad-hoc SHA-256 CodeDirectory theo chuẩn trang 4KB; dung lượng ramdisk 32,768 bytes (32 KB), căn chỉnh nghiêm ngặt 16KB granule.
+      * Quét qua `tools/patch_userland_pac.py`: Xác nhận 100% lệnh ARMv8.0 sạch, không có PAC trap.
+  * **2. Tích hợp RAMDisk vào Payload & Cập nhật ADT (`tools/mkpayload.py`):**
+    - Đóng gói cùng kernel `mach.development.bcm2837` (27,645,288 bytes) và DeviceTree `sapphire.adt`.
+    - Payload mở rộng lên **11 segments** (Segment 10 = RAMDisk):
+      * RAMDisk nạp tại PA vật lý: `0x82e64000`, kích thước: `0x8000` (32 KB).
+      * `kernel_end` dời lên `0xfffffff008e6c000`, ADT đặt tại `0x82e6c000`, `boot_args` tại `0x82e70000`.
+      * `topOfKernelData` bảo vệ toàn bộ vùng RAMDisk, ngăn pmap cấp phát trùng vùng nhớ RAMDisk.
+      * Tự động đăng ký thuộc tính `/chosen/memory-map/RAMDisk = <0x82e64000, 0x8000>` vào ADT.
+  * **3. Biên dịch Loader Enxerto & Đóng gói Android Boot v4 (`enxerto/build.py`):**
+    - Biên dịch sạch 100% với `aarch64-none-elf-gcc` 13.3.1 Rel1, zero absolute relocations.
+    - Nhúng `payload.bin` (10,025,152 bytes) vào sau Loader Image tại biên 4K (`0xa2000`).
+    - Cập nhật header Android boot v4: `kernel_size = 10,688,704`, `ramdisk_size = 69` (empty cpio).
+    - Image hoàn chỉnh: `enxerto-boot.img` (10,698,752 bytes, SHA256: `0885a93a252fc959...`).
+  * **4. Triển khai Sẵn sàng vào Thư mục Thực thi:**
+    - Đã sao lưu bản cũ thành `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img.bak_pre_rd`.
+    - Đã ghi đè file mới tại `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img` (10,698,752 bytes, 11/5/2026 7:31 PM).
+    - Cập nhật CI workflow: commit `fda2553` đã push lên GitHub repo `HouseOfBalance/ios26-sapphire`.
+- **Lệnh Khởi động cho Người dùng (Fastboot Boot):**
+  ```powershell
+  cd C:\Users\hungtv\Downloads\platform-tools
+  .\fastboot.exe boot enxerto-boot.img
+  ```
+- **Hiện tượng Dự kiến trên Màn hình Điện thoại:**
+  1. *Giai đoạn Enxerto Bootloader:*
+     - Màn hình hiển thị: `SEGS n=0000000B end=82E6C000`.
+     - Vạch nạp 11 segments kết thúc mượt mà, nhảy vào XNU tại `0x815194a8`.
+  2. *Giai đoạn XNU Kernel & BSD (Thang vạch chẩn đoán):*
+     - Toàn bộ chuỗi Row 50..580 sáng đèn (arm_init, pmap, minimac, bsd_init, vfs_init, bsd_autoconf).
+     - Row 600 (Dark Cyan `#00008B8B`): `IOFindBSDRoot` bắt đầu tìm kiếm rootfs.
+     - Row 610 (Lime `#0000FF00`): Khớp ngay lập tức với `rd=md0` từ ADT RAMDisk (không còn bị sleep chờ).
+  3. *Giai đoạn Mount Root & Userland PID 1:*
+     - `vfs_mountroot()` gọi `mockfs_mountroot()`, mount `/dev/md0` thành `/`.
+     - `load_init_program()` nạp `/sbin/launchd` (PID 1).
+     - Console text xuất hiện dưới Row 720:
+       ```text
+       === HAKIOS USERLAND PID 1 ALIVE ===
+       Running as PID: 1
+       [sweet-init] alive (5s heartbeat)
+       ```
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 + A53).
 - **Phân tích nhị phân thực nghiệm (Binary Forensic on `mach.development.bcm2837`):**
   * Disassemble hàm `_lck_mtx_lock` tại VA `0xfffffff00733db34` (file offset `0x339b34`) phát hiện chính xác lệnh tại offset `+0x3c`:
