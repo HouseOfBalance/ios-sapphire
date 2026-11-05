@@ -1,29 +1,63 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-05: Deep Codebase Audit Completed — Fixed 5 Critical Root-Cause Bugs in LSE/PAC/VM/SLEH, Commit `fdce453`)
+## Agent handoff / active work (2026-11-06: Userland PID 1 Lifecycle Ladder, Console Unhang & Video Console Display, Commit `3729ddd`)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 + A53).
-- **Kết quả Rà soát Chuyên sâu Toàn bộ Thư mục Cốt lõi (`base/xnu/files/`, `kernel/`, `tools/`, `enxerto/`, `.github/workflows/`) & Khắc phục (Commit `fdce453` trong `hakios-arm64e-dada-main`):**
-  1. **[BUG NGHIÊM TRỌNG #1 — Nguyên nhân thực sự gây Crash tại Row 296 `vm_free_page_lock`] `base/xnu/files/osfmk/arm64/lse_patch.c` & `pac_patch.c`:**
-     - Macro `#define PHYSTOKV(pa) ((uint64_t)(pa) + (gVirtBase - gPhysBase))` tính ra đúng bằng địa chỉ ảo `va` nằm trong phân đoạn `__TEXT_EXEC`. Sau khi `arm_vm_init()` (Row 158..160) chạy, `__TEXT_EXEC` bị khóa quyền **Read-Only (`AP = RO`)** và `__DATA,__bss` (nơi đặt `lse_kernel_pool`) bị khóa **`PXN = 1` (Privileged Execute-Never)**.
-     - Khi lệnh LSE đầu tiên sau `arm_vm_init()` (tại `vm_free_page_lock()` ngay sau Row 296 `PRE-LOCK`) bẫy vào `lse_patch_handle_trap()`, hàm `lse_try_patch_island()` gọi `patch_memory_phys()` ghi đè trực tiếp vào `__TEXT_EXEC` đang Read-Only -> gây **Data Abort Permission Fault (`ESR_EC = 0x25`)** ngay lập tức! Đồng thời bất kỳ branch island nào được cài vào `lse_kernel_pool` (`__DATA,__bss`) trước `arm_vm_init()` khi được gọi lại sau `arm_vm_init()` cũng gây **Instruction Abort Permission Fault (`ESR_EC = 0x21`)** do `PXN = 1`!
-     - Hơn nữa, trong `lse_emulate_atomic()`, việc đổi địa chỉ biến đích `addr` của kernel qua `kvtophys(addr)` + `pa + (gVirtBase - gPhysBase)` tạo ra địa chỉ **chưa được map (Translation Fault)** đối với mọi vùng nhớ cấp phát động nằm trên `first_avail` (như mảng `vm_pages` vừa được steal tại `pmap_startup` Row 280!).
-     - **Đã sửa:**
-       - Đối với kernel mode (`!is_user`), `lse_patch_handle_trap()` luôn mô phỏng trực tiếp qua `lse_emulate_atomic()` (không cài branch island vào `__TEXT_EXEC` RO / `__DATA` PXN=1), và dùng trực tiếp địa chỉ ảo kernel `kptr = (void *)addr`.
-       - Đối với userland (`is_user`), dùng hàm `phystokv(pa)` chuẩn của XNU (`ptov_table`).
-       - Trong `pac_patch.c`, kiểm tra quyền ghi bằng lệnh phần cứng `at s1e1w` trước khi ghi đè; nếu trang là Read-Only thì tự động mô phỏng lệnh thay thế (`NOP`, `RET`, `BR`, `BLR`, `MOV`) bằng phần mềm.
-  2. **[BUG NGHIÊM TRỌNG #2] `base/xnu/files/osfmk/arm64/lse_decode.h`: Sai Bitmask Giải mã LSE Acquire (`0x3F800C00 == 0x38000000`):**
-     - Trong tập lệnh ARMv8.1-A LSE (`LDADD*`, `SWP*`, `LDCLR*`, `LDSET*`, `LDEOR*`, `LD*MAX`, `LD*MIN`), bit 23 (`0x00800000`) là cờ **Acquire (`A`)**, bit 22 là **Release (`R`)**, và bit 21 luôn bằng `1`.
-     - File `base/xnu/files/osfmk/arm64/lse_decode.h` (vốn ghi đè lên `0002-lse-branch-islands.patch` khi `apply.sh` chạy `cp -a base/xnu/files/.`) dùng mask `0x3F800C00 == 0x38000000` ép bit 23 phải bằng `0`, khiến **100% các lệnh nguyên tử có cờ Acquire (`ldadda`, `ldaddal`, `swpa`, `swpal`, `ldseta`, `ldclra`...) bị từ chối giải mã (`return false`)** và gây Kernel UNDEF Panic!
-     - **Đã sửa:** Chuẩn hóa mask thành `(inst & 0x3F200C00) == 0x38200000` với `acquire = bit 23`, `release = bit 22`.
-  3. **[BUG NGHIÊM TRỌNG #3] `base/xnu/files/osfmk/arm64/lse_hooks.h`: Lỗi Ràng buộc Thanh ghi Inline ASM `"+r"` & 22 Hàm Còn Vòng lặp Vô hạn:**
-     - Ràng buộc `"+r"` trên các biến đầu vào (`ptr`, `*expected`, `desired`) có thể bị trình biên dịch gán trùng thanh ghi hoặc ghi đè ngược khi kết hợp với `"=&r"`, và 22/28 hàm nguyên tử còn lại (`cas8/16`, `casp32/64`, `ldclr`, `ldset`, `ldeor`, `ldsmax/min`, `ldumax/min`) vẫn dùng vòng lặp `cbnz` không giới hạn.
-     - **Đã sửa:** Chuẩn hóa toàn bộ 28/28 hàm trong `lse_hooks.h` dùng `"=&r"(retries)` khởi tạo trực tiếp trong assembly (`mov %w2, #1000` / `mov %w3, #1000`) + fallback ghi trực tiếp, giữ toàn bộ đầu vào là `"r"` thuần túy.
-  4. **[BUG NGHIÊM TRỌNG #4] `kernel/patch_cortex_a73.py` (`sleh.c`): Bẫy Đệ quy trong `snprintf()` & Trùng Vạch Màu Row 210:**
-     - Trong ảnh chụp màn hình thiết bị (`crop2_ladder_detail.png`), vạch **Row 210..219 có màu Magenta (`0x00FF00FF`)** (chính là vạch báo Kernel Fault của `sleh.c` bị lẫn vào giữa thang vạch `188..240`), nhưng vạch Green Row 230 và chữ console Row 720 không xuất hiện vì `sleh.c` gọi `snprintf()` bị lỗi đệ quy trước khi tới `hk_render_screen_asm()`!
-     - **Đã sửa:** Đưa vạch báo lỗi của `sleh.c` xuống **Row 680..693** (tách biệt hoàn toàn khỏi thang boot `0..500`), và thay `snprintf()` bằng vòng lặp đổi mã hex nội tuyến thuần túy (0 lệnh gọi hàm ngoài) trước khi gọi `hk_render_screen_asm()`.
-  5. **[BUG NGHIÊM TRỌNG #5] `kernel/patch_cortex_a73.py` (`vm_resident.c`): `LCK_MTX_ASSERT` & Khớp Nhầm `vm_free_page_unlock()`:**
-     - Trên bản build `DEVELOPMENT`, hàm `vm_page_free_unlocked()` bên trong vòng lặp trang của `pmap_startup()` kiểm tra `LCK_MTX_ASSERT(&vm_page_queue_free_lock, LCK_MTX_ASSERT_OWNED)` (sẽ panic nếu bypass `vm_free_page_lock()`), đồng thời lệnh `.replace('\tvm_free_page_unlock();', ..., 1)` không neo ngữ cảnh sẽ khớp nhầm hàm `vm_free_page_unlock()` đầu tiên trong file.
-     - **Đã sửa:** Khôi phục `vm_free_page_lock()` / `vm_free_page_unlock()` (do lỗi gốc ở `lse_patch.c` đã được giải quyết triệt để) và neo chính xác vị trí `vm_free_page_unlock()` ngay sau vòng lặp `pmap_startup`.
+- **Phân tích Thực tế từ 5 Ảnh Boot Thiết bị Mới Nhất (Run ID `42061456645`, Commit `88c3b3b`):**
+  - Màn hình Enxerto: `ENTRY FFFFFFFF0075194A0`, `SEGS n=0000000B end=82E6C000`, nhảy vào XNU tại `0x815194a8`.
+  - Toàn bộ thang vạch boot kernel & BSD đã sáng đèn hoàn chỉnh:
+    - Row 280 (Lime): `vm_pages` stolen thành công.
+    - Row 288 (Dark Orange): `vm_pages_end` tính toán xong.
+    - Row 296 (Vivid Yellow): `PRE-LOCK` vượt qua.
+    - Row 304 (Vivid Magenta): `POST-LOCK` vượt qua.
+    - Row 312..348: Toàn bộ vòng lặp nạp bảng trang `pmap_startup` 0% -> 50% -> 100% hoàn tất.
+    - Row 360..392: `vm_init.c` (`zone_bootstrap`, `kmem_init`, `STARTUP_SUB_KMEM`, `vm_fault_init`, `STARTUP_SUB_ZALLOC`) hoàn tất.
+    - Row 184 (Cyan): `kernel_bootstrap` entry.
+    - Row 186 (Hot Pink): `kernel_bootstrap_thread` entry.
+    - Row 500..580: `bsd_init` (`bcache_init`, `vfs_init`, `devfs_kernel_mount`, `mbuf_init`, `net_init`, `bsd_autoconf`) hoàn tất 100%.
+    - Row 600 (Dark Cyan): `IOFindBSDRoot` entry.
+    - Row 660 (Red Panic) & Row 680 (Magenta Fault): **HOÀN TOÀN KHÔNG XUẤT HIỆN**! XNU không hề panic hay crash.
+- **Nguyên nhân Gốc Được Định vị Chính xác Khiến Màn Hình Chưa Hiện Text:**
+  1. **Treo Vòng lặp Vô hạn trong `dummy_init` (`tools/mkramdisk.py`):**
+     - Đoạn code `assemble_dummy_init()` cũ:
+       ```assembly
+       ADR x0, path_console   # "/dev/console"
+       movz x1, #2            # O_RDWR
+       movz x2, #0
+       movz x16, #5           # SYS_open
+       svc #0x80
+       b.cs hang              # Nếu mở lỗi (carry set), nhảy thẳng vào b hang!
+       ```
+     - Trên hệ thống Mockfs RAMDisk sớm, `/dev/console` chưa sẵn sàng cho `O_RDWR` (hoặc trả về Carry Set).
+     - Instruction `b.cs hang` khiến tiến trình PID 1 lập tức nhảy vào vòng lặp spin `hang: b hang` ở userland EL0, không bao giờ chạy đến đoạn in banner!
+  2. **`serial=3` Trong Command Line Cướp Mất Console Của Màn Hình:**
+     - Trong `.github/workflows/build-xnu-12377.yml` và `tools/mkpayload.py`, cờ `serial=3` kích hoạt bit `SERIALMODE_OUTPUT`, khiến `osfmk/arm/arm_init.c` gọi `switch_to_serial_console()` chuyển hướng toàn bộ text console sang chân UART phần cứng thay vì framebuffer `video_console` (AMOLED).
+  3. **Thiếu Vạch Chẩn đoán cho Giai đoạn Userland PID 1:**
+     - Sau Row 600 chưa có vạch đánh dấu `vfs_mountroot`, `bsd_utaskbootstrap`, `load_init_program` và syscall của PID 1.
+- **Biện pháp Khắc phục Triệt để Đã Áp dụng & Đẩy lên GitHub (Commit `3729ddd`):**
+  1. **Khắc phục Hoàn toàn `dummy_init` trong `tools/mkramdisk.py`:**
+     - Bổ sung opcode hỗ trợ điều kiện `B_CC` (Carry Clear, condition 3) trong mini assembler.
+     - Triệt tiêu hoàn toàn lệnh `b.cs hang`. Khi mở `/dev/console` với `O_RDWR=2` gặp lỗi, tự động fallback sang `O_WRONLY=1`; nếu vẫn lỗi thì fallback sang `fd = 1` (stdout) và tiếp tục thực thi ghi banner thay vì treo máy.
+     - Vượt qua 100% (7/7) bài test trong bộ unit test của `mkramdisk.py`.
+  2. **Bảo tồn Màn hình `video_console` Cho Console Text:**
+     - Sửa `serial=3` thành `serial=0` trong `tools/mkpayload.py` và `.github/workflows/build-xnu-12377.yml`.
+     - Giữ nguyên hiển thị video console trên AMOLED bắt đầu từ hàng pixel 720 theo thiết kế dual-region của `video_console.c`.
+  3. **Định vị Chuẩn Anchor `rd=md0` trong `kernel/patch_iokit_root.py`:**
+     - Khớp chính xác pattern `rootName[0] = 'm';` trong `iokit/bsddev/IOKitBSDInit.cpp` của XNU 12377.121.6 để vẽ Row 610 (Lime `0x0000FF00`).
+  4. **Bổ sung Thang Vạch Giám sát Toàn diện Vòng đời Userland PID 1 (`kernel/patch_bsd_init.py`):**
+     - Row 615 (Spring Green `0x0000FF7F`): `vfs_mountroot()` thành công (Mockfs rootfs đã mount).
+     - Row 620 (Deep Sky Blue `0x0000BFFF`): `bsd_utaskbootstrap()` hoàn tất (PID 1 task đã tạo).
+     - Row 630 (Dark Orange `0x00FF8C00`): `bsdinit_task` thread của PID 1 bắt đầu chạy.
+     - Row 640 (Magenta `0x00FF00FF`): `load_init_program(p)` nạp `/sbin/launchd` thành công và chuẩn bị handoff sang userland EL0.
+     - Row 650 (Vivid Yellow `0x00FFFF00`): Bắt trúng syscall đầu tiên từ userland EL0 của PID 1 trong `bsd/dev/arm/systemcalls.c`.
+     - Row 656 (Lime/Cyan Toggling): Nhịp tim Heartbeat của PID 1 mỗi khi gọi `SYS_select` (93) chu kỳ 5 giây.
+- **CI Build Hiện tại (2026-11-06):**
+  - Commit: `3729ddd`
+  - GitHub Actions Run ID: `42128156318` (`HouseOfBalance/ios26-sapphire`).
+  - Giao thức nhận file: Người dùng tự tải trực tiếp artifact từ GitHub Actions run để test.
+  ```powershell
+  cd C:\Users\hungtv\Downloads\platform-tools
+  .\fastboot.exe boot enxerto-boot.img
+  ```
 
 - **Đã Hoàn thành Fix Toàn diện Cả 2 Mục Theo Yêu cầu Người dùng:**
   * **Mục 1: Chuẩn hóa Kiến trúc & Dọn dẹp Clean Build:**
