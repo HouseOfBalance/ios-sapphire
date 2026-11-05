@@ -33,7 +33,16 @@
        * `hk_crash_report` (`loader_return.c` -> phục vụ `kern_sig.c`).
        * 7 hàm Bengal RPMh/ADSP/MPSS (`redwood_adsp.c` -> `hakios_adsp_gpr*`, `hakios_aop_send`, `hakios_mpss_state`, `hakios_rpmh_*`).
      - Đã bổ sung định nghĩa chuẩn xác 100% cho toàn bộ 29 symbol (Commit `5a13826`).
-     - GitHub Actions Run ID `42018209259` đang chạy trên macOS-15 runner.
+     - **GitHub Actions Run ID `42018209259` THÀNH CÔNG 100% (conclusion: success).**
+     - Đã tự động tải artifact `hakios-ios26-sapphire.zip` (33.35 MB) và trích xuất thành công:
+       * `mach.development.bcm2837` (27,645,288 bytes): Chứa đầy đủ `lse_patch_handle_trap`, `pac_patch_handle_trap`, và các dải vạch chẩn đoán mới Row 296 (Vivid Yellow), Row 304 (Vivid Magenta), Row 312 (Deep Sky Blue).
+       * `enxerto-boot.img` (10,682,368 bytes): Header Android boot image v2 hợp lệ, đã triển khai sẵn tại `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img`.
+- **Hành động tiếp theo (Next Concrete Action):**
+  1. Kết nối Xiaomi Redmi Note 13 4G (`sapphire`) ở chế độ Fastboot (`adb reboot bootloader` hoặc bấm giữ Nguồn + Giảm âm lượng).
+  2. Nạp thử tạm thời vào RAM bằng lệnh: `fastboot boot C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img`.
+  3. Quan sát thang vạch trên màn hình:
+     - Xác nhận Row 296 (Vivid Yellow: PRE-LOCK) và Row 304 (Vivid Magenta: POST-LOCK) sáng màu, chứng minh bẫy lệnh LSE `casal` đã được giải mã/mô phỏng thành công qua `lse_patch_handle_trap` trên Cortex-A73 mà không còn bị spin treo.
+     - Kiểm tra Row 312 (Deep Sky Blue) và các dải màu tiếp theo của chuỗi cấp trang VM và BSD subsystem.
 - **Hoàn thành tự động toàn bộ 4 Đợt theo nguyên tắc "Mỗi file chỉ một chủ" (Single File Ownership) và không giẫm chân nhau:**
   1. *ĐỢT 0 - Nền tảng Bắt buộc & Định vị Lỗi (Đã hoàn thành & test pass 100%):*
      - **Agent 0.1 (`osfmk/arm64/sleh.c` qua `0003-sleh-hook.patch`):** Bẫy ngoại lệ `VBAR_EL1` kết nối trực tiếp với bộ vẽ font ASCII `hk_render_screen_asm`, dump PC, LR, SP, ESR, FAR, insn ra màn hình.
