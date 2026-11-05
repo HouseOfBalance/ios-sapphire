@@ -1,10 +1,29 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-05: Resolved Row 288 vm_free_page_lock Blocker, Hardened LSE LL/SC bounded retries, Verified RAMDisk Loader & Cleaned Subsystems)
+## Agent handoff / active work (2026-11-05: Deep Codebase Audit Completed — Fixed 5 Critical Root-Cause Bugs in LSE/PAC/VM/SLEH, Commit `fdce453`)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 + A53).
-- **Phân tích Thực nghiệm Kết quả Boot Thực tế từ Ảnh Chụp Thiết bị (media_1793883629485_2be9659c, media_1793883629860_4dbf3b4c):**
-  1. *Enxerto Bootloader:* Xác nhận 100% nạp thành công 11 segments (`n=0000000B end=82E6C000`, `BOOTARG pa=82E70000 top=82E74000`). Segment 10 chính là Mockfs RAMDisk (32 KB) chứa Mach-O PID 1 (`/sbin/launchd`).
-  2. *Điểm dừng thực tế của Nhân XNU:* Dải màu kết thúc tại Row 288 (Dark Orange: `vm_pages_end`) và Row 296 (Vivid Yellow: PRE-LOCK). Điểm treo xảy ra chính xác bên trong `vm_free_page_lock()` do lệnh ARMv8.1-A `casa x2, x21, [x9]` (offset `0x325b70`) bị bẫy hoặc vòng lặp `stlxr` retry vô hạn trên Cortex-A73 (ARMv8.0-A). Không có exception abort nào thoát ra (Row 200/210 sạch).
+- **Kết quả Rà soát Chuyên sâu Toàn bộ Thư mục Cốt lõi (`base/xnu/files/`, `kernel/`, `tools/`, `enxerto/`, `.github/workflows/`) & Khắc phục (Commit `fdce453` trong `hakios-arm64e-dada-main`):**
+  1. **[BUG NGHIÊM TRỌNG #1 — Nguyên nhân thực sự gây Crash tại Row 296 `vm_free_page_lock`] `base/xnu/files/osfmk/arm64/lse_patch.c` & `pac_patch.c`:**
+     - Macro `#define PHYSTOKV(pa) ((uint64_t)(pa) + (gVirtBase - gPhysBase))` tính ra đúng bằng địa chỉ ảo `va` nằm trong phân đoạn `__TEXT_EXEC`. Sau khi `arm_vm_init()` (Row 158..160) chạy, `__TEXT_EXEC` bị khóa quyền **Read-Only (`AP = RO`)** và `__DATA,__bss` (nơi đặt `lse_kernel_pool`) bị khóa **`PXN = 1` (Privileged Execute-Never)**.
+     - Khi lệnh LSE đầu tiên sau `arm_vm_init()` (tại `vm_free_page_lock()` ngay sau Row 296 `PRE-LOCK`) bẫy vào `lse_patch_handle_trap()`, hàm `lse_try_patch_island()` gọi `patch_memory_phys()` ghi đè trực tiếp vào `__TEXT_EXEC` đang Read-Only -> gây **Data Abort Permission Fault (`ESR_EC = 0x25`)** ngay lập tức! Đồng thời bất kỳ branch island nào được cài vào `lse_kernel_pool` (`__DATA,__bss`) trước `arm_vm_init()` khi được gọi lại sau `arm_vm_init()` cũng gây **Instruction Abort Permission Fault (`ESR_EC = 0x21`)** do `PXN = 1`!
+     - Hơn nữa, trong `lse_emulate_atomic()`, việc đổi địa chỉ biến đích `addr` của kernel qua `kvtophys(addr)` + `pa + (gVirtBase - gPhysBase)` tạo ra địa chỉ **chưa được map (Translation Fault)** đối với mọi vùng nhớ cấp phát động nằm trên `first_avail` (như mảng `vm_pages` vừa được steal tại `pmap_startup` Row 280!).
+     - **Đã sửa:**
+       - Đối với kernel mode (`!is_user`), `lse_patch_handle_trap()` luôn mô phỏng trực tiếp qua `lse_emulate_atomic()` (không cài branch island vào `__TEXT_EXEC` RO / `__DATA` PXN=1), và dùng trực tiếp địa chỉ ảo kernel `kptr = (void *)addr`.
+       - Đối với userland (`is_user`), dùng hàm `phystokv(pa)` chuẩn của XNU (`ptov_table`).
+       - Trong `pac_patch.c`, kiểm tra quyền ghi bằng lệnh phần cứng `at s1e1w` trước khi ghi đè; nếu trang là Read-Only thì tự động mô phỏng lệnh thay thế (`NOP`, `RET`, `BR`, `BLR`, `MOV`) bằng phần mềm.
+  2. **[BUG NGHIÊM TRỌNG #2] `base/xnu/files/osfmk/arm64/lse_decode.h`: Sai Bitmask Giải mã LSE Acquire (`0x3F800C00 == 0x38000000`):**
+     - Trong tập lệnh ARMv8.1-A LSE (`LDADD*`, `SWP*`, `LDCLR*`, `LDSET*`, `LDEOR*`, `LD*MAX`, `LD*MIN`), bit 23 (`0x00800000`) là cờ **Acquire (`A`)**, bit 22 là **Release (`R`)**, và bit 21 luôn bằng `1`.
+     - File `base/xnu/files/osfmk/arm64/lse_decode.h` (vốn ghi đè lên `0002-lse-branch-islands.patch` khi `apply.sh` chạy `cp -a base/xnu/files/.`) dùng mask `0x3F800C00 == 0x38000000` ép bit 23 phải bằng `0`, khiến **100% các lệnh nguyên tử có cờ Acquire (`ldadda`, `ldaddal`, `swpa`, `swpal`, `ldseta`, `ldclra`...) bị từ chối giải mã (`return false`)** và gây Kernel UNDEF Panic!
+     - **Đã sửa:** Chuẩn hóa mask thành `(inst & 0x3F200C00) == 0x38200000` với `acquire = bit 23`, `release = bit 22`.
+  3. **[BUG NGHIÊM TRỌNG #3] `base/xnu/files/osfmk/arm64/lse_hooks.h`: Lỗi Ràng buộc Thanh ghi Inline ASM `"+r"` & 22 Hàm Còn Vòng lặp Vô hạn:**
+     - Ràng buộc `"+r"` trên các biến đầu vào (`ptr`, `*expected`, `desired`) có thể bị trình biên dịch gán trùng thanh ghi hoặc ghi đè ngược khi kết hợp với `"=&r"`, và 22/28 hàm nguyên tử còn lại (`cas8/16`, `casp32/64`, `ldclr`, `ldset`, `ldeor`, `ldsmax/min`, `ldumax/min`) vẫn dùng vòng lặp `cbnz` không giới hạn.
+     - **Đã sửa:** Chuẩn hóa toàn bộ 28/28 hàm trong `lse_hooks.h` dùng `"=&r"(retries)` khởi tạo trực tiếp trong assembly (`mov %w2, #1000` / `mov %w3, #1000`) + fallback ghi trực tiếp, giữ toàn bộ đầu vào là `"r"` thuần túy.
+  4. **[BUG NGHIÊM TRỌNG #4] `kernel/patch_cortex_a73.py` (`sleh.c`): Bẫy Đệ quy trong `snprintf()` & Trùng Vạch Màu Row 210:**
+     - Trong ảnh chụp màn hình thiết bị (`crop2_ladder_detail.png`), vạch **Row 210..219 có màu Magenta (`0x00FF00FF`)** (chính là vạch báo Kernel Fault của `sleh.c` bị lẫn vào giữa thang vạch `188..240`), nhưng vạch Green Row 230 và chữ console Row 720 không xuất hiện vì `sleh.c` gọi `snprintf()` bị lỗi đệ quy trước khi tới `hk_render_screen_asm()`!
+     - **Đã sửa:** Đưa vạch báo lỗi của `sleh.c` xuống **Row 680..693** (tách biệt hoàn toàn khỏi thang boot `0..500`), và thay `snprintf()` bằng vòng lặp đổi mã hex nội tuyến thuần túy (0 lệnh gọi hàm ngoài) trước khi gọi `hk_render_screen_asm()`.
+  5. **[BUG NGHIÊM TRỌNG #5] `kernel/patch_cortex_a73.py` (`vm_resident.c`): `LCK_MTX_ASSERT` & Khớp Nhầm `vm_free_page_unlock()`:**
+     - Trên bản build `DEVELOPMENT`, hàm `vm_page_free_unlocked()` bên trong vòng lặp trang của `pmap_startup()` kiểm tra `LCK_MTX_ASSERT(&vm_page_queue_free_lock, LCK_MTX_ASSERT_OWNED)` (sẽ panic nếu bypass `vm_free_page_lock()`), đồng thời lệnh `.replace('\tvm_free_page_unlock();', ..., 1)` không neo ngữ cảnh sẽ khớp nhầm hàm `vm_free_page_unlock()` đầu tiên trong file.
+     - **Đã sửa:** Khôi phục `vm_free_page_lock()` / `vm_free_page_unlock()` (do lỗi gốc ở `lse_patch.c` đã được giải quyết triệt để) và neo chính xác vị trí `vm_free_page_unlock()` ngay sau vòng lặp `pmap_startup`.
 
 - **Đã Hoàn thành Fix Toàn diện Cả 2 Mục Theo Yêu cầu Người dùng:**
   * **Mục 1: Chuẩn hóa Kiến trúc & Dọn dẹp Clean Build:**
