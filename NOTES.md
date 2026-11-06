@@ -1,6 +1,13 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-06: Opaque ARGB Alpha Channel & Font MSB Orientation Engine, Commit `14851d4`)
+## Agent handoff / active work (2026-11-06 13:15: KVA framebuffer banner, Commit `4614895`)
+- Banner/SYS_write text now drawn by `hk_kva_fill`/`hk_kva_text` appended to `osfmk/console/video_console.c` (via `kernel/patch_bsd_init.py`), writing through `vinfo.v_baseaddr` (XNU's own WC KVA mapping). MMU, IRQs, TTBR0 and caches are untouched. Font is read LSB = leftmost, matching XNU `vc_render_char`. The MSB change in `14851d4` only affects the old asm renderer, which is now used only by the panic paths.
+- Fake syscalls also set `uu_rval[1]=0`. The `dc cvac` loop has been removed.
+- Expected bands: 650 yellow (syscall entry), 654 cyan (box wiped), 658 lime (banner done), 670 red = `vinfo` not mapped (KVA path unavailable).
+- Not built locally. The CI result is unverified.
+- Note: `hk_draw_band` already masks DAIF, so the "IRQ during MMU-off" theory does not fully explain the old 240-row failure. Root cause still unknown.
+
+## Previous handoff (Opaque ARGB Alpha Channel & Font MSB Orientation Engine, Commit `14851d4`)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 Gold + A53 Silver).
 - **Hiện tượng Thực tế từ Ảnh Boot Thiết bị (Commit `00eb127`, Run ID `42167103209`):**
   - Màn hình Enxerto: `ENTRY FFFFFFFF0075194A0`, `SEGS n=0000000B end=82E64000`, nhảy vào XNU tại `0x815194a8`.
