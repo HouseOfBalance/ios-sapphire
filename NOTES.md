@@ -1,29 +1,17 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-06 14:55: Visual Calibration Ladder, Nibble Bit-Gauge & ml_io_map_wcomb Probe, Commit ea3dc96)
-- **Trien khai bo chan doan truc quan hoan chinh theo dung yeu cau:**
-  1. **Thang Calibration (Row mốc & độ dày tăng dần):**
-     - Row 100: Do (16 rows)
-     - Row 300: Cam dam (24 rows)
-     - Row 500: Vang (32 rows)
-     - Row 700: Xanh la (40 rows)
-     - Row 900: Cyan (48 rows)
-     - Row 1100: Xanh duong (56 rows)
-     - Row 1300: Trang (64 rows)
-     - Row 2380: Hong canh sen Deep Pink (20 rows) - moc kiem tra day panel thuc te.
-  2. **Thước đo Nibble Gauge (16 màu cố định cho 4-bit nibbles):**
-     - Bang mau: 0=Black, 1=Blue, 2=Green, 3=Cyan, 4=Red, 5=Magenta, 6=Yellow, 7=White, 8=Gray, 9=Navy, A=DarkGreen, B=Teal, C=Maroon, D=Purple, E=Olive, F=Orange.
-     - Block A (Rows 1400..1527): 16 nibbles cua info.v_baseaddr (64-bit), co guide header hong row 1390.
-     - Block B (Rows 1540..1603): 8 nibbles cua info.v_rowbytes (32-bit), co guide header hong row 1534.
-     - Block C (Rows 1610..1630):
-       - Row 1610 (8 rows): kernel_map != NULL (Xanh la = TRUE, Do = NULL).
-       - Row 1620 (8 rows): makeMapping (Cyan = TRUE, Magenta = FALSE, Blue = never run).
-  3. **Truy van truc tiep ml_io_map_wcomb:**
-     - Row 1640 (12 rows): hk_get_manual_kva() (Xanh la neu KVA >= 0xffff000000000000, Do neu that bai).
-  4. **Thu nghiem ghi KVA (32 rows Cam tai Row 1660):**
-     - Sau do lap tuc ve Row 1700 (16 rows Trang bang hk_draw_band MMU-off) de xac nhan CPU con song.
-- **Quy tac doc ket qua:** Dua hoan toan vao anh chup calibration va thuoc mau nibble de ket luan stride/mapping that, khong suy doan.
-- **Repo State:** HouseOfBalance/ios26-sapphire commit ea3dc96 pushed to main.
+## Agent handoff / active work (2026-11-06 15:12: Encapsulated PID 1 Diagnostics, Commit 51db9e0)
+- **Nguyen nhan loi CI run 42184253439:** sd/dev/arm/systemcalls.c la mot file BSD khong include header Mach VM (osfmk/console/video_console.h va osfmk/vm/vm_kern.h). Khi ta khai bao extern struct vc_info vinfo; va extern vm_map_t kernel_map; truc tiep ben trong systemcalls.c, clang bao loi incomplete type 'struct vc_info' va unknown type name 'vm_map_t'.
+- **Giai phap triet de:**
+  - Chuyen toan bo ham chan doan hk_run_pid1_diagnostics() sang osfmk/console/video_console.c (noi da include day du ideo_console.h, info, kernel_map va tat ca cac KVA helper).
+  - Trong sd/dev/arm/systemcalls.c, chi con mot loi goi duy nhat: extern void hk_run_pid1_diagnostics(void); hk_run_pid1_diagnostics();.
+  - Khong con bat ky khai bao kieu phuc tap nao trong systemcalls.c.
+- **Thang do & Thuoc do giu nguyen 100%:**
+  1. Thang Calibration: Row 100 (Do 16r), Row 300 (Cam 24r), Row 500 (Vang 32r), Row 700 (Xanh la 40r), Row 900 (Cyan 48r), Row 1100 (Blue 56r), Row 1300 (Trang 64r), Row 2380 (Deep Pink 20r).
+  2. Nibble Gauge 16 mau doc: Block A (vinfo.v_baseaddr), Block B (vinfo.v_rowbytes), Block C (trang thai kernel_map va makeMapping).
+  3. Goi thu ml_io_map_wcomb truc tiep va bao ket qua bang Row 1640.
+  4. Thu nghiem ghi KVA tai Row 1660 (Cam 32r) va Row 1700 (Trang 16r).
+- **Repo State:** HouseOfBalance/ios26-sapphire commit 51db9e0 pushed to main.
 
 ## Previous handoff (Opaque ARGB Alpha Channel & Font MSB Orientation Engine, Commit `14851d4`)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 Gold + A53 Silver).
