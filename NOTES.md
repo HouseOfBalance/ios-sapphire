@@ -1,30 +1,32 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-06: Direct AMOLED Userland PID 1 Banner & Syscall Engine, Commit `00eb127`, Run ID `42167103209`)
+## Agent handoff / active work (2026-11-06: Opaque ARGB Alpha Channel & Font MSB Orientation Engine, Commit `14851d4`)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 Gold + A53 Silver).
-- **Hiện tượng Thực tế từ Ảnh Boot Thiết bị (Run ID `42134895438`, Commit `b7059fd`):**
+- **Hiện tượng Thực tế từ Ảnh Boot Thiết bị (Commit `00eb127`, Run ID `42167103209`):**
   - Màn hình Enxerto: `ENTRY FFFFFFFF0075194A0`, `SEGS n=0000000B end=82E64000`, nhảy vào XNU tại `0x815194a8`.
   - Thang vạch chẩn đoán đã sáng đèn lên tới **Row 650 (Vivid Yellow `0x00FFFF00`)** - PID 1 đã chạy trong userland EL0 và thực hiện system call đầu tiên.
-  - Tuy nhiên, phần màn hình AMOLED bên dưới hàng 720 vẫn giữ nguyên hình nền bootloader Bergamota màu xanh lá kèm các dòng log của enxerto, chưa hiện banner chữ trắng của XNU / PID 1.
-- **Phân tích Nguyên nhân Gốc rễ & Khắc phục Toàn diện (Commit `00eb127`):**
-  1. **Triệt tiêu Lỗi Permission Fault (Data Abort) của `dc cvac` trên Vùng Nhớ Read-Only (`kernel/patch_cortex_a73.py`):**
-     - Trong `hk_render_screen_asm` (`start.s`), trước khi tắt MMU, mã cũ chạy vòng lặp `dc cvac, x10` trên con trỏ chuỗi văn bản `x19`.
-     - `hk_init_banner` được khai báo là `static const char[]`, Clang arm64e lưu vào phân vùng `.rodata` (`__TEXT`) được map với cờ Read-Only (`AP[2] = 1`).
-     - Trên vi kiến trúc Cortex-A73 Gold, việc thực thi lệnh `DC CVAC` trên trang chỉ đọc (Read-Only) sinh ra ngoại lệ **Permission Fault (Data Abort)** làm CPU bị trap ngay lập tức khi chuẩn bị vẽ banner.
-     - **Giải pháp:** Xóa bỏ hoàn toàn vòng lặp `dc cvac` khỏi `hk_render_screen_asm`. Các chuỗi tĩnh trong kernel Mach-O đã được bootloader Enxerto nạp sẵn và đồng bộ trong RAM vật lý từ trước khi bật MMU, không cần flush.
-  2. **Chuẩn hóa Ép kiểu 32-bit trong `hk_draw_band` Tránh Tràn Thanh ghi 64-bit (`kernel/patch_cortex_a73.py`):**
-     - Theo chuẩn gọi hàm AAPCS64, khi truyền tham số 32-bit (`uint32_t row_start`, `uint32_t row_count`), các bit cao (32..63) của thanh ghi `x1`, `x2` không bắt buộc phải bằng 0.
-     - Lệnh `cmp x1, x22` (so sánh 64-bit với 2400) có thể bị nhánh nhảy `b.hs 5f` đánh chặn và return ngay lập tức nếu bit cao có rác.
-     - **Giải pháp:** Thêm `and x1, x1, #0xffffffff` và `and x2, x2, #0xffffffff` ở đầu `hk_draw_band`.
-  3. **Tối ưu Hóa Vùng Xóa Nền (Blackout Wipe) từ 1680 Hàng Xuống 240 Hàng An Toàn (`kernel/patch_bsd_init.py`):**
-     - Lệnh xóa 1680 hàng cũ (`hk_draw_band(0x00000000, 720, 1680)`) đòi hỏi `453,600` lệnh ghi 16-byte `stp` không đệm (Device-nGnRnE) khi tắt MMU, có thể gây quá tải hàng đợi bus bộ nhớ SM6225.
-     - **Giải pháp:** Chuyển sang xóa hộp banner 240 hàng (hàng 720..960, tương đương `54,000` lệnh ghi), hoàn tất trong ~5ms và tạo nền đen tuyền tuyệt đối cho banner.
-  4. **Đảm bảo Tính Nhất quán D-Cache cho Chuỗi Userland trong `SYS_write` (`kernel/patch_bsd_init.py`):**
-     - Chuỗi do userland gửi qua `SYS_write` được `copyin` chép vào `hk_user_write_buf` (thuộc vùng `.bss` RW).
-     - Trước khi gọi `hk_render_screen_asm`, kernel chủ động thực hiện `dc cvac` trên vùng đệm RW này để đẩy toàn bộ nội dung từ L1 D-Cache xuống RAM vật lý, đồng thời xóa nền 32 hàng cho từng dòng text userland.
-- **CI Build Hiện tại (2026-11-06):**
-  - Commit: `00eb127`
-  - GitHub Actions Run ID: `42167103209` (`HouseOfBalance/ios26-sapphire`).
+  - Tuy nhiên, vùng xóa banner và hiển thị text bên dưới hàng 720 vẫn giữ nguyên hình nền Bergamota màu xanh lá.
+- **Phân tích Nguyên nhân Gốc rễ & Khắc phục Toàn diện (Commit `14851d4`):**
+  1. **Thiết lập Kênh Alpha Tuyệt đối Opaque (`0xFF000000` / `0xFFFFFFFF`) Cho Bộ Hiển Thị DPU Qualcomm:**
+     - Mã cũ sử dụng màu xóa `0x00000000` và màu chữ `0x00ffffff` (Alpha byte = `0x00`).
+     - Khi DPU continuous splash plane cấu hình ở định dạng 32-bit ARGB/BGRA, việc ghi alpha = 0 làm cho các pixel bị hòa trộn trong suốt tuyệt đối (100% transparent), để lộ nguyên vẹn hình nền Bergamota bên dưới.
+     - **Giải pháp:**
+       - Sửa lệnh xóa banner box thành `hk_draw_band(0xFF000000, 720, 240)` (Opaque Black).
+       - Sửa `hk_render_screen_asm`: Nạp màu chữ `w14 = 0xFFFFFFFF` (Opaque White) và màu nền ký tự `w13 = 0xFF000000` (Opaque Black). Tại nhãn `62:` ghi trực tiếp `w13` (`0xFF000000`) vào framebuffer thay vì `wzr` (`0x00000000`).
+       - Sửa `SYS_write` line wipe sang dùng `0xFF000000`.
+  2. **Khắc phục Chiều Bit Font Ký tự (MSB-first) Chống Lật Ngược Ký tự (Horizontal Mirroring):**
+     - Font bitmap 8x16 quy định pixel ngoài cùng bên trái nằm ở bit 7 (MSB `0x80`), pixel ngoài cùng bên phải ở bit 0 (LSB `0x01`).
+     - Mã cũ kiểm tra từ bit 0 (`lsr w10, w5, w6; tbz w10, #0`) khiến mỗi ký tự bị lật ngược (mirrored) từ phải sang trái.
+     - **Giải pháp:** Đổi sang kiểm tra từ bit 7 (`tbz w5, #7, 62f`) và dịch trái dần (`lsl w5, w5, #1`), đảm bảo từng glyph được vẽ đúng chiều từ trái qua phải.
+  3. **Bổ sung Vạch Chẩn đoán Giám sát Lifecycle Render Chi Tiết:**
+     - Row 650: Yellow (`0x00FFFF00`) - PID 1 syscall entry.
+     - Row 654: Cyan (`0x0000FFFF`) - Banner box wiped to black, chuẩn bị gọi `hk_render_screen_asm`.
+     - Row 658: Lime Green (`0x0000FF00`) - `hk_render_screen_asm` hoàn tất vẽ banner!
+     - Row 652: White (`0x00FFFFFF`) - `SYS_write` thực thi.
+     - Row 662: Orchid (`0x00DA70D6`) - `SYS_getpid` thực thi.
+     - Row 666: Heartbeat (`0x0000FF00` / `0x0000FFFF`) - `SYS_select` loop.
+- **CI Build Mới Nhất (2026-11-06):**
+  - Commit: `14851d4` (`HouseOfBalance/ios26-sapphire`, branch `main`).
   - Giao thức nhận file: Người dùng tự tải trực tiếp artifact `hakios-ios26-sapphire` từ GitHub Actions run để test.
   ```powershell
   cd C:\Users\hungtv\Downloads\platform-tools
