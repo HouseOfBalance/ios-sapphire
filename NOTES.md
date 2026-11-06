@@ -1,11 +1,24 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-06 13:15: KVA framebuffer banner, Commit `4614895`)
-- Banner/SYS_write text now drawn by `hk_kva_fill`/`hk_kva_text` appended to `osfmk/console/video_console.c` (via `kernel/patch_bsd_init.py`), writing through `vinfo.v_baseaddr` (XNU's own WC KVA mapping). MMU, IRQs, TTBR0 and caches are untouched. Font is read LSB = leftmost, matching XNU `vc_render_char`. The MSB change in `14851d4` only affects the old asm renderer, which is now used only by the panic paths.
-- Fake syscalls also set `uu_rval[1]=0`. The `dc cvac` loop has been removed.
-- Expected bands: 650 yellow (syscall entry), 654 cyan (box wiped), 658 lime (banner done), 670 red = `vinfo` not mapped (KVA path unavailable).
-- Not built locally. The CI result is unverified.
-- Note: `hk_draw_band` already masks DAIF, so the "IRQ during MMU-off" theory does not fully explain the old 240-row failure. Root cause still unknown.
+## Agent handoff / active work (2026-11-06 13:45: Robust KVA capture & Ladder Probes, Commit 4ecea2e)
+- **Phat hien bug quan trong:** patch_cortex_a73.py (step 21) tinh tien vinfo.v_baseaddr them + 720 * v_rowbytes va tru v_height di 720 (de danh rows 0..719 cho diagnostic ladder). Neu dung vinfo.v_baseaddr truc tiep lam panel origin thi row 720 se bi tinh thanh row 1440!
+- **Giai phap:** Bat con tro KVA goc truc tiep tu initialize_screen trong video_console.c vao hk_fb_kva_base, hk_fb_width, hk_fb_height, hk_fb_rowbytes, va co hk_fb_made_mapping (truoc bat ky buoc dich chuyen nao).
+- **That chat hk_kva_fb_ready():** Kiem tra (uint64_t)hk_fb_kva_base >= 0xffff000000000000ULL (chuan TTBR1 KVA, chong nuot nham raw PA 0x5c000000), vinfo.v_depth == 32, rowbytes >= width * 4.
+- **He thong Diagnostic Ladder moi (tat ca row tinh theo panel tuyet doi):**
+  - Row 650 (Vang - hk_draw_band MMU-off): Da vao hook syscall PID 1.
+  - Row 646 (Magenta - hk_draw_band): initialize_screen chay voi makeMapping == FALSE.
+  - Row 642 (Xanh duong dam - hk_draw_band): initialize_screen chua tung capture duoc mapping.
+  - Row 670 (Do - hk_draw_band): hk_kva_fb_ready() tra ve FALSE (chua co KVA hop le).
+  - Row 654 (Cyan - hk_kva_fill): Da xoa banner box qua KVA, chuan bi ve chu.
+  - Row 658 (Lime Green - hk_kva_fill): Da ve xong text banner qua KVA.
+  - Row 662 (Trang - hk_draw_band): CPU van song sot sau khi thuc hien toan bo lenh ghi KVA!
+  - Banner bat dau bang ky tu 'F' bat doi xung de xac thuc huong glyph iso_font.
+- **Bang giai ma ket qua boot:**
+  - 654, 658 hien, banner hien: KVA mapping va render hoan hao!
+  - 654, 658 khong hien nhung 662 trang hien: CPU khong treo nhung con tro KVA tro sai vung hien thi.
+  - Mat ca 662: Lenh ghi KVA gay fault/hang.
+  - Do 670 hien: hk_fb_kva_base chua hop le, can goi truc tiep ml_io_map_wcomb.
+- **Repo State:** HouseOfBalance/ios26-sapphire commit 4ecea2e pushed to main.
 
 ## Previous handoff (Opaque ARGB Alpha Channel & Font MSB Orientation Engine, Commit `14851d4`)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 Gold + A53 Silver).
