@@ -1,24 +1,29 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-06 13:45: Robust KVA capture & Ladder Probes, Commit 4ecea2e)
-- **Phat hien bug quan trong:** patch_cortex_a73.py (step 21) tinh tien vinfo.v_baseaddr them + 720 * v_rowbytes va tru v_height di 720 (de danh rows 0..719 cho diagnostic ladder). Neu dung vinfo.v_baseaddr truc tiep lam panel origin thi row 720 se bi tinh thanh row 1440!
-- **Giai phap:** Bat con tro KVA goc truc tiep tu initialize_screen trong video_console.c vao hk_fb_kva_base, hk_fb_width, hk_fb_height, hk_fb_rowbytes, va co hk_fb_made_mapping (truoc bat ky buoc dich chuyen nao).
-- **That chat hk_kva_fb_ready():** Kiem tra (uint64_t)hk_fb_kva_base >= 0xffff000000000000ULL (chuan TTBR1 KVA, chong nuot nham raw PA 0x5c000000), vinfo.v_depth == 32, rowbytes >= width * 4.
-- **He thong Diagnostic Ladder moi (tat ca row tinh theo panel tuyet doi):**
-  - Row 650 (Vang - hk_draw_band MMU-off): Da vao hook syscall PID 1.
-  - Row 646 (Magenta - hk_draw_band): initialize_screen chay voi makeMapping == FALSE.
-  - Row 642 (Xanh duong dam - hk_draw_band): initialize_screen chua tung capture duoc mapping.
-  - Row 670 (Do - hk_draw_band): hk_kva_fb_ready() tra ve FALSE (chua co KVA hop le).
-  - Row 654 (Cyan - hk_kva_fill): Da xoa banner box qua KVA, chuan bi ve chu.
-  - Row 658 (Lime Green - hk_kva_fill): Da ve xong text banner qua KVA.
-  - Row 662 (Trang - hk_draw_band): CPU van song sot sau khi thuc hien toan bo lenh ghi KVA!
-  - Banner bat dau bang ky tu 'F' bat doi xung de xac thuc huong glyph iso_font.
-- **Bang giai ma ket qua boot:**
-  - 654, 658 hien, banner hien: KVA mapping va render hoan hao!
-  - 654, 658 khong hien nhung 662 trang hien: CPU khong treo nhung con tro KVA tro sai vung hien thi.
-  - Mat ca 662: Lenh ghi KVA gay fault/hang.
-  - Do 670 hien: hk_fb_kva_base chua hop le, can goi truc tiep ml_io_map_wcomb.
-- **Repo State:** HouseOfBalance/ios26-sapphire commit 4ecea2e pushed to main.
+## Agent handoff / active work (2026-11-06 14:55: Visual Calibration Ladder, Nibble Bit-Gauge & ml_io_map_wcomb Probe, Commit ea3dc96)
+- **Trien khai bo chan doan truc quan hoan chinh theo dung yeu cau:**
+  1. **Thang Calibration (Row mốc & độ dày tăng dần):**
+     - Row 100: Do (16 rows)
+     - Row 300: Cam dam (24 rows)
+     - Row 500: Vang (32 rows)
+     - Row 700: Xanh la (40 rows)
+     - Row 900: Cyan (48 rows)
+     - Row 1100: Xanh duong (56 rows)
+     - Row 1300: Trang (64 rows)
+     - Row 2380: Hong canh sen Deep Pink (20 rows) - moc kiem tra day panel thuc te.
+  2. **Thước đo Nibble Gauge (16 màu cố định cho 4-bit nibbles):**
+     - Bang mau: 0=Black, 1=Blue, 2=Green, 3=Cyan, 4=Red, 5=Magenta, 6=Yellow, 7=White, 8=Gray, 9=Navy, A=DarkGreen, B=Teal, C=Maroon, D=Purple, E=Olive, F=Orange.
+     - Block A (Rows 1400..1527): 16 nibbles cua info.v_baseaddr (64-bit), co guide header hong row 1390.
+     - Block B (Rows 1540..1603): 8 nibbles cua info.v_rowbytes (32-bit), co guide header hong row 1534.
+     - Block C (Rows 1610..1630):
+       - Row 1610 (8 rows): kernel_map != NULL (Xanh la = TRUE, Do = NULL).
+       - Row 1620 (8 rows): makeMapping (Cyan = TRUE, Magenta = FALSE, Blue = never run).
+  3. **Truy van truc tiep ml_io_map_wcomb:**
+     - Row 1640 (12 rows): hk_get_manual_kva() (Xanh la neu KVA >= 0xffff000000000000, Do neu that bai).
+  4. **Thu nghiem ghi KVA (32 rows Cam tai Row 1660):**
+     - Sau do lap tuc ve Row 1700 (16 rows Trang bang hk_draw_band MMU-off) de xac nhan CPU con song.
+- **Quy tac doc ket qua:** Dua hoan toan vao anh chup calibration va thuoc mau nibble de ket luan stride/mapping that, khong suy doan.
+- **Repo State:** HouseOfBalance/ios26-sapphire commit ea3dc96 pushed to main.
 
 ## Previous handoff (Opaque ARGB Alpha Channel & Font MSB Orientation Engine, Commit `14851d4`)
 - **Mục tiêu:** Boot HakiOS XNU 12377 (iOS 26 ARM64E) trên Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 Gold + A53 Silver).
