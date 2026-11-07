@@ -1,5 +1,69 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 22:30: CI Build 104 - Thang Đo Vi Mô Lockdown Đến bsd_init & Mở Khóa Fallback max_cpus Cho GenericARMPE / kperf)
+
+### 1. Phân Tích Thực Nghiệm Build 103 (`15d5760`, Run `42384289468`) Trên Phần Cứng Thực Tế
+- **Thiết bị:** Xiaomi Redmi Note 13 4G (`sapphire`, SM6225 Bengal, Kryo 260 / Cortex-A73 + A53).
+- **Log Enxerto:** `BUILD 15d5760`, `PHYS base=B0000000 size=4D000000`, `JUMP 00000000B151A4A8`.
+- **Hiện tượng thực tế trên màn hình:**
+  - **0 RED PANIC PIXELS (Zero Panic - 0 pixel đỏ).**
+  - Vạch MediumOrchid sáng rực rỡ tại Row 566 (`initialize_screen(NULL, kPEAcquireScreen)` hoàn tất).
+  - Vạch trắng Row 570 (`bsd_init()` trong Build 103) chưa xuất hiện.
+  - Bộ lập lịch Mach Scheduler (`sched_startup()`, Row 550 Lime) và luồng `kernel_bootstrap_thread` (Row 546 White) đã chạy 100% trơn tru trên stack luồng mới!
+- **Xác định ranh giới thực thi (Execution Frontier):**
+  - Ranh giới nằm chính xác giữa `initialize_screen()` (dòng 822) và `bsd_init()` (dòng 922) trong `osfmk/kern/startup.c`.
+  - Giữa hai hàm này có chuỗi các bước:
+    1. `vm_commpage_init()` & `vm_commpage_text_init()`
+    2. `trust_cache_runtime_init()` & `load_static_trust_cache()`
+    3. `kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN)`
+    4. `OSKextRemoveKextBootstrap()`
+    5. `machine_lockdown()`
+    6. `PE_lockdown_iokit()`
+    7. `vm_set_restrictions(machine_info.max_cpus)`
+    8. `kperf_init_early()`
+    9. `bsd_init()`
+- **Phát hiện nút thắt kẹt im lặng (Silent Stall Vector):**
+  - Trong `kperf_init_early()`: gọi `ml_wait_max_cpus()`.
+  - `ml_wait_max_cpus()` lặp vô tận `while (!max_cpus_initialized) thread_block(...)` cho đến khi `ml_set_max_cpus()` được gọi.
+  - Trong `GenericARMPE::start()`: `ml_set_max_cpus(count)` chỉ được gọi bên trong khối `if (cpus[master_cpu] != NULL)`.
+  - Nếu `cpus[master_cpu]` là NULL (hoặc nub cpu0 chưa được device tree bind kịp lúc), `ml_set_max_cpus` không bao giờ được gọi -> nhân treo im lặng mà không panic!
+
+---
+
+### 2. Thiết Kế & Triển Khai Trong Build 104 (Commit `05e815e`, Run ID `42387082198`)
+1. **Thang đo vi mô 10 bước độc lập trong `osfmk/kern/startup.c`:**
+   - **Row 566 (MediumOrchid `0x00BA55D3`, 2 rows):** `initialize_screen()` hoàn tất
+   - **Row 568 (Cyan `0x0000FFFF`, 2 rows):** `vm_commpage_text_init()` hoàn tất
+   - **Row 570 (Coral `0x00FF7F50`, 2 rows):** `load_static_trust_cache()` hoàn tất
+   - **Row 572 (Gold `0x00FFD700`, 2 rows):** `kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN)` hoàn tất
+   - **Row 574 (Lime `0x0000FF00`, 2 rows):** `OSKextRemoveKextBootstrap()` hoàn tất
+   - **Row 576 (Chartreuse `0x007FFF00`, 2 rows):** `machine_lockdown()` hoàn tất
+   - **Row 578 (DeepSkyBlue `0x0000BFFF`, 2 rows):** `PE_lockdown_iokit()` hoàn tất
+   - **Row 580 (DarkOrange `0x00FF8C00`, 2 rows):** `vm_set_restrictions(machine_info.max_cpus)` hoàn tất
+   - **Row 582 (DeepPink `0x00FF1493`, 2 rows):** `kperf_init_early()` hoàn tất (xác nhận vượt qua `ml_wait_max_cpus`)
+   - **Row 585 (Thick White `0x00FFFFFF`, 10 rows):** **CHẠM CỬA NGÕ `bsd_init()`!**
+2. **Triệt tiêu nguy cơ treo vô tận trong `GenericARMPE` & `ml_wait_max_cpus`:**
+   - Trong `iokit/Kernel/GenericARMPE.cpp`: Bổ sung nhánh `else` gọi `ml_set_max_cpus(1)` dự phòng cho single-core bring-up nếu `cpus[master_cpu] == NULL`.
+   - Trong `osfmk/arm64/machine_routines.c` & `osfmk/arm/machine_routines.c`: Đảm bảo `ml_wait_max_cpus()` tự động thiết lập `ml_set_max_cpus(1)` nếu `!max_cpus_initialized`.
+3. **Nâng cấp `patch_bsd_init.py`:**
+   - Chuyển toàn bộ 100% vạch vẽ trong `bsd_init.c` sang `hk_draw_band_direct` (ghi trực tiếp vào VA `0xfffffff004000000`).
+   - Dời các vạch BSD sang dải Row 600..660 để không đè lên dải khởi động kernel (Row 500..595):
+     - Row 600: `bsd_init entered` (Goldenrod)
+     - Row 606: `bcache_init done` (Orange)
+     - Row 612: `vfs_init done` (YellowGreen)
+     - Row 618: `devfs mounted` (DodgerBlue)
+     - Row 624: `mbuf_init done` (MediumOrchid)
+     - Row 630: `net_init done` (HotPink)
+     - Row 636: `bsd_autoconf -> launchd` (Cyan)
+     - Row 642: `vfs_mountroot succeeded` (SpringGreen)
+     - Row 648: `bsd_utaskbootstrap / PID 1 process created` (DeepSkyBlue)
+     - Row 654: `bsdinit_task entered` (DarkOrange)
+     - Row 660: `load_init_program handoff to EL0` (Magenta)
+4. **Đồng bộ hóa với `patch_breadcrumbs.py`:**
+   - Kiểm tra tránh chèn trùng lặp vạch Row 376 nếu Row 572 đã được cài đặt.
+
+---
+
 ## Agent handoff / active work (2026-11-07 22:00: CI Build 103 - Triển Khai Direct VA Drawer Cho load_context & Toàn Bộ Vòng Đời kernel_bootstrap_thread Đến Cửa Ngõ bsd_init)
 
 ### 1. Phân Tích Thực Nghiệm Sau Đột Phá Lịch Sử Build 102 (`4a94e45`)
