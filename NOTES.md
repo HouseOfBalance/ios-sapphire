@@ -1,5 +1,60 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 18:45: CI Build 99 - Khắc Phục Lỗ Hổng Pha 2 cpu_tte, Tinh Gọn Direct Drawer & Chuyển Hướng Drawer)
+
+### 1. Đột Phá Thực Nghiệm Từ Build 98 (Commit `66f0ba1`, Run `42355730863`)
+- **Ảnh chụp thiết bị thực tế (`BUILD 66f0ba1`):**
+  - Cụm chẩn đoán phần cứng và thước đo nhị phân 16-bit tại **Rows 178..181** đã xuất hiện sắc nét trên màn hình thiết bị (ngay cạnh camera punch hole, các vạch sáng tương ứng bits 8..10 = 1, bit 0 F = 0).
+  - Phân tích pixel và đối chiếu định dạng `PAR_EL1`:
+    - **`PAR_EL1.F == 0`! (DỊCH ĐỊA CHỈ THÀNH CÔNG 100%)**
+    - `FST == 0` (Không có lỗi Translation / Permission / Access Flag nào).
+    - Bit 8 (S) = 1, Bits 9..10 (Inner Shareable) = 1.
+    - Bits 47:12 khớp chính xác Physical Address `0x5c000000` của Framebuffer!
+  - **Kết luận thực nghiệm quyết định:**
+    - Pha 1 trong `start.s` (`bootstrap_pagetables` TTBR1 L1[192] -> L2[32] với Attr1 Normal-NC `0x0060000000000605`) hoạt động hoàn hảo 100% trên phần cứng Cortex-A73!
+    - Không hề có lỗi MAIR, không có lỗi AP permission, không có lỗi RES0 hay stale cache ở Pha 1.
+
+### 2. Phát Hiện Nguyên Nhân Gốc Chí Tử Khiến Direct Drawer Bị Im Lặng
+- **Câu hỏi cốt lõi:** Nếu Pha 1 thành công 100% (`PAR_EL1.F == 0`), tại sao toàn bộ các vạch direct từ sau `arm_vm_init` (Row 160 Rose, Row 294 Cyan, Row 302 Magenta, Row 304 Magenta, Row 305 White, Row 310 Purple...) lại hoàn toàn tắt?
+- **Nguyên nhân gốc (Bug trong Section 20c `osfmk/arm64/arm_vm_init.c`):**
+  - Trong `arm_vm_init`, XNU tạo ra một bảng trang mới tinh (`cpu_tte`) để thay thế `bootstrap_pagetables`.
+  - Bảng `cpu_tte` được `bzero` và hàm `arm_vm_init` chỉ cấp phát L2 table cho dải kernel heap/text (`0xfffffff007...` đến `0xfffffff01a...`).
+  - Địa chỉ Framebuffer trực tiếp `0xfffffff004000000` nằm ngoài dải này, nên trong `cpu_tte`, entry L1[192] là **RỖNG (`*fb_l1_tte == 0`)**.
+  - Trong Section 20c cũ:
+    ```c
+    if ((*fb_l1_tte & ARM_TTE_VALID) == 0) {
+        hk_draw_band_direct(0x008B0000, 162, 2); /* Dark Red */
+    } else {
+        /* ... điền 5 descriptor L2 ... */
+    }
+    ```
+  - Do `*fb_l1_tte == 0`, code nhảy vào nhánh `if` cảnh báo và **HOÀN TOÀN BỎ QUA VIỆC CẤP PHÁT L2 TABLE VÀ ĐIỀN 5 DESCRIPTOR L2 VÀO `cpu_tte`**!
+  - Ngay sau khối này, `set_mmu_ttb_alternate` chuyển TTBR1 sang `cpu_tte`.
+  - Kể từ khoảnh khắc đó, `0xfffffff004000000` trở thành một lỗ hổng dịch địa chỉ hoàn toàn rỗng trong `cpu_tte` (Translation Fault Level 1).
+  - Mọi lời gọi `hk_draw_band_direct` sau đó đều thực thi `at s1e1w`, nhận `PAR_EL1.F = 1` và thoát im lặng qua `Lhk_direct_fault` để bảo vệ CPU khỏi crash.
+  - Trong khi đó, Row 280, 288, 296 sáng vì gọi hàm cũ `hk_draw_band` (nạp lại `bootstrap_pagetables` vào TTBR0).
+  - Khi `vm_page_bootstrap` gọi Row 302 và Row 304 bằng direct drawer, chúng rơi vào lỗ hổng này và không thể hiển thị!
+
+### 3. Giải Pháp Triệt Để trong Build 99 (Commit `67c8539`)
+1. **Cấp phát L2 On-Demand & Cache Flush cho `cpu_tte` (Section 20c):**
+   - Khi `(*fb_l1_tte & ARM_TTE_VALID) == 0`, gọi ngay `alloc_ptpage(FALSE)` để cấp phát một trang L2 mới tinh.
+   - Điền table descriptor hợp lệ vào `*fb_l1_tte` (gồm `ARM_TTE_TYPE_TABLE | ARM_TTE_VALID | ARM_DYNAMIC_TABLE_XN | ARM_TTE_TABLE_AP(ARM_TTE_TABLE_AP_USER_NA)`).
+   - Zero hoá trang L2 với `bzero((void *)l2_page, ARM_PGBYTES)`.
+   - Điền chính xác 5 block descriptor L2 (`0x5c000000 + k*0x200000 | 0x0060000000000605ULL`).
+   - Thực thi `dc civac` làm sạch đường D-cache cho `fb_l1_tte` và `fb_l2_tte[0..4]` kèm `dsb sy; isb` để hardware table walker luôn nhìn thấy descriptor ngay khi chuyển MMU.
+2. **Chuyển Hướng Toàn Diện `hk_draw_band`:**
+   - Thêm `cmp w1, #290; b.hs EXT(hk_draw_band_direct)` ngay tại dòng đầu tiên của `LEXT(hk_draw_band)`.
+   - Toàn bộ các lời gọi visual marker từ Row 290 trở đi (kể cả từ legacy drawer) đều được chuyển hướng 100% sang `hk_draw_band_direct`, triệt tiêu hoàn toàn thao tác đổi TTBR0 / `tlbi alle1` / MMU toggles khi kernel đã vào giai đoạn `pmap_startup`.
+3. **Tinh Gọn & Ổn Định Hoá `hk_draw_band_direct`:**
+   - Loại bỏ phép đo dư thừa `x7` (end address probe), chỉ giữ lại probe bắt đầu `at s1e1w, x4`.
+   - Loại bỏ `msr par_el1, x6` không cần thiết, giúp routine thuần túy 0 side-effects, 0 stack, 100% VA space.
+
+### 4. Tiến Độ Commit & CI Build 99
+- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `67c8539`
+- CI Run ID: `42369785316` (Build 99) đang chạy (`in_progress`).
+
+---
+
 ## Agent handoff / active work (2026-11-07 15:30: CI Build 98 - Chẩn Đoán Phần Cứng PAR_EL1 & Kiểm Chứng Bootstrap Pagetable Thực Nghiệm)
 
 ### 1. Bối cảnh & Phân tích từ Phản biện Thực nghiệm Build 97
