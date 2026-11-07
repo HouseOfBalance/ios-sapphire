@@ -1,5 +1,57 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 19:45: CI Build 100 - Triệt Tiêu Nghẽn Bus uncached pmap_next_page, Thang Đo Logarit, Gauge first_avail & Vạch Đồng Hồ Sống)
+
+### 1. Đột Phá Thực Nghiệm Quyết Định Từ Build 99 (Commit `67c8539`, Run `42369785316`)
+- **Ảnh chụp thiết bị thực tế (`BUILD 67c8539`):**
+  - **DIRECT FRAMEBUFFER DRAWER HOẠT ĐỘNG HOÀN TOÀN 100%!**
+  - Bảng trang `cpu_tte` đã được cấp phát L2 on-demand và làm sạch cache D-cache via `dc civac` thành công.
+  - Toàn bộ chuỗi vạch direct từ sau `arm_vm_init` bung sáng rực rỡ trên màn hình:
+    - **Row 294 (Cyan):** `pmap_startup` bắt đầu.
+    - **Row 302 & 304 (Vivid Magenta kép):** `vm_free_page_lock()` lock thành công, không bị dead-lock.
+    - **Row 305 (White):** Điểm gọi `pmap_next_page` đầu tiên.
+    - **Row 316 (Lime) & Row 320 (Magenta):** `vm_pages_first_pnum` đã gán và `patch_low_glo_vm_page_info` hoàn tất.
+    - **Row 324 (Yellow) & Row 328 (Orange):** `vm_page_init(vm_page_get(0))` và `vm_page_release_startup(vm_page_get(0))` thành công.
+    - **Row 340 (Deep Pink):** **Vòng lặp khởi tạo trang đạt Iteration 1!**
+- **Quan sát thực nghiệm:** Sau 5-10 phút boot Build 99, màn hình giữ nguyên ở Row 340, vạch 344 (50%) và 348 (unlock) không xuất hiện.
+- **Phân tích nguyên nhân:**
+  - Số trang DRAM với 1 GB RAM là $pprox 262.144$ trang. Mốc 50% nằm ở trang $131.072$.
+  - Khoảng cách giữa iteration 1 và 131.072 là **131.071 vòng lặp**.
+  - Mỗi vòng lặp, `pmap_next_page` thực hiện 2 lần ghi framebuffer uncached $pprox 17,2	ext{ KB}$ kèm `dsb sy`.
+  - Tổng lưu lượng ghi uncached vượt quá **2,2 GB**, gây nghẽn bus DRAM nghiêm trọng hoặc làm cắn Watchdog phần cứng của Snapdragon SM6225.
+
+### 2. Thiết Kế & Khắc Phục Trong Build 100 (Commit `b8e937b`, Run `42373865374`)
+1. **Triệt tiêu 100% chi phí ghi uncached trong `pmap_next_page`:**
+   - Trong `kernel/patch_ram_alignment.py`: Gỡ bỏ toàn bộ các lệnh gọi `hk_draw_band_direct` trong `pmap_next_page`.
+   - Hàm `pmap_next_page` trở về hàm logic CPU thuần túy (~10ns/trang), duyệt 260.000 trang trong vài millisecond.
+2. **Thang đo logarit thưa trong vòng lặp chính (`kernel/patch_cortex_a73.py`):**
+   - Row 340 (Deep Pink): $i = 1$
+   - Row 342 (Yellow): $i = 10$
+   - Row 344 (Lime): $i = 100$
+   - Row 346 (Cyan): $i = 1.000$
+   - Row 348 (Dodger Blue): $i = 10.000$
+   - Row 350 (Medium Orchid): $i = 50.000$
+   - Row 352 (Gold): $i = 100.000$
+   - Row 354 (Dark Orange): $i = 50\%$ tổng số trang
+   - Row 356 (Coral): `pmap_next_page` trả về `FALSE` (duyệt hết RAM)
+   - Row 358 (Spring Green, 4 rows): `vm_free_page_unlock()` hoàn tất
+3. **Thước đo 8 nibble địa chỉ vật lý `first_avail`:**
+   - Tại $i = 1.000$: hiển thị `first_avail` ở Rows 450..457.
+   - Tại $i = 10.000$: hiển thị `first_avail` ở Rows 460..467.
+4. **Vạch đồng hồ sống (Live Clock Heartbeat):**
+   - Tại Row 470: đổi màu Xanh lá / Hồng cánh sen theo chu kỳ `CNTVCT_EL0` bit 18 mỗi 4096 trang.
+5. **Giới hạn an toàn vòng lặp lùi:**
+   - Đổi `for (uint32_t i = npages; i-- > 0;)` thành `for (uint32_t i = vm_pages_count; i-- > 0;)`.
+6. **Cập nhật công cụ kiểm tra `tools/verify_kernel_markers.py`:**
+   - Check 3 xác nhận `_pmap_next_page` tồn tại (zero-overhead) và `_pmap_startup` chứa các milestone markers (Rows 302, 304, 340, 342, 358).
+
+### 3. Tiến Độ Commit & CI Build 100
+- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `b8e937b`
+- CI Run ID: `42373865374` (Build 100) đang chạy trên GitHub Actions.
+- Kế hoạch: Theo dõi CI -> Tải artifact kernel -> Đóng gói `platform-tools/enxerto-boot.img` -> Kiểm chứng markers -> Flash và boot.
+
+---
+
 ## Agent handoff / active work (2026-11-07 18:45: CI Build 99 - Khắc Phục Lỗ Hổng Pha 2 cpu_tte, Tinh Gọn Direct Drawer & Chuyển Hướng Drawer)
 
 ### 1. Đột Phá Thực Nghiệm Từ Build 98 (Commit `66f0ba1`, Run `42355730863`)
