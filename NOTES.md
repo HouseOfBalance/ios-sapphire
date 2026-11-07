@@ -1,14 +1,12 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 07:45: Chuẩn Hóa Kiểu pmap_paddr_t & CI Run 42320102838, Commit b352c61)
-- **Khắc phục lỗi biên dịch Clang (Commit b352c61):**
-  1. **Lỗi `redeclaration of 'avail_end' with a different type`:**
-     - Trong `osfmk/vm/vm_resident.c`, biến `avail_end` đã được khai báo ở dòng 2427 là `extern pmap_paddr_t avail_start, avail_end;` (`pmap_paddr_t` là `unsigned long long`).
-     - Đoạn code gauge tại dòng 1664 trong `patch_cortex_a73.py` khai báo lại `extern vm_offset_t avail_end;` (`vm_offset_t` là `unsigned long`), gây xung đột kiểu nghiêm ngặt trong Clang khi biên dịch `vm_resident.c`.
-     - Đã sửa cả `first_avail` và `avail_end` sang đúng kiểu `pmap_paddr_t`:
-       `extern pmap_paddr_t first_avail;`
-       `extern pmap_paddr_t avail_end;`
-  2. **Đang theo dõi CI:** Run ID `42320102838` (workflow `Build HakiOS XNU 12377 (iOS 26)`).
+## Agent handoff / active work (2026-11-07 07:50: Loại Bỏ Khai Báo Thừa first_avail/avail_end & CI Run 42320493118, Commit 8aeea71)
+- **Khắc phục triệt để xung đột khai báo biến trong vm_resident.c (Commit 8aeea71):**
+  1. **Nguyên nhân cốt lõi:**
+     - Trong `osfmk/vm/vm_resident.c`, biến `first_avail` được khai báo ở dòng 2426 là `extern vm_offset_t first_avail;` (`unsigned long`), trong khi `avail_end` được khai báo ở dòng 2427 là `extern pmap_paddr_t avail_start, avail_end;` (`unsigned long long`).
+     - Cả hai biến này đã nằm sẵn trong scope của `pmap_startup`. Việc cố khai báo lại chúng ở dòng 2856 bên trong block gauge chắc chắn sẽ xung đột với một trong hai kiểu nguyên bản.
+     - Đã loại bỏ hoàn toàn việc khai báo lại `first_avail` và `avail_end` trong block gauge của `kernel/patch_cortex_a73.py`, chỉ giữ lại `extern bool need_ram_ranges_init;`.
+  2. **Đang theo dõi CI:** Run ID `42320493118` (workflow `Build HakiOS XNU 12377 (iOS 26)`).
 - **Khắc phục lỗi linker Mach-O (Commit 4182df8):**
   1. **Lỗi `_get_saved_state_lr`:**
      - Trong XNU ARM64 không tồn tại hàm `get_saved_state_lr`. Thanh ghi LR (x30) trong XNU ARM64 được truy xuất qua `get_saved_state_reg(state, 30)`.
