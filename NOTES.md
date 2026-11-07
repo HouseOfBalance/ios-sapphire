@@ -1,5 +1,43 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 22:00: CI Build 103 - Triển Khai Direct VA Drawer Cho load_context & Toàn Bộ Vòng Đời kernel_bootstrap_thread Đến Cửa Ngõ bsd_init)
+
+### 1. Phân Tích Thực Nghiệm Sau Đột Phá Lịch Sử Build 102 (`4a94e45`)
+- Build 102 dời DRAM sang `0xb0000000` (1.2 GB sạch, không carveout) hoàn toàn thành công trên thiết bị thực tế:
+  - **0 PIXEL ĐỎ PANIC (ZERO PANIC).**
+  - Đã vượt qua `mapping_free_prime()` (Gold Row 508, Yellow Row 512), `machine_init()` (Chartreuse Row 514, DeepSkyBlue Row 518), `clock_init()` (MediumOrchid Row 524), `task_init()` (DodgerBlue Row 530), `thread_init()` (DeepPink Row 536), `kernel_thread_create()` (SpringGreen Row 542).
+  - Điểm dừng tiếp theo là lệnh gọi `load_context(thread)` để chuyển mạch sang luồng kernel đầu tiên (`kernel_bootstrap_thread`).
+
+### 2. Thiết Kế & Triển Khai Trong Build 103 (Commit `15d5760`, Run ID `42384289468`)
+1. **Khắc phục triệt để lỗ hổng regex & hàm vẽ cũ:**
+   - Trong `startup.c`, `kernel_bootstrap_thread` được khai báo là `static void kernel_bootstrap_thread(void)`.
+   - Hàm `idle_thread_create(processor, idle_thread)` trong XNU 12377 nhận 2 tham số (không phải 1 tham số như XNU cũ).
+   - Loại bỏ 100% việc gọi hàm `hk_draw_band` cũ tại Row 186 (bị che bởi camera cutout); thay thế bằng thang đo `hk_draw_band_direct` trong vùng hiển thị thông thoáng (Row 543..570).
+2. **Bản đồ thang đo vi mô Build 103:**
+   - **Row 496 (Cyan `0x0000FFFF`, 4 rows):** Entry `kernel_bootstrap()`
+   - **Row 543 (MediumTurquoise `0x0048D1CC`, 2 rows):** Entry `load_context()`
+   - **Row 544 (LightSeaGreen `0x0020B2AA`, 2 rows):** `machine_set_current_thread(thread)` hoàn tất
+   - **Row 545 (Coral `0x00FF7F50`, 2 rows):** `PMAP_ACTIVATE_KERNEL` hoàn tất, chuẩn bị gọi `machine_load_context(thread)`
+   - **Row 546 (White `0x00FFFFFF`, 4 rows):** **VÀO TRONG `kernel_bootstrap_thread` THÀNH CÔNG!**
+   - **Row 548 (Gold `0x00FFD700`, 4 rows):** `idle_thread_create()` hoàn tất
+   - **Row 550 (Lime `0x0000FF00`, 4 rows):** `sched_startup()` hoàn tất (scheduler kích hoạt)
+   - **Row 552 (Cyan `0x0000FFFF`, 4 rows):** `thread_daemon_init()` hoàn tất
+   - **Row 554 (Magenta `0x00FF00FF`, 4 rows):** `mapping_adjust()` hoàn tất
+   - **Row 556 (DarkOrange `0x00FF8C00`, 4 rows):** `clock_service_create()` hoàn tất
+   - **Row 558 (DeepPink `0x00FF1493`, 4 rows):** `device_service_create()` hoàn tất
+   - **Row 560 (Yellow `0x00FFFF00`, 4 rows):** `PE_init_iokit()` hoàn tất
+   - **Row 562 (Chartreuse `0x007FFF00`, 4 rows):** Chuẩn bị mở ngắt (`spllo`)
+   - **Row 564 (DeepSkyBlue `0x0000BFFF`, 4 rows):** Mở ngắt thành công (`spllo` returned)
+   - **Row 566 (MediumOrchid `0x00BA55D3`, 4 rows):** `initialize_screen()` hoàn tất
+   - **Row 570 (White `0x00FFFFFF`, 8 rows):** **CHẠM CỬA NGÕ `bsd_init()`!**
+
+### 3. Tiến Độ Commit & CI
+- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `15d5760`
+- GitHub Actions CI Run ID: `42384289468` (đang build)
+- Trạng thái: Theo dõi quá trình compile và chuẩn bị nạp thử nghiệm `fastboot boot`.
+
+---
+
 ## Agent handoff / active work (2026-11-07 21:50: CI Build 102 ĐẠT MỤC TIÊU LỊCH SỬ - DRAM 1.2GB SẠCH HOÀN TOÀN KHÔNG PANIC, HOÀN TẤT TOÀN BỘ BOOTSTRAP MACH ĐẾN load_context!)
 
 ### 1. Phân Tích Chuỗi 4 Thế Hệ Build (Build 99 -> 100 -> 101 -> 102) Trên Thiết Bị Thực Tế
