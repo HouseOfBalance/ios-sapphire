@@ -1,61 +1,61 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 12:30: CI Build 96 ĐANG CHẠY, Commit 2734bfa - Khắc phục Bug c8_new, Pre-STP Vector Markers, DAIF Early-Boot Safeguard & Post-Build Mach-O Verification)
+## Agent handoff / active work (2026-11-07 14:05: CI Build 97 ĐANG CHẠY, Run ID 42349528215, Commit f7a10bf - Direct VA Framebuffer Mapping 0xfffffff004000000, Phase 1 & 2 Two-Stage Mapping, Elimination of MMU Toggling After Row 294, Pre-304 Isolation Row 302)
 
-### 1. Phân tích thực địa & Nguyên nhân gốc rễ (Root Cause Analysis từ Build 95 - Commit 23e7c39)
-- **Thực địa 4 ảnh chụp mới của User:**
-  - Enxerto in rõ `BUILD 23e7c39` (chính là Build 95).
-  - Vạch checkpoint: Cụm CP (0..89), Vạch đơn lẻ Teal (Row 120/194), Cụm `vm_page_bootstrap` (Row 280 Lime, 288 Cam đậm, 296 Vàng, 304 Magenta).
-  - Hoàn toàn KHÔNG CÓ Row 230 Đỏ Cam hay Row 410 Trắng / Gauge 416..440.
-- **Phát hiện chấn động qua Disassembly trực tiếp Mach-O (`mach.development.bcm2837`):**
-  1. **Bug `c8 = c8_new` trong `kernel/patch_cortex_a73.py`:**
-     - Dòng 1142 tạo `c8_new` từ regex `Ltest_istack`.
-     - Dòng 1145..1208 patch toàn bộ vector `locore.s` vào chuỗi `c8`.
-     - Dòng 1210: `if n_sub > 0: c8 = c8_new` -> **Ghi đè `c8` bằng `c8_new`, xóa sạch toàn bộ các patch vector trong `locore.s`!**
-     - CI log in `[OK]` vì regex thành công trên `c8`, nhưng file ghi xuống đĩa bị mất sạch.
-     - Hệ quả: Build 95 hoàn toàn KHÔNG CÓ Row 230, Row 204, Row 210 trong binary!
-  2. **Row 306 có trong binary, nhưng vì sao kernel dừng ngay sau Row 304:**
-     - Disassembly tại `0xfffffff007469f00`:
-       - `bl _lck_mtx_lock` (tương ứng `vm_free_page_lock()`)
-       - `mov w1, #304; bl _hk_draw_band` (Vẽ Row 304 Magenta)
-       - `mov w1, #410; bl _hk_draw_band` (Vẽ Row 410 White)
-     - `_hk_draw_band` khi thoát thực hiện `msr DAIF, x23`.
-     - Trong boot sớm, ABL để lại các ngắt phần cứng đang pending (`pend=08240000`, `hppi=12` PTIMER, `pend=00200002` SGI11).
-     - Khi `hk_draw_band` khôi phục DAIF, CPU nhảy ngay vào `el1_sp0_irq_vector_long` (hoặc SP1). Vector này trong kernel gốc thực hiện `mrs x1, TPIDR_EL1; ldr x0, [x1, #456]`. Vì `TPIDR_EL1 == 0` (chưa có CPU data), nó gây ra Data Abort lập tức!
-     - Data Abort nhảy vào `el1_sp0_synchronous_vector_long`, mà vector này không có marker và stack SP_EL1 lỗi -> double fault đứng im tại chỗ!
+### 1. Phân tích thực nghiệm & Quyết định Kiến trúc Build 97
+- **Vấn đề cốt lõi của Build 96 và các bản trước:**
+  - `hk_draw_band` và `hk_draw_band_stackless` phụ thuộc vào cơ chế tắt MMU (`msr SCTLR_EL1`), chuyển sang `TTBR0` của bootstrap, vẽ vào PA `0x5c000000`, rồi bật lại MMU và chuyển về TTBR0 gốc.
+  - Khi MMU được bật lại, nếu translation context hoặc trạng thái CPU không toàn vẹn khi trở lại VA, CPU sẽ fault lập tức. Việc này giải thích tại sao mọi build từ 93 đến 96 đều dừng ngay sau Row 304 khi gọi `hk_draw_band(0x00FFFFFF, 410, 4)`!
+  - Để loại bỏ hoàn toàn điểm yếu này, toàn bộ hệ thống chẩn đoán hiển thị được chuyển sang chạy **100% trong Virtual Address space (KVA)** thông qua routine mới `hk_draw_band_direct`.
+- **Xác minh chính xác từ nguồn & binary về không gian VA dưới `gVirtBase`:**
+  - `LOW_GLOBAL_BASE_ADDRESS = 0xfffffff000000000ULL` (định nghĩa chuẩn trong `osfmk/arm/pmap.h` cho cấu hình không có `ARM_LARGE_MEMORY`). `arm_vm_init` chỉ dùng L2 index 0 (2MB).
+  - `gVirtBase = 0xfffffff006000000ULL` (L1 index 192, L2 index 48).
+  - Phân đoạn `__PRELINK_TEXT` trong Mach-O nằm ở `0xfffffff004004000`, nhưng `vmsize == 0`. Vì vậy, `arm_vm_prot_init()` và `arm_vm_physmap_init()` bỏ qua hoàn toàn.
+  - **Địa chỉ VA được chọn cho Framebuffer:**
+    $$\mathbf{VA = 0xfffffff004000000ULL} \quad (\text{L1 index } 192, \text{ L2 indices } 32..36, \text{ diện tích } 10\text{ MB})$$
+    Nằm trọn vẹn trong L2 table của L1[192], không trùng với bất kỳ cấu trúc hay kalloc/dynamic map nào của kernel!
 
----
+### 2. Thiết kế Hai Pha (Two-Phase Mapping) & Các Guard bảo vệ
+1. **Pha 1 (Early Bootstrap trong `start.s`):**
+   - Đặt tại CP3 ngay trước `dsb ish` (MMU đang OFF, chạy tại PA).
+   - Truy cập TTBR1 L1 root (`x25 + 0x1000`), đọc descriptor L1[192], trích xuất địa chỉ PA của L2 table (`and x10, x10, #0x0000FFFFFFFFF000`).
+   - Trỏ tới entry 32 (`add x10, x10, #(32 * 8)`).
+   - **Guard Pha 1:** Duyệt đọc 5 entry (32..36). Nếu có entry nào khác 0, CPU rẽ nhánh `Lhk_fb_read_fail` và ghi ngay vạch Đỏ cảnh báo tại Row 45 lên PA framebuffer!
+   - **Zero & Fill:** Zero 5 entry bằng `str xzr`, sau đó ghi 5 block descriptor `PA | 0x0060000000000605ULL` (Attr 1 Normal Non-cacheable, Outer Shareable, AF=1, UXN/PXN=1).
+   - Dùng các nhãn cục bộ duy nhất: `Lhk_fb_read_guard`, `Lhk_fb_read_fail`, `Lhk_fb_zero`, `Lhk_fb_fill`.
+2. **Pha 2 (Sau Physmap Init trong `arm_vm_init.c`):**
+   - Đặt ngay giữa dòng 2164 (`arm_vm_physmap_init(args);`) và dòng 2165 (`set_mmu_ttb_alternate(...)`).
+   - Tại đây, `cpu_tte` đã được cấp L2 table cho L1[192] và `phystokv` đã hợp lệ.
+   - Kiểm tra `*fb_l1_tte`: nếu thiếu, gọi `hk_draw_band_direct(0x008B0000, 162, 2)` (Đỏ đậm).
+   - Kiểm tra va chạm dữ liệu trong `fb_l2_tte`: nếu có entry != 0 và khác descriptor mong muốn, gọi `hk_draw_band_direct(0x00FF0000, 164, 2)`.
+   - Ghi 5 descriptor vào `cpu_tte` và phát hành `dsb sy`.
+   - Ngay sau `set_mmu_ttb_alternate` & `flush_mmu_tlb()`: gọi `hk_draw_band_direct(0x00FF007F, 160, 3)` (Rose) để kiểm chứng trực tiếp trên màn hình rằng bảng trang mới đã hoạt động!
 
-### 2. Các sửa đổi đã hoàn tất trong Commit `2734bfa` (Kernel Repo `ios26-sapphire`):
-1. **Loại bỏ hoàn toàn bug `c8 = c8_new`:**
-   - Sử dụng `c8, n_sub = re.subn(...)` tại chỗ.
-2. **Cài đặt 6 marker vector STACKLESS TRƯỚC LỆNH `stp` trong `locore.s`:**
-   - Không chạm vào stack SP_EL1, lưu `x0, x1, lr` vào `x16, x17, x18`.
-   - `el1_sp0_synchronous_vector_long`: Row 230 OrangeRed (0x00FF4500, 6 hàng 230..235, bỏ qua nếu EC==0 trap LSE/PAC).
-   - `el1_sp0_irq_vector_long`: Row 220 GreenYellow (0x00ADFF2F, 4 hàng, chỉ kích hoạt khi `TPIDR_EL1 == 0`).
-   - `el1_sp0_fiq_vector_long`: Row 224 Lime (0x0000FF00, 4 hàng, chỉ kích hoạt khi `TPIDR_EL1 == 0`).
-   - `el1_sp0_serror_vector_long`: Row 228 Red (0x00FF0000, 2 hàng).
-   - `el1_sp1_synchronous_vector_long`: Row 236 BlueViolet (0x008A2BE2, 2 hàng).
-   - `el1_sp1_irq_vector_long`: Row 238 DarkOrange (0x00FF8C00, 2 hàng).
-3. **DAIF Early-Boot Safeguard trong `hk_draw_band` & `hk_render_screen_asm`:**
-   - Kiểm tra `TPIDR_EL1`: Nếu `TPIDR_EL1 == 0`, KHÔNG khôi phục `x23` mà thực hiện `msr DAIFSet, #0xf` để giữ ngắt bị khóa hoàn toàn trong suốt quá trình boot sơ khởi!
-   - Thêm `msr daifset, #0xf; isb` tại đầu `vm_page_bootstrap` và trước/sau `vm_free_page_lock()`.
-4. **Vạch Call-site Row 305 White:**
-   - Đặt ngay trước lệnh gọi `pmap_next_page(&phys_page)`.
-   - Chuỗi visual rõ ràng: Row 304 (Magenta) -> Row 305 (White: sắp gọi) -> Row 306 (Lime: bên trong `pmap_next_page`) -> Row 310 (Purple: đã return).
-5. **Post-patch Disk Assertions & Mach-O Binary Verification:**
-   - `patch_cortex_a73.py`: Đọc lại file từ đĩa và `assert` các chuỗi marker tồn tại trước khi hoàn tất script.
-   - Thêm công cụ `tools/verify_kernel_markers.py`: Đọc header Mach-O, duyệt symbol table và disassembly mã máy ARM64 kiểm tra lệnh `bl hk_draw_band_stackless` và `Row 306` tồn tại trong binary.
-   - Tích hợp `verify_kernel_markers.py` vào `.github/workflows/build-xnu-12377.yml`.
+### 3. Routine Direct VA Drawer & Loại bỏ triệt để Drawer cũ
+1. **`hk_draw_band_direct` trong `start.s`:**
+   - Hoạt động 100% trong VA, không chạm `SCTLR_EL1`, không chạm `TTBR0_EL1`, không gọi `tlbi`, không dùng stack (chỉ dùng caller-saved `x0..x8`).
+   - Bảo toàn và khôi phục `PAR_EL1` trong `x6`.
+   - Sử dụng `at s1e1w` kiểm tra cả địa chỉ bắt đầu (`x4`) và kết thúc (`x7`). Nếu `PAR_EL1` báo fault, thoát ngay lập tức (silent fail, không bao giờ gây crash/freeze).
+2. **Cắt đứt hoàn toàn việc đổi MMU sau Row 294:**
+   - Đầu hàm `hk_draw_band` thêm lệnh: `cmp w1, #294; b.hs EXT(hk_draw_band_direct)`. Bất kỳ lời gọi nào từ hàng 294 trở đi đều tự động rẽ sang routine direct.
+   - `hk_draw_band_stackless` chuyển thành `b EXT(hk_draw_band_direct)`. Các exception vector trong `locore.s` hoàn toàn không đổi MMU nữa.
+   - Thêm vạch **Row 302** (Magenta, `hk_draw_band_direct`) nằm **ngay trước** `vm_free_page_lock` để chia đôi rõ ràng: phân định treo do mutex lock hay do drawer.
+   - Chuyển toàn bộ các marker: Row 294, 302, 304, 305, 306, 308, 310, 312, 316, 320, 330, 340, 344, 348, Gauge 410..440 sang gọi trực tiếp `hk_draw_band_direct`.
 
----
+### 4. Ma trận đọc ảnh trên thiết bị thực tế (Build 97)
+- **Row 50 sáng, Row 55 sáng:** Pha 1 thành công (mapping VA tồn tại trong `bootstrap_pagetables`).
+- **Row 45 Đỏ sáng:** Guard Pha 1 kích hoạt (L2 entries 32..36 trong bootstrap không trống).
+- **Row 158 & Row 160 sáng:** Pha 2 thành công (mapping VA tồn tại trong `cpu_tte` sau `arm_vm_init`).
+- **Row 162 sáng:** Cảnh báo Pha 2 (thiếu L1 entry trong `cpu_tte`).
+- **Row 164 sáng:** Cảnh báo Pha 2 (va chạm L2 entry trong `cpu_tte`).
+- **Row 294 sáng, Row 302 sáng, Row 304 tối:** Treo thật sự nằm tại `vm_free_page_lock()` hoặc trước Row 304, độc lập với drawer.
+- **Row 302 sáng, Row 304 sáng, Gauge 410+ sáng:** Khẳng định 100% việc dừng ở 304 ở các build trước là do lỗi chuyển đổi MMU của drawer cũ; kernel thực tế đã unblock qua `pmap_startup`!
 
-### 3. Trạng thái CI Hiện tại:
-- **Commit:** `2734bfa` trên branch `main` của `HouseOfBalance/ios26-sapphire`.
-- **Run ID:** `42342883843` (Build 96).
-- **Trạng thái:** `in_progress`.
-
----
+### 5. Tiến độ CI Build 97 & Các commit liên quan
+- **Kernel Repo (`HouseOfBalance/ios26-sapphire`):**
+  - Commit `f7a10bf`: `kernel: map framebuffer directly to VA (0xfffffff004000000), eliminate MMU toggling after Row 294, and install Phase 1/Phase 2 guards`
+- **GitHub Actions Run ID:** `42349528215` (đang chạy).
+- **Tool kiểm chứng:** `tools/verify_kernel_markers.py` đã cập nhật kiểm tra `hk_draw_band_direct`, AT guard, không có lệnh MMU toggle, và Row 306.
 
 ## Agent handoff / active work (2026-11-07 08:52: CI Build 95 THÀNH CÔNG, Commit 23e7c39 - Đã Sẵn Sàng Boot Image Trên Thiết Bị)
 - **CI Build Thành Công 100% (Run ID: 42325734420, Run Number: 95, Commit: 23e7c39):**
