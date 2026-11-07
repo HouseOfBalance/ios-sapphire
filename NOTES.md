@@ -1,6 +1,15 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 07:55: Chuẩn Hóa Đúng Kiểu Độc Lập Cho first_avail & avail_end, CI Run 42320860894, Commit 7495b6c)
+## Agent handoff / active work (2026-11-07 07:58: CI Build 93 THÀNH CÔNG XANH 100%, Sẵn Sàng Fastboot Boot, Commit 7495b6c)
+- **CI Build Thành Công 100% (Run ID: 42320860894, Run Number: 93, Commit: 7495b6c):**
+  - Tất cả các bước (Prepare XNU tree, Setup build env, Compile XNU Kernel, Package Payload and Boot Image, Upload Artifacts) đều đạt `success`.
+  - Đã tải và giải nén artifact: `artifacts/ci_42320860894/` và cập nhật file boot cục bộ `out/enxerto-boot.img` (10,719,232 bytes).
+  - Đã kiểm tra symbol table của Mach-O kernel (`mach.development.bcm2837`):
+    - `_hk_draw_band_stackless`: type `0xf`, value `0xfffffff00751d990` (Global export, 100% stackless).
+    - `_need_ram_ranges_init`: type `0xf`, value `0xfffffff007c822d8` (Global export).
+    - `_sleh_invalid_stack`: type `0xf`, value `0xfffffff007518d4c` (Bảo vệ NULL stack, dc civac, asm render).
+    - `_get_saved_state_reg`: type `0xf`, value `0xfffffff007b9d7c4` (Đọc LR reg 30 chuẩn xác).
+    - `_pmap_startup`: type `0xf`, value `0xfffffff007469cb4` (Tích hợp gauge nibble 410..440 và vạch dày >=2 hàng).
 - **Khắc phục chính xác kiểu khai báo extern cho gauge (Commit 7495b6c):**
   1. **Nguyên nhân phân tích từ log build 91 & 92:**
      - Trong `osfmk/vm/vm_resident.c`, khai báo ở dòng 2426 là local bên trong một hàm trước đó, nên `pmap_startup` (dòng 2856) bắt buộc phải có khai báo `extern` riêng để truy xuất.
@@ -13,7 +22,6 @@
        extern pmap_paddr_t avail_end;
        extern bool need_ram_ranges_init;
        ```
-  2. **Đang theo dõi CI:** Run ID `42320860894` (workflow `Build HakiOS XNU 12377 (iOS 26)`).
 - **Khắc phục lỗi linker Mach-O (Commit 4182df8):**
   1. **Lỗi `_get_saved_state_lr`:**
      - Trong XNU ARM64 không tồn tại hàm `get_saved_state_lr`. Thanh ghi LR (x30) trong XNU ARM64 được truy xuất qua `get_saved_state_reg(state, 30)`.
