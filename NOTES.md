@@ -1,5 +1,62 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 12:30: CI Build 96 ĐANG CHẠY, Commit 2734bfa - Khắc phục Bug c8_new, Pre-STP Vector Markers, DAIF Early-Boot Safeguard & Post-Build Mach-O Verification)
+
+### 1. Phân tích thực địa & Nguyên nhân gốc rễ (Root Cause Analysis từ Build 95 - Commit 23e7c39)
+- **Thực địa 4 ảnh chụp mới của User:**
+  - Enxerto in rõ `BUILD 23e7c39` (chính là Build 95).
+  - Vạch checkpoint: Cụm CP (0..89), Vạch đơn lẻ Teal (Row 120/194), Cụm `vm_page_bootstrap` (Row 280 Lime, 288 Cam đậm, 296 Vàng, 304 Magenta).
+  - Hoàn toàn KHÔNG CÓ Row 230 Đỏ Cam hay Row 410 Trắng / Gauge 416..440.
+- **Phát hiện chấn động qua Disassembly trực tiếp Mach-O (`mach.development.bcm2837`):**
+  1. **Bug `c8 = c8_new` trong `kernel/patch_cortex_a73.py`:**
+     - Dòng 1142 tạo `c8_new` từ regex `Ltest_istack`.
+     - Dòng 1145..1208 patch toàn bộ vector `locore.s` vào chuỗi `c8`.
+     - Dòng 1210: `if n_sub > 0: c8 = c8_new` -> **Ghi đè `c8` bằng `c8_new`, xóa sạch toàn bộ các patch vector trong `locore.s`!**
+     - CI log in `[OK]` vì regex thành công trên `c8`, nhưng file ghi xuống đĩa bị mất sạch.
+     - Hệ quả: Build 95 hoàn toàn KHÔNG CÓ Row 230, Row 204, Row 210 trong binary!
+  2. **Row 306 có trong binary, nhưng vì sao kernel dừng ngay sau Row 304:**
+     - Disassembly tại `0xfffffff007469f00`:
+       - `bl _lck_mtx_lock` (tương ứng `vm_free_page_lock()`)
+       - `mov w1, #304; bl _hk_draw_band` (Vẽ Row 304 Magenta)
+       - `mov w1, #410; bl _hk_draw_band` (Vẽ Row 410 White)
+     - `_hk_draw_band` khi thoát thực hiện `msr DAIF, x23`.
+     - Trong boot sớm, ABL để lại các ngắt phần cứng đang pending (`pend=08240000`, `hppi=12` PTIMER, `pend=00200002` SGI11).
+     - Khi `hk_draw_band` khôi phục DAIF, CPU nhảy ngay vào `el1_sp0_irq_vector_long` (hoặc SP1). Vector này trong kernel gốc thực hiện `mrs x1, TPIDR_EL1; ldr x0, [x1, #456]`. Vì `TPIDR_EL1 == 0` (chưa có CPU data), nó gây ra Data Abort lập tức!
+     - Data Abort nhảy vào `el1_sp0_synchronous_vector_long`, mà vector này không có marker và stack SP_EL1 lỗi -> double fault đứng im tại chỗ!
+
+---
+
+### 2. Các sửa đổi đã hoàn tất trong Commit `2734bfa` (Kernel Repo `ios26-sapphire`):
+1. **Loại bỏ hoàn toàn bug `c8 = c8_new`:**
+   - Sử dụng `c8, n_sub = re.subn(...)` tại chỗ.
+2. **Cài đặt 6 marker vector STACKLESS TRƯỚC LỆNH `stp` trong `locore.s`:**
+   - Không chạm vào stack SP_EL1, lưu `x0, x1, lr` vào `x16, x17, x18`.
+   - `el1_sp0_synchronous_vector_long`: Row 230 OrangeRed (0x00FF4500, 6 hàng 230..235, bỏ qua nếu EC==0 trap LSE/PAC).
+   - `el1_sp0_irq_vector_long`: Row 220 GreenYellow (0x00ADFF2F, 4 hàng, chỉ kích hoạt khi `TPIDR_EL1 == 0`).
+   - `el1_sp0_fiq_vector_long`: Row 224 Lime (0x0000FF00, 4 hàng, chỉ kích hoạt khi `TPIDR_EL1 == 0`).
+   - `el1_sp0_serror_vector_long`: Row 228 Red (0x00FF0000, 2 hàng).
+   - `el1_sp1_synchronous_vector_long`: Row 236 BlueViolet (0x008A2BE2, 2 hàng).
+   - `el1_sp1_irq_vector_long`: Row 238 DarkOrange (0x00FF8C00, 2 hàng).
+3. **DAIF Early-Boot Safeguard trong `hk_draw_band` & `hk_render_screen_asm`:**
+   - Kiểm tra `TPIDR_EL1`: Nếu `TPIDR_EL1 == 0`, KHÔNG khôi phục `x23` mà thực hiện `msr DAIFSet, #0xf` để giữ ngắt bị khóa hoàn toàn trong suốt quá trình boot sơ khởi!
+   - Thêm `msr daifset, #0xf; isb` tại đầu `vm_page_bootstrap` và trước/sau `vm_free_page_lock()`.
+4. **Vạch Call-site Row 305 White:**
+   - Đặt ngay trước lệnh gọi `pmap_next_page(&phys_page)`.
+   - Chuỗi visual rõ ràng: Row 304 (Magenta) -> Row 305 (White: sắp gọi) -> Row 306 (Lime: bên trong `pmap_next_page`) -> Row 310 (Purple: đã return).
+5. **Post-patch Disk Assertions & Mach-O Binary Verification:**
+   - `patch_cortex_a73.py`: Đọc lại file từ đĩa và `assert` các chuỗi marker tồn tại trước khi hoàn tất script.
+   - Thêm công cụ `tools/verify_kernel_markers.py`: Đọc header Mach-O, duyệt symbol table và disassembly mã máy ARM64 kiểm tra lệnh `bl hk_draw_band_stackless` và `Row 306` tồn tại trong binary.
+   - Tích hợp `verify_kernel_markers.py` vào `.github/workflows/build-xnu-12377.yml`.
+
+---
+
+### 3. Trạng thái CI Hiện tại:
+- **Commit:** `2734bfa` trên branch `main` của `HouseOfBalance/ios26-sapphire`.
+- **Run ID:** `42342883843` (Build 96).
+- **Trạng thái:** `in_progress`.
+
+---
+
 ## Agent handoff / active work (2026-11-07 08:52: CI Build 95 THÀNH CÔNG, Commit 23e7c39 - Đã Sẵn Sàng Boot Image Trên Thiết Bị)
 - **CI Build Thành Công 100% (Run ID: 42325734420, Run Number: 95, Commit: 23e7c39):**
   - Tất cả các bước (Prepare XNU tree, Setup build env, Compile XNU Kernel, Package Payload and Boot Image, Upload Artifacts) đều đạt `success`.
