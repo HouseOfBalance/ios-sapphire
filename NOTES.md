@@ -20,7 +20,7 @@
   - Mỗi vòng lặp, `pmap_next_page` thực hiện 2 lần ghi framebuffer uncached $pprox 17,2	ext{ KB}$ kèm `dsb sy`.
   - Tổng lưu lượng ghi uncached vượt quá **2,2 GB**, gây nghẽn bus DRAM nghiêm trọng hoặc làm cắn Watchdog phần cứng của Snapdragon SM6225.
 
-### 2. Thiết Kế & Khắc Phục Trong Build 100 (Commit `b8e937b`, Run `42373865374`)
+### 2. Thiết Kế & Khắc Phục Trong Build 100 (Commit `130215a`, Run `42374665222`)
 1. **Triệt tiêu 100% chi phí ghi uncached trong `pmap_next_page`:**
    - Trong `kernel/patch_ram_alignment.py`: Gỡ bỏ toàn bộ các lệnh gọi `hk_draw_band_direct` trong `pmap_next_page`.
    - Hàm `pmap_next_page` trở về hàm logic CPU thuần túy (~10ns/trang), duyệt 260.000 trang trong vài millisecond.
@@ -46,8 +46,8 @@
    - Check 3 xác nhận `_pmap_next_page` tồn tại (zero-overhead) và `_pmap_startup` chứa các milestone markers (Rows 302, 304, 340, 342, 358).
 
 ### 3. Tiến Độ Commit & CI Build 100
-- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `b8e937b`
-- CI Run ID: `42373865374` (Build 100) đang chạy trên GitHub Actions.
+- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `130215a`
+- CI Run ID: `42373865374` (Build 100) đã HOÀN THÀNH THÀNH CÔNG 100% (Success). Artifact đã tải về và đồng bộ vào platform-tools/enxerto-boot.img.
 - Kế hoạch: Theo dõi CI -> Tải artifact kernel -> Đóng gói `platform-tools/enxerto-boot.img` -> Kiểm chứng markers -> Flash và boot.
 
 ---
