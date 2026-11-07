@@ -51,7 +51,14 @@
 
 ### 4. Tiến Độ Commit & CI Build 99
 - Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `67c8539`
-- CI Run ID: `42369785316` (Build 99) đang chạy (`in_progress`).
+- CI Run ID: `42369785316` (Build 99) **THÀNH CÔNG 100% (Success)**.
+- `verify_kernel_markers.py`: PASSED 100%.
+- Đã tải artifact và đồng bộ boot images:
+  - `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img` (10,723,328 bytes, chứa chuỗi `67c8539` và `BUILD`).
+  - `artifacts/ci_42369785316/`
+  - `out/enxerto-boot.img` và `out/bergamota-fastboot.img`
+- Thao tác boot: Đưa máy về Fastboot (`Nguồn + Giảm âm lượng`), chạy:
+  `fastboot boot enxerto-boot.img` từ thư mục `platform-tools`.
 
 ---
 
