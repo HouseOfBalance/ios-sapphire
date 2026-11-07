@@ -54,8 +54,11 @@
 ### 5. Tiến độ CI Build 97 & Các commit liên quan
 - **Kernel Repo (`HouseOfBalance/ios26-sapphire`):**
   - Commit `f7a10bf`: `kernel: map framebuffer directly to VA (0xfffffff004000000), eliminate MMU toggling after Row 294, and install Phase 1/Phase 2 guards`
-- **GitHub Actions Run ID:** `42349528215` (đang chạy).
-- **Tool kiểm chứng:** `tools/verify_kernel_markers.py` đã cập nhật kiểm tra `hk_draw_band_direct`, AT guard, không có lệnh MMU toggle, và Row 306.
+  - Commit `0429220`: `tools: fix AT S1E1W instruction opcode mask in verify_kernel_markers.py`
+- **GitHub Actions Runs:**
+  - Run ID `42349528215` (Commit `f7a10bf`): Biên dịch XNU Kernel thành công 100% với Clang 19 trên macos-15 (toàn bộ code Pha 1, Pha 2 và `hk_draw_band_direct` liên kết hoàn hảo). Bước đóng gói payload dừng lại tại `verify_kernel_markers.py` do mask opcode của lệnh `at s1e1w` (0xD5087820 vs 0xD5087800 của `s1e1r`).
+  - Run ID `42350166743` (Commit `0429220`): Đang chạy với bản sửa hoàn chỉnh của `verify_kernel_markers.py`.
+- **Tool kiểm chứng:** `tools/verify_kernel_markers.py` kiểm chứng nhị phân Mach-O trước khi đóng gói: `_hk_draw_band_direct` tồn tại, chạy 100% VA (không TTBR0, không SCTLR toggle, không TLBI), có guard `AT S1E1W`, exception vector gọi drawer, và `pmap_next_page` chứa Row 306.
 
 ## Agent handoff / active work (2026-11-07 08:52: CI Build 95 THÀNH CÔNG, Commit 23e7c39 - Đã Sẵn Sàng Boot Image Trên Thiết Bị)
 - **CI Build Thành Công 100% (Run ID: 42325734420, Run Number: 95, Commit: 23e7c39):**
