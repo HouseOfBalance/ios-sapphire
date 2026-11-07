@@ -1,6 +1,30 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 07:58: CI Build 93 THÀNH CÔNG XANH 100%, Sẵn Sàng Fastboot Boot, Commit 7495b6c)
+## Agent handoff / active work (2026-11-07 08:20: BƯỚC NGOẶT LỊCH SỬ - ĐÃ VÀO BSD TASK 1 / bsdinit_task, HÀNG 630 SÁNG, ĐANG TREO TẠI load_init_program)
+- **KẾT QUẢ ĐO ĐẠC THỰC TẾ TRÊN PHẦN CỨNG (Ảnh media_1794013179628_2f74e704.jpg & media_1794013180354_01cc5d96.jpg):**
+  - **TOÀN BỘ EARLY BOOT & PMAP & BSD KHỞI TẠO ĐÃ QUA THÀNH CÔNG RỰC RỠ:**
+    - Subsystem 3 (STARTUP_SUB_LOCKS, Row 194 Cyan) **ĐÃ QUA**.
+    - pmap_startup / aperture steal loop (Rows 280, 288, 296, 304, 306..315, 348) **ĐÃ QUA**.
+    - pmap_startup thoát, vm_page_bootstrap trả về, sched_startup hoàn tất!
+    - `bsd_init` entered (Row 500: Goldenrod `0x00DAA520`) **ĐÃ QUA**.
+    - `bsd_init` completed (Row 580: Cyan `0x0000FFFF`) **ĐÃ QUA**.
+    - `vfs_mountroot()` THÀNH CÔNG (Row 615: Spring Green `0x0000FF7F`) **ĐÃ QUA**.
+    - `bsd_utaskbootstrap()` THÀNH CÔNG (Row 620: Deep Sky Blue `0x0000BFFF`) **ĐÃ QUA** (Tạo task 1, thread 1, proc 1 hoàn tất).
+    - **`bsdinit_task()` ĐÃ CHẠY! (Row 630: Dark Orange `0x00FF8C00`) ĐÃ XUẤT HIỆN RÕ RÀNG TRÊN MÀN HÌNH** (Đo pixel tại x=190: R=229 G=142 B=65, nằm ngay sau vạch Deep Sky Blue 620 tại x=185 và Spring Green 615 tại x=181).
+- **VỊ TRÍ DỪNG HIỆN TẠI ĐÃ ĐƯỢC KHOAN VÙNG CHÍNH XÁC:**
+  - Hàng 630 (Dark Orange: `bsdinit_task` entry) đã vẽ.
+  - Hàng 640 (Magenta: `load_init_program` handoff/return) CHƯA XUẤT HIỆN.
+  - Hàng 660 (Thick Red: `panic`) CHƯA XUẤT HIỆN (do `panic()` không được gọi, hoặc `PE_kputc == NULL` khiến `panic()` nhảy qua hook).
+  - Không có exception vector 198 (EC), không có double fault corrupt stack (204, 210, 216).
+  - **Kernel đang dừng/treo bên trong lời gọi `load_init_program(p)` tại `bsd/kern/kern_exec.c`!**
+  - Trong `_load_init_program`:
+    1. Thử gọi `load_init_program_at_path(p, scratch, "/usr/appleinternal/sbin/launchd.development")` -> trả về ENOENT (mockfs ramdisk không có file này).
+    2. Thử gọi `load_init_program_at_path(p, scratch, "/sbin/launchd")` -> gọi `__mac_execve` -> `exec_activate_image` -> `exec_mach_imgact` -> `load_machfile`.
+    3. Kernel đang dừng bên trong chuỗi thực thi này (hoặc chờ lock/sleep trong `exec_activate_image`, hoặc trong `load_machfile`, hoặc mã kiểm tra signature/entitlement).
+- **Kế hoạch hành động cụ thể kế tiếp:**
+  1. Đặt vạch chẩn đoán phân giải cao bên trong `load_init_program` và `exec_mach_imgact` (Rows 632, 634, 636, 638, 642).
+  2. Đặt hook `panic()` VÔ ĐIỀU KIỆN ngay dòng đầu tiên của `panic()` (Row 660), không phụ thuộc vào `PE_kputc`.
+  3. Bẫy `el1_sp1_synchronous_vector_long_spill_failed` (tránh spin im lặng `wfe; b .` tại `0xfffffff0075162bc`).
 - **CI Build Thành Công 100% (Run ID: 42320860894, Run Number: 93, Commit: 7495b6c):**
   - Tất cả các bước (Prepare XNU tree, Setup build env, Compile XNU Kernel, Package Payload and Boot Image, Upload Artifacts) đều đạt `success`.
   - Đã tải và giải nén artifact: `artifacts/ci_42320860894/` và cập nhật file boot cục bộ `out/enxerto-boot.img` (10,719,232 bytes).
