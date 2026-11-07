@@ -1,5 +1,53 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 20:25: CI Build 101 - pmap_startup & vm_mem_bootstrap Hoàn Tất, Chuyển Hướng 100% hk_draw_band Sang Direct VA & Đo Mốc kernel_bootstrap)
+
+### 1. Đột Phá Thực Nghiệm Quyết Định Từ Build 100 (Commit `130215a`, Run `42374665222`)
+- **Ảnh chụp thiết bị thực tế (`BUILD 130215a`):**
+  - **DẢI VẠCH TIẾN VƯỢT BẬC SO VỚI BUILD 99:**
+    - Trong Build 99, dải vạch dừng lại tại $y \approx 272$ (Iteration 1, Row 340).
+    - Trong Build 100, vạch bung sáng trải dài từ $y = 272$ xuống tận **$y = 386$** (tăng thêm 114 pixel vào sâu trong màn hình!).
+  - **Giải mã quang phổ pixel (Thước đo 0.45 pixel / hàng):**
+    - **Y=218..221 (Lime Green `0x0032CD32`):** **Row 292** - `pmap_startup` trả về `vm_page_bootstrap` thành công!
+    - **Y=226..227 (Magenta `0x00FF00FF`):** Row 302 & 304 - `vm_free_page_lock` thành công.
+    - **Y=267 (Deep Pink `0x00FF1493`):** Row 340 - $i = 1$.
+    - **Y=296..306 (Cyan `0x0000FFFF`):** Row 344/346 - $i = 100$ và $i = 1.000$.
+    - **Y=352 (Yellow/Gold `0x00FFFF00` / `0x00BA55D3`):** Row 348/350 - $i = 10.000$ và $i = 50.000$ (Medium Orchid).
+    - **Y=374 (Dark Orange `0x00FF8C00`):** Row 356 - `pmap_next_page` trả về `FALSE` (duyệt hết RAM an toàn tại mốc firmware carveout `0x85800000`).
+    - **Y=386 (Magenta `0x00FF00FF`):** Row 470 - **Live Clock Heartbeat** được kích hoạt liên tục trong vòng lặp!
+    - **Các mốc `vm_mem_bootstrap`:** Row 360 (Lime Green), Row 364 (Cyan - `zone_bootstrap`), Row 368 (Magenta - `vm_object_bootstrap`), Row 372 (Yellow - `vm_retire_boot_pages`), Row 376 (Dark Violet - `vm_map_init`), Row 380 (Cyan - `kmem_init`), Row 384 (White - `STARTUP_SUB_KMEM`), Row 388 (Orange - `vm_fault_init`), Row 392 (Chartreuse - `STARTUP_SUB_ZALLOC`) đều đã được vượt qua!
+
+### 2. Phát Hiện Điểm Nghẽn & Khắc Phục Trong Build 101 (Commit `3909cb2`)
+1. **Gốc rễ sự cố sau `STARTUP_SUB_ZALLOC`:**
+   - Trong `patch_cortex_a73.py`: Lệnh chuyển hướng `hk_draw_band` cũ chỉ chuyển các hàng $\ge 290$ (`cmp w1, #290; b.hs EXT(hk_draw_band_direct)`).
+   - Bất kỳ lời gọi `hk_draw_band` nào có `row < 290` (như Row 163 sau `serial_init`, Row 166, Row 170, Row 175, Row 180, Row 184 khi vào `kernel_bootstrap`, hay Row 240..254 của `kernel_bootstrap_log`) đều rơi vào 2365 bytes mã legacy gọi `set_mmu_ttb_alternate`, làm đổi TTBR0 trong chế độ TTBR1 và gây MMU Translation Fault.
+2. **Triệt tiêu hoàn toàn mã legacy `hk_draw_band`:**
+   - Đơn giản hóa `hk_draw_band` trong `start.s` thành 1 lệnh duy nhất:
+     ```asm
+     LEXT(hk_draw_band)
+         b   EXT(hk_draw_band_direct)
+     ```
+   - 100% các lời gọi vẽ vạch từ `start.s`, `arm_init.c`, `vm_init.c`, `startup.c`, `pmap.c` (bất kể hàng từ 0 đến 2400) nay đều đi thẳng qua Direct VA Drawer tại `0xfffffff004000000` (zero MMU switch, zero TLBI, zero stack).
+3. **Cài đặt các mốc kiểm chứng chi tiết trong `kernel_bootstrap` và `kernel_bootstrap_thread`:**
+   - Row 500 (Cyan): `console_init()` hoàn tất
+   - Row 506 (Lime): `sched_init()` hoàn tất
+   - Row 512 (Yellow): `mapping_free_prime()` hoàn tất
+   - Row 518 (DeepSkyBlue): `machine_init()` hoàn tất
+   - Row 524 (MediumOrchid): `clock_init()` hoàn tất
+   - Row 530 (DodgerBlue): `task_init()` hoàn tất
+   - Row 536 (DeepPink): `thread_init()` hoàn tất
+   - Row 542 (SpringGreen): `kernel_thread_create()` hoàn tất
+   - Row 550 (Gold): `kernel_bootstrap_thread` bắt đầu chạy
+   - Row 556 (DarkOrange): `sched_startup()` hoàn tất
+   - Row 570 (White, 8 hàng): `bsd_init()` bắt đầu!
+
+### 3. Tiến Độ Commit & CI Build 101
+- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `3909cb2` (Pushed to `main`)
+- CI Run: Đang kích hoạt trên GitHub Actions
+- Kế hoạch: Theo dõi CI Build 101 -> Tải artifact kernel -> Đóng gói `platform-tools/enxerto-boot.img` -> Flash và boot để quan sát dải vạch 500..570.
+
+---
+
 ## Agent handoff / active work (2026-11-07 19:45: CI Build 100 - Triệt Tiêu Nghẽn Bus uncached pmap_next_page, Thang Đo Logarit, Gauge first_avail & Vạch Đồng Hồ Sống)
 
 ### 1. Đột Phá Thực Nghiệm Quyết Định Từ Build 99 (Commit `67c8539`, Run `42369785316`)
