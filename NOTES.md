@@ -1,24 +1,23 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 08:35: ĐÍNH CHÍNH QUAN TRỌNG - KERNEL CHƯA QUA PMAP, DỪNG TẠI CỤM ROW 280..304)
-- **Đính chính và thống nhất 100% với nhận định người dùng:**
-  - Báo cáo trước đó bị nhầm lẫn hệ tọa độ khi đo đạc từ ảnh xoay ngang (`im1`).
-  - Điểm neo vật lý chuẩn xác: Logo Enxerto nằm ở `BLOCK_TOP = 530..600`. Toàn bộ vùng từ sau cụm vạch đến logo là nền xanh trơn (Row 500, 580, 615, 620, 630 HOÀN TOÀN KHÔNG TỒN TẠI trên màn hình).
-  - Kernel **CHƯA HỀ** tới `vfs_mountroot` hay `bsdinit_task`. Mọi giả thuyết về `load_init_program` được **hoãn lại hoàn toàn**.
-- **Kết quả đọc ảnh thực tế (Ảnh media_1794013179628 & media_1794013180):**
-  - **Câu hỏi quyết định:** Vạch 306..311 (trắng, cyan, tím) và Gauge 410..440 **HOÀN TOÀN KHÔNG XUẤT HIỆN**.
-  - Vạch cuối cùng hiển thị trên màn hình chỉ dừng tại cụm `vm_page_bootstrap` (khoảng Row 280..304). Sau cụm này là nền xanh trơn.
-  - Vạch Cyan/Teal cô lập ở phía trên là Row 194 (Subsystem 3 `STARTUP_SUB_LOCKS`) hoặc Row 198 (Vector EC).
-  - Vòng lặp `pmap_next_page` / lệnh gọi `BL _pmap_next_page` tại Row 304 vẫn là **NGHI PHẠM SỐ 1**.
-- **Hành động đã và đang thực hiện:**
+## Agent handoff / active work (2026-11-07 08:38: CI Build 94 ĐANG CHẠY, Commit 40d6e47 - Phân lập Row 230 Đỏ Cam & In BUILD SHA Enxerto)
+- **CI Build Đang Chạy (Run ID: 42325076843, Run Number: 94, Commit: 40d6e47):**
+  - Đã push commit `40d6e47` lên `main`.
+- **Nội dung cải tiến then chốt giải quyết dứt điểm câu hỏi phân định:**
   1. **In Commit SHA / Build ID lên màn hình ngay từ Enxerto:**
-     - Đã thêm `BUILD <git_sha>` vào `enxerto/loader.c` và truyền cflags `-DENXERTO_GIT_SHA` từ `enxerto/build.py`.
-     - Loại bỏ hoàn toàn mọi nghi ngờ flash nhầm build cũ.
-  2. **Chồng lưới và đo đạc:**
-     - Đã tạo artifact `ladder_grid_annotated.png` trực quan hóa toàn bộ dải vạch từ Bezel (Row 0), Camera hole (Row ~100), Row 194/198, và điểm dừng tại Row 280..304.
-  3. **Bảo toàn tính tối giản:**
-     - Hoãn toàn bộ các breadcrumb trong `kern_exec.c`.
-     - Giữ lại hook `panic()` vô điều kiện.
+     - `enxerto/build.py`: lấy `git rev-parse --short HEAD` và truyền cflags `-DENXERTO_GIT_SHA="<sha>"`.
+     - `enxerto/loader.c`: gọi `con_str("BUILD", ENXERTO_GIT_SHA);` ngay trước khi handoff sang XNU. Màn hình Enxerto log sẽ in trực tiếp `BUILD 40d6e47`, bảo đảm 100% không còn nghi ngờ về build đang nạp.
+  2. **Dời Exception Vector Marker từ Row 198 sang Row 230 (Đỏ Cam `0x00FF4500`, dày 6 hàng):**
+     - Row 194 là Cyan (`0x0000FFFF`) thuộc `STARTUP_SUB_LOCKS`.
+     - Row 230..235 (6 hàng) là Đỏ Cam (`0x00FF4500`) thuộc `el1_sp0_synchronous_vector_long`.
+     - Cách nhau tới 36 hàng và màu sắc đối lập hoàn toàn (Cyan vs Đỏ Cam), triệt tiêu sai số camera và ảnh JPEG.
+  3. **Bẫy cả hai nhánh SP0 và SP1 spill_failed:**
+     - Sửa thay thế toàn bộ các `wfe; b .` trong vector handler để cả SP0 lẫn SP1 khi spill failed đều vẽ Row 210 Vivid Red.
+  4. **Quy tắc phân định sau khi boot Build 94 (`40d6e47`):**
+     - Dòng `BUILD 40d6e47` xuất hiện $\rightarrow$ xác nhận chắc chắn nạp đúng build mới.
+     - Vùng hàng 190..235:
+       - Nếu **CHỈ CÓ 1 VẠCH CYAN (Row 194)**: Không có ngoại lệ EC≠0 qua `el1_sp0`. Treo là vòng lặp vô hạn hoặc VBAR hỏng.
+       - Nếu **XUẤT HIỆN THÊM VẠCH ĐỎ CAM (Row 230)**: Chắc chắn 100% có Data Abort / Sync Exception. Khi đó quan sát tiếp xem các hàng 204 (vàng), 210 (đỏ), 216 (cam), 220 (tím panic text) có sáng hay không.
 - **CI Build Thành Công 100% (Run ID: 42320860894, Run Number: 93, Commit: 7495b6c):**
   - Tất cả các bước (Prepare XNU tree, Setup build env, Compile XNU Kernel, Package Payload and Boot Image, Upload Artifacts) đều đạt `success`.
   - Đã tải và giải nén artifact: `artifacts/ci_42320860894/` và cập nhật file boot cục bộ `out/enxerto-boot.img` (10,719,232 bytes).
