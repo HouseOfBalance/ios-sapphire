@@ -1,26 +1,31 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 08:46: CI Build 95 ĐANG CHẠY, Commit 23e7c39 - Fix Chuẩn Macro BUILD SHA Enxerto & Phân Tích Thực Địa)
-- **CI Build Đang Chạy (Run ID: 42325734420, Run Number: 95, Commit: 23e7c39):**
-  - Đã push commit `23e7c39` lên `main`.
-  - **Khắc phục lỗi build CI 94 (Commit 40d6e47):**
-    - Lỗi tại bước `Package Payload and Boot Image`: chuỗi `-DENXERTO_GIT_SHA=\"<sha>\"` chứa ký tự escape gạch chéo ngược khiến GCC báo `stray '\' in program`.
-    - Đã sửa triệt để: trong `enxerto/build.py` truyền `-DENXERTO_GIT_SHA=<sha>`, và trong `enxerto/loader.c` dùng chuẩn macro stringification `#define STR_HELPER(x) #x; #define STR(x) STR_HELPER(x); con_str("BUILD", STR(ENXERTO_GIT_SHA));`. Chuẩn C này miễn nhiễm hoàn toàn với lỗi shell / escape.
-- **Phân tích thực địa từ 2 ảnh màn hình mới nhất của người dùng:**
-  - Hai ảnh ghi lại lần boot của Build 93 (`7495b6c`) (chưa có dòng `BUILD <sha>` do Build 94 bị lỗi đóng gói).
-  - Kết quả đo phổ pixel thực tế trên ảnh thẳng:
+## Agent handoff / active work (2026-11-07 08:52: CI Build 95 THÀNH CÔNG, Commit 23e7c39 - Đã Sẵn Sàng Boot Image Trên Thiết Bị)
+- **CI Build Thành Công 100% (Run ID: 42325734420, Run Number: 95, Commit: 23e7c39):**
+  - Tất cả các bước (Prepare XNU tree, Setup build env, Compile XNU Kernel, Package Payload and Boot Image, Upload Artifacts) đều đạt `success`.
+  - Đã tải và giải nén artifact: `artifacts/ci_42325734420/` và sao chép vào:
+    - `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img` (10,719,232 bytes)
+    - `out/enxerto-boot.img` & `out/bergamota-fastboot.img`
+  - Đã xác thực nhị phân: chuỗi `23e7c39` và `BUILD` có mặt chính xác trong `enxerto-boot.img`.
+- **Nội dung mới của Build 95 (`23e7c39`):**
+  1. **Hiển thị định danh build:** Màn hình Enxerto log sẽ in trực tiếp `BUILD 23e7c39` trước khi handoff sang XNU.
+  2. **Vạch exception dời sang Row 230 (Đỏ Cam `0x00FF4500`, 6 hàng):**
+     - Cách xa Row 194 Cyan (`0x0000FFFF`) tới 36 hàng, không thể nhầm lẫn.
+     - Nếu có ngoại lệ EC≠0 qua `el1_sp0`: Vạch Row 230 Đỏ Cam sẽ sáng.
+     - Nếu không có ngoại lệ (kernel loop/lock thuần túy): Chỉ duy nhất vạch Row 194 Cyan sáng, Row 230 sẽ tối (nền xanh).
+  3. **Bẫy cả hai nhánh SP0 và SP1 spill_failed:**
+     - Mọi điểm `spill_failed` đều vẽ Row 210 Đỏ cờ (`0x00FF0000`).
+- **Thao tác boot cho người dùng:**
+  - Nhấn giữ **Nguồn + Giảm âm lượng** để đưa máy về chế độ Fastboot.
+  - Chạy lệnh: `fastboot boot enxerto-boot.img` từ thư mục `platform-tools`.
+- **Phân tích thực địa từ 2 ảnh màn hình trước đó của người dùng:**
+  - Hai ảnh ghi lại lần boot của Build 93 (`7495b6c`) (chưa có dòng `BUILD <sha>`):
     1. Hàng 0..89 (CP1..CP5): Đầy đủ, nằm từ mép trên tới camera nốt ruồi.
     2. Camera nốt ruồi: Nằm ở vị trí y ≈ 100 trên ảnh.
     3. Hàng 194 (Cyan `0x0000FFFF`): Xuất hiện đơn lẻ tại y ≈ 140.
     4. Hàng 280..304 (`vm_page_bootstrap`): Xuất hiện cụm tại y ≈ 160..168 gồm đủ 4 vạch (280 Lime, 288 Cam đậm, 296 Vàng, 304 Magenta).
     5. Từ sau Hàng 304 tới logo Bergamota: **HOÀN TOÀN TRỐNG (NỀN XANH NGUYÊN BẢN)**.
-       - Không hề có vạch trắng/tím 306..311.
-       - Không hề có Gauge 410..440.
-       - Không hề có các vạch 500..630.
-    6. **Kết luận vị trí dừng:** Kernel dừng chính xác tuyệt đối ngay tại lời gọi `pmap_next_page` đầu tiên trong `pmap_startup`. Build 95 sẽ làm rõ 100% bằng vạch Đỏ Cam Row 230 và dòng `BUILD 23e7c39` trên màn hình.
-- **CI Build 94 Thất Bại (Run ID: 42325076843, Run Number: 94, Commit: 40d6e47):**
-  - Kernel compile: Thành công (`success`).
-  - Packaging: Lỗi macro preprocessor (đã sửa ở Build 95).
+    6. Điểm dừng: Lời gọi `pmap_next_page` đầu tiên trong `pmap_startup`.
 - **CI Build Thành Công 100% (Run ID: 42320860894, Run Number: 93, Commit: 7495b6c):**
   - Tất cả các bước (Prepare XNU tree, Setup build env, Compile XNU Kernel, Package Payload and Boot Image, Upload Artifacts) đều đạt `success`.
   - Đã tải và giải nén artifact: `artifacts/ci_42320860894/` và cập nhật file boot cục bộ `out/enxerto-boot.img` (10,719,232 bytes).
