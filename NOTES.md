@@ -1,6 +1,6 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 14:05: CI Build 97 ĐANG CHẠY, Run ID 42349528215, Commit f7a10bf - Direct VA Framebuffer Mapping 0xfffffff004000000, Phase 1 & 2 Two-Stage Mapping, Elimination of MMU Toggling After Row 294, Pre-304 Isolation Row 302)
+## Agent handoff / active work (2026-11-07 14:16: CI Build 97 THÀNH CÔNG 100%, Run ID 42350166743, Commit 0429220 - Đã Sẵn Sàng Boot Image Trên Thiết Bị)
 
 ### 1. Phân tích thực nghiệm & Quyết định Kiến trúc Build 97
 - **Vấn đề cốt lõi của Build 96 và các bản trước:**
@@ -55,10 +55,16 @@
 - **Kernel Repo (`HouseOfBalance/ios26-sapphire`):**
   - Commit `f7a10bf`: `kernel: map framebuffer directly to VA (0xfffffff004000000), eliminate MMU toggling after Row 294, and install Phase 1/Phase 2 guards`
   - Commit `0429220`: `tools: fix AT S1E1W instruction opcode mask in verify_kernel_markers.py`
-- **GitHub Actions Runs:**
-  - Run ID `42349528215` (Commit `f7a10bf`): Biên dịch XNU Kernel thành công 100% với Clang 19 trên macos-15 (toàn bộ code Pha 1, Pha 2 và `hk_draw_band_direct` liên kết hoàn hảo). Bước đóng gói payload dừng lại tại `verify_kernel_markers.py` do mask opcode của lệnh `at s1e1w` (0xD5087820 vs 0xD5087800 của `s1e1r`).
-  - Run ID `42350166743` (Commit `0429220`): Đang chạy với bản sửa hoàn chỉnh của `verify_kernel_markers.py`.
-- **Tool kiểm chứng:** `tools/verify_kernel_markers.py` kiểm chứng nhị phân Mach-O trước khi đóng gói: `_hk_draw_band_direct` tồn tại, chạy 100% VA (không TTBR0, không SCTLR toggle, không TLBI), có guard `AT S1E1W`, exception vector gọi drawer, và `pmap_next_page` chứa Row 306.
+- **GitHub Actions Run ID `42350166743` (Commit `0429220`) THÀNH CÔNG 100%:**
+  - Tất cả các bước (Prepare XNU tree, Setup build env, Compile XNU Kernel, Package Payload and Boot Image, Upload Artifacts) đều đạt `success`.
+  - Kiểm chứng tiền đóng gói `verify_kernel_markers.py` đạt 100% PASSED:
+    - `_hk_draw_band_direct` tại `0xfffffff00751d870` (100% VA, zero MMU toggles, có AT guard).
+    - `el1_sp0_synchronous_vector_long` tại `0xfffffff007516000` (BL drawer xác nhận tại `+0x38`).
+    - `_pmap_next_page` tại `0xfffffff0074f40c4` (Row 306 instruction xác nhận tại `+0x18`).
+  - Đã tải artifact và cập nhật:
+    - `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img` (10,719,232 bytes, chứa chuỗi `0429220` và `BUILD`).
+    - `artifacts/ci_42350166743/`
+    - `out/enxerto-boot.img` và `out/bergamota-fastboot.img`
 
 ## Agent handoff / active work (2026-11-07 08:52: CI Build 95 THÀNH CÔNG, Commit 23e7c39 - Đã Sẵn Sàng Boot Image Trên Thiết Bị)
 - **CI Build Thành Công 100% (Run ID: 42325734420, Run Number: 95, Commit: 23e7c39):**
