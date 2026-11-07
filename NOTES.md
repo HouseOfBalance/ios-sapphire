@@ -1,5 +1,44 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 21:50: CI Build 102 ĐẠT MỤC TIÊU LỊCH SỬ - DRAM 1.2GB SẠCH HOÀN TOÀN KHÔNG PANIC, HOÀN TẤT TOÀN BỘ BOOTSTRAP MACH ĐẾN load_context!)
+
+### 1. Phân Tích Chuỗi 4 Thế Hệ Build (Build 99 -> 100 -> 101 -> 102) Trên Thiết Bị Thực Tế
+- **Đối chiếu 8 ảnh chụp màn hình thiết bị thực tế:**
+  1. **Build 99 (`67c8539`):** Direct drawer POC. Kernel vượt qua pmap lock nhưng bị nghẽn (throttle) bên trong vòng lặp 250k trang của `vm_page_init` (dừng tại Row 340) do chi phí vẽ vạch lặp quá lớn.
+  2. **Build 100 (`130215a`):** Tinh gọn đo lường thưa (sparse milestones). Giải phóng hoàn toàn vòng lặp 250k trang, vượt qua `pmap_startup`, `kmem_init`, `zone_init` đến mốc `STARTUP_SUB_ZALLOC` (Row 392, $y = 154$).
+  3. **Build 101 (`3909cb2`):** Tiến thêm 17 pixel sâu vào màn hình ($y = 171$), bung vạch Cyan rực rỡ tại Row 500 (`console_init()` hoàn tất). Dừng lại tại `mapping_free_prime()` do RAM bị kẹp ở 88 MB (chỉ còn 41.5 MB khả dụng), cạn kiệt trang vật lý.
+  4. **Build 102 (`4a94e45`):** Chuyển dịch DRAM sang `0xb0000000` (1.2 GB sạch hoàn toàn, không carveout).
+     - **KẾT QUẢ: 0 PIXEL ĐỎ PANIC! HOÀN TOÀN SẠCH LỖI!**
+     - **Row 508 (Gold):** `mapping_free_prime` bắt đầu -> [VƯỢT QUA]
+     - **Row 512 (Yellow):** `mapping_free_prime` hoàn tất -> [VƯỢT QUA]
+     - **Row 514 (Chartreuse) & Row 518 (DeepSkyBlue):** `machine_init` hoàn tất -> [VƯỢT QUA]
+     - **Row 524 (MediumOrchid):** `clock_init` hoàn tất -> [VƯỢT QUA]
+     - **Row 530 (DodgerBlue):** `task_init` hoàn tất -> [VƯỢT QUA]
+     - **Row 536 (DeepPink):** `thread_init` hoàn tất -> [VƯỢT QUA]
+     - **Row 542 (SpringGreen):** `kernel_thread_create` hoàn tất -> [VƯỢT QUA]
+     - **`load_context(thread)`:** Thực thi chuyển mạch context từ bootstrap CPU sang luồng nhân đầu tiên (`kernel_bootstrap_thread`)!
+
+### 2. Định Vị Điểm Dừng Hiện Tại & Thiết Kế Build 103
+- **Hiện tượng:** Màn hình dừng lại sau vạch Row 542 (SpringGreen) mà không có vạch đỏ panic.
+- **Nguyên nhân chính xác:**
+  1. Trong `osfmk/kern/startup.c`: Tại cuối `kernel_bootstrap()`, CPU thực thi `load_context(thread)` để nhảy vào `kernel_bootstrap_thread()`.
+  2. Tại entry `kernel_bootstrap_thread()`: Code chẩn đoán cũ trong `patch_cortex_a73.py` sử dụng hàm `hk_draw_band` (drawer gián tiếp cũ phụ thuộc fbcon/virtual memory chưa sẵn sàng) tại Row 186 (vùng bị che bởi camera cutout), không dùng `hk_draw_band_direct`.
+  3. Các bước con trong `kernel_bootstrap_thread` (`idle_thread_create`, `sched_startup`, `bsd_init`) trong `kbt_steps` chưa khớp định dạng chuỗi của XNU 12377 (`xnu-12377.121.6-dada.patch` sử dụng `minimac_policy_init()`, `kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN)`, etc.).
+  4. Khi chuyển sang luồng nhân đầu tiên: `TPIDR_EL1` được gán con trỏ luồng, SP chuyển sang stack riêng của luồng, ngoại lệ chuyển sang `CHECK_KERNEL_STACK` tiêu chuẩn.
+
+### 3. Kế Hoạch Thực Hiện Build 103
+1. **Instrument `kernel_bootstrap_thread` bằng `hk_draw_band_direct`:**
+   - Row 546 (White `0x00FFFFFF`, 4 rows): Entry `kernel_bootstrap_thread`
+   - Row 548 (Gold `0x00FFD700`, 4 rows): `minimac_policy_init()` hoàn tất
+   - Row 550 (Lime `0x0000FF00`, 4 rows): `kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN)` hoàn tất
+   - Row 552 (Cyan `0x0000FFFF`, 4 rows): Bắt đầu `scale_setup()`
+   - Row 556 (DarkOrange `0x00FF8C00`, 4 rows): `sched_startup()` / luồng nhàn rỗi sẵn sàng
+   - Row 570 (White `0x00FFFFFF`, 8 rows): Chạm cửa ngõ `bsd_init()`!
+2. **Loại bỏ hoàn toàn mọi tham chiếu còn sót lại tới `hk_draw_band` gián tiếp cũ trong `startup.c`:**
+   - Đảm bảo 100% vạch vẽ mốc đều đi qua `hk_draw_band_direct`.
+
+---
+
 ## Agent handoff / active work (2026-11-07 21:25: CI Build 102 - Chuyển Dịch DRAM sapphire sang 0xb0000000 1.2GB Sạch, Triệt Tiêu Cạn Kiệt Bộ Nhớ mapping_free_prime & Hook Trực Tiếp Panic Red Row 660)
 
 ### 1. Đột Phá Thực Nghiệm & Giải Mã Dừng Sau Row 500 Ở Build 101 (Commit `3909cb2`, Run `42376879714`)
