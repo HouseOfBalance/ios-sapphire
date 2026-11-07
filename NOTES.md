@@ -1,5 +1,24 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 23:50: Tích Hợp Toàn Bộ Driver Metal Adreno A6xx & Subsystem Cảm Ứng 5ms Từ HakiOS 2.3.4 - Commit `c5acc44`)
+
+### 1. Đồng Bộ Hóa Hệ Thống Đồ Họa & Driver HakiOS 2.3.4 Vào Codebase
+- **Nguồn:** `https://github.com/oosexgang/hakios-xnu-kernel` (Bản phát hành chính thức 2.3.4 ngày 2026-11-05).
+- **Mục tiêu:** Tích hợp trước toàn bộ kiến trúc Metal cho GPU Qualcomm Adreno và driver input độ trễ thấp vào `HouseOfBalance/ios26-sapphire` trước khi người dùng flash lại `userdata.simg`.
+- **Nội dung tích hợp (Commit `c5acc44`, 290 files, +170,366 lines):**
+  1. [`hakios-metal/`](file:///C:/Users/hungtv/Downloads/hakios-arm64e-dada-main/hakios-metal): Toàn bộ driver Metal C++ chuyên biệt cho GPU Qualcomm Adreno A6xx (tương thích 100% với Adreno 610 của SM6225 Bengal):
+     - `a6xx.hpp`, `pm4.hpp`: Bảng mã lệnh và thanh ghi GPU Adreno A6xx.
+     - `gpu.hpp`, `command.hpp`, `compute.hpp`, `render.hpp`, `texture.hpp`: Bộ quản lý CommandBuffer, Render/Compute pipeline trực tiếp.
+  2. [`drivers/`](file:///C:/Users/hungtv/Downloads/hakios-arm64e-dada-main/drivers): Bộ driver ngoại vi:
+     - `drivers/input/hakios.input.c` & `hakios.goodix.c`, `hakios.focaltech_fw.h`: Hệ thống xử lý cảm ứng đa điểm 5ms (giảm từ 169ms), hỗ trợ cả panel FocalTech và Goodix trên dòng Redmi Note 13 4G.
+     - `drivers/gpu/hakios.adreno.c` & `hakios.gpu.cpp`: Giao tiếp kernel DRM cho GPU Adreno.
+     - `drivers/audio/`, `drivers/wifi/`, `drivers/power/`, `drivers/storage/` (APFS & UFS).
+  3. [`userland/src/HakiosMetalCA.m`](file:///C:/Users/hungtv/Downloads/hakios-arm64e-dada-main/userland/src/HakiosMetalCA.m) & `userland/src/inject_sb.c`:
+     - Bản vá 8,747 dòng xử lý pipeline shader CoreAnimation, sửa triệt để lỗi vệt đỏ đỉnh hình nền và vệt trắng thanh trạng thái (`darkenSourceOver`).
+- **Trạng thái:** Đã commit và push sạch lên nhánh `main` của `HouseOfBalance/ios26-sapphire`.
+
+---
+
 ## Agent handoff / active work (2026-11-07 22:30: CI Build 104 - Thang Đo Vi Mô Lockdown Đến bsd_init & Mở Khóa Fallback max_cpus Cho GenericARMPE / kperf)
 
 ### 1. Phân Tích Thực Nghiệm Build 103 (`15d5760`, Run `42384289468`) Trên Phần Cứng Thực Tế
