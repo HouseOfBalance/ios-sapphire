@@ -1,6 +1,14 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 07:40: Sửa Lỗi Undefined Symbols & CI Run 42319615177, Commit 4182df8)
+## Agent handoff / active work (2026-11-07 07:45: Chuẩn Hóa Kiểu pmap_paddr_t & CI Run 42320102838, Commit b352c61)
+- **Khắc phục lỗi biên dịch Clang (Commit b352c61):**
+  1. **Lỗi `redeclaration of 'avail_end' with a different type`:**
+     - Trong `osfmk/vm/vm_resident.c`, biến `avail_end` đã được khai báo ở dòng 2427 là `extern pmap_paddr_t avail_start, avail_end;` (`pmap_paddr_t` là `unsigned long long`).
+     - Đoạn code gauge tại dòng 1664 trong `patch_cortex_a73.py` khai báo lại `extern vm_offset_t avail_end;` (`vm_offset_t` là `unsigned long`), gây xung đột kiểu nghiêm ngặt trong Clang khi biên dịch `vm_resident.c`.
+     - Đã sửa cả `first_avail` và `avail_end` sang đúng kiểu `pmap_paddr_t`:
+       `extern pmap_paddr_t first_avail;`
+       `extern pmap_paddr_t avail_end;`
+  2. **Đang theo dõi CI:** Run ID `42320102838` (workflow `Build HakiOS XNU 12377 (iOS 26)`).
 - **Khắc phục lỗi linker Mach-O (Commit 4182df8):**
   1. **Lỗi `_get_saved_state_lr`:**
      - Trong XNU ARM64 không tồn tại hàm `get_saved_state_lr`. Thanh ghi LR (x30) trong XNU ARM64 được truy xuất qua `get_saved_state_reg(state, 30)`.
@@ -8,7 +16,6 @@
   2. **Lỗi `_need_ram_ranges_init`:**
      - Biến `need_ram_ranges_init` nguyên bản được khai báo `static bool` trong `osfmk/arm/pmap/pmap.c` (local symbol, type 0xe). Khi `vm_resident.c` khai báo `extern boolean_t need_ram_ranges_init` để đo gauge tại Row 436, `ld64` báo lỗi Undefined Symbol khi link kernel Mach-O.
      - Đã cập nhật `kernel/patch_ram_alignment.py` để loại bỏ `static` (`bool need_ram_ranges_init = true;`), biến cờ trở thành global export (type 0xf), đồng thời chuẩn hóa kiểu `extern bool need_ram_ranges_init` trong `vm_resident.c`.
-  3. **Đang theo dõi CI:** Run ID `42319615177` (workflow `Build HakiOS XNU 12377 (iOS 26)`).
 - **Khắc phục lỗi logic nghiêm trọng trong vector (Commit c3cad8c):**
   1. **Loại bỏ 100% stp/ldp trong el1_sp0_synchronous_vector_long:**
      - Trước đó dùng chuỗi stp lưu x2..x15, x29/x30 lên SP_EL1. Nếu SP_EL1 bị lỗi/unmapped, chính chuỗi stp sẽ gây double fault lồng nhau trước khi vẽ được vạch 198, khiến kết quả không có vạch bị đánh lừa.
