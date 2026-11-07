@@ -42,9 +42,13 @@
    - Row 570 (White, 8 hàng): `bsd_init()` bắt đầu!
 
 ### 3. Tiến Độ Commit & CI Build 101
-- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `3909cb2` (Pushed to `main`)
-- CI Run: Đang kích hoạt trên GitHub Actions
-- Kế hoạch: Theo dõi CI Build 101 -> Tải artifact kernel -> Đóng gói `platform-tools/enxerto-boot.img` -> Flash và boot để quan sát dải vạch 500..570.
+- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `3909cb2`
+- CI Run ID: `42376879714` (Build 101) đã HOÀN THÀNH THÀNH CÔNG 100% (Success)!
+- Artifact đã tải về và cài đặt hoàn tất vào cả 2 vị trí:
+  - `C:\Users\hungtv\platform-tools\enxerto-boot.img`
+  - `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img`
+- Kiểm chứng markers bằng `verify_kernel_markers.py`: Toàn bộ checks PASSED (100% Direct VA Drawer, el1_sp0 exception trap, Row 302/304 markers).
+- Trạng thái: Sẵn sàng cho lệnh `fastboot boot enxerto-boot.img` trên thiết bị!
 
 ---
 
