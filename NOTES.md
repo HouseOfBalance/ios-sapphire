@@ -1,5 +1,46 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 07:15: Stackless Vector Diagnostics, sleh_invalid_stack NULL-guard, & pmap Gauge, Commit 707cc4e)
+- **Mục tiêu cốt lõi:** Xác định chính xác vị trí treo kernel giữa POST-LOCK (Row 304 Vivid Magenta) và pmap_startup loop body (i == 0, Row 312), đồng thời bẫy mọi data abort / invalid stack double fault và hiển thị trạng thái phần cứng trên màn hình thiết bị.
+- **Hiện tượng Thực tế từ Phân tích Ảnh Boot Mới Nhất (media_1793971110092_0aea3f9d.jpg & media_1793971110144_c476709d.jpg):**
+  - Subsystem 3 (STARTUP_SUB_LOCKS, Row 194 Cyan) ĐÃ VƯỢT QUA.
+  - vm_pages stolen (Row 280 Lime) ĐÃ VƯỢT QUA.
+  - vm_pages_end computed (Row 288 Dark Orange) ĐÃ VƯỢT QUA.
+  - PRE-LOCK (Row 296 Vivid Yellow) ĐÃ VƯỢT QUA.
+  - POST-LOCK (Row 304 Vivid Magenta) ĐÃ VƯỢT QUA (nhìn thấy rõ ở hàng camera y=265).
+  - Vạch Row 312 (Deep Sky Blue: i == 0 loop body) và Row 348 (Lime: loop exit & unlock) HOÀN TOÀN CHƯA XUẤT HIỆN.
+  - Disassembly chứng minh: pmap_next_page(&phys_page) được gọi tại 0xfffffff007469f4c và chưa trả về.
+- **Cơ chế Gốc Rễ Đã Giải Mã (Double Fault & Silent Spin):**
+  - Trong locore.s: lệnh tbz x1, #(5 + ESR_EC_SHIFT), Lkernel_stack_valid kiểm tra bit 31 của ESR. Với Data Abort (EC = 0x25), bit 5 = 1 nên lệnh rơi vào CHECK_KERNEL_STACK.
+  - Trong CHECK_KERNEL_STACK: do early boot có TPIDR_EL1 == 0, lệnh cbz x1, Lcorrupt_stack nhảy tới Lcorrupt_stack -> gọi fleh_invalid_stack -> gọi sleh_invalid_stack.
+  - Trong sleh_invalid_stack (nguyên bản): gọi thread = current_thread() (trả về NULL) rồi dereference thread->machine.kstackptr -> Kích hoạt Data Abort thứ hai khi đang ở SP_EL1!
+  - CPU nhảy vào el1_sp1_synchronous_vector_long -> _el1_sp1_synchronous_vector_long_spill_failed -> rơi vào 0: wfe; b 0b // Spin for watchdog làm máy đứng im hoàn toàn không có panic text.
+- **Biện pháp Khắc phục Triệt để Đã Áp dụng & Commit 707cc4e (HouseOfBalance/ios26-sapphire):**
+  1. Thủ tục vẽ màn hình không dùng Stack (hk_draw_band_stackless trong start.s): 0 byte stack, chỉ dùng caller-saved x0..x15, an toàn trong mọi ngữ cảnh exception.
+  2. Bẫy Vector Đồng bộ EL1 (locore.s):
+     - el1_sp0_synchronous_vector_long: kiểm tra EC. Nếu EC == 0 (LSE/PAC trap), bỏ qua hoàn toàn. Nếu EC != 0, dùng cờ one-shot bit 63 của TPIDR_EL0, vẽ Row 198 (4 rows 198..201: Cyan + EC).
+     - Lcorrupt_stack: vẽ Row 204 (4 rows 204..207: Vivid Yellow 0x00FFFF00).
+     - spill_failed: vẽ Row 210 (4 rows 210..213: Vivid Red 0x00FF0000) trước wfe.
+  3. Bảo vệ NULL trong sleh_invalid_stack (osfmk/arm64/sleh.c):
+     - Vẽ Row 216 (4 rows 216..219: Dark Orange 0x00FF8C00).
+     - Nếu thread == NULL: dùng static char emsg[384], format thủ công PC, LR, SP, ESR, FAR, X0, dc cvac, hk_render_screen_asm, vẽ Row 220 (4 rows 220..223: Magenta 0x00FF00FF), sau đó lặp wfe.
+  4. Thước đo Gauge & Breadcrumbs chi tiết tại pmap_startup (vm_resident.c & patch_ram_alignment.py):
+     - Row 306 (White, 2 rows): pmap_next_page entry.
+     - Row 308 (Cyan, 1 row): returning TRUE.
+     - Row 309 (Dark Orange, 1 row): returning FALSE.
+     - Row 310 (1 row): khoảng cách đệm.
+     - Row 311 (Purple, 1 row): call-site nhận giá trị trả về (i == 0).
+     - Row 312 (Deep Sky Blue, 4 rows): thân vòng lặp nạp trang lần đầu.
+     - Gauge Rows 410..440: Row 410 (Calibration Trắng), Rows 416..423 (8 nibble first_avail), Rows 426..433 (8 nibble avail_end), Row 436 (need_ram_ranges_init), Row 440 (VBAR_EL1 alignment).
+  5. Bảng hàng & Bảng màu Nibble: Đã lập file DIAGNOSTIC_ROW_MAP.md trong repo.
+  6. Dọn cờ One-shot: Đã xóa bit 63 TPIDR_EL0 trong bsdinit_task trước khi vào userland.
+- **Thao tác Đọc Màn hình Sau Boot:**
+  1. Exception (198, 204, 210, 216, 220).
+  2. Loop Entry (306, 308, 309, 311, 312).
+  3. Gauge (410, 416..423, 426..433, 436, 440).
+- **Repo State:** HouseOfBalance/ios26-sapphire commit 707cc4e pushed to main.
+
+
 ## Agent handoff / active work (2026-11-06 15:12: Encapsulated PID 1 Diagnostics, Commit 51db9e0)
 - **Nguyen nhan loi CI run 42184253439:** sd/dev/arm/systemcalls.c la mot file BSD khong include header Mach VM (osfmk/console/video_console.h va osfmk/vm/vm_kern.h). Khi ta khai bao extern struct vc_info vinfo; va extern vm_map_t kernel_map; truc tiep ben trong systemcalls.c, clang bao loi incomplete type 'struct vc_info' va unknown type name 'vm_map_t'.
 - **Giai phap triet de:**
