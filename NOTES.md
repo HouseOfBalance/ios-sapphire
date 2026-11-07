@@ -1,5 +1,58 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
+## Agent handoff / active work (2026-11-07 21:25: CI Build 102 - Chuyển Dịch DRAM sapphire sang 0xb0000000 1.2GB Sạch, Triệt Tiêu Cạn Kiệt Bộ Nhớ mapping_free_prime & Hook Trực Tiếp Panic Red Row 660)
+
+### 1. Đột Phá Thực Nghiệm & Giải Mã Dừng Sau Row 500 Ở Build 101 (Commit `3909cb2`, Run `42376879714`)
+- **Ảnh chụp thiết bị thực tế (`BUILD 3909cb2` - Ảnh `39341a47` và `902b5ec6`):**
+  - **DẢI VẠCH TIẾN THÊM 17 PIXEL VÀO SÂU MÀN HÌNH SO VỚI BUILD 100:**
+    - Build 100 kết thúc tại $y = 154$ (Row 392 / `STARTUP_SUB_ZALLOC`).
+    - Build 101 bung vạch Cyan sáng rực rỡ tại $y = 171$ (`0x0000FFFF`, Row 500) tương ứng `console_init()` hoàn tất!
+    - Bậc thang cam Row 240..254 của `kernel_bootstrap_log` cũng đã vẽ thành công qua Direct VA Drawer (`0xfffffff004000000`).
+- **Disassembly Mach-O Kernel & Định Vị Điểm Treo Tuyệt Đối:**
+  - Chuỗi thực thi trong `_kernel_bootstrap` (`0xfffffff00735c348`):
+    1. `_vm_mem_bootstrap()` (Rows 360..392) [PASSED]
+    2. `_atm_init()` [PASSED]
+    3. `kernel_startup_initialize_upto(STARTUP_SUB_LOCKDOWN)` [PASSED]
+    4. `_console_init()` -> Row 500 (Cyan) [PASSED]
+    5. `_stackshot_init()` [PASSED]
+    6. `_mac_policy_init()` [PASSED]
+    7. `_mapping_free_prime()` (`0xfffffff0075086d0`): Gọi `_pve_feed_page()` để cấp phát trang vật lý cho danh sách rảnh PTE.
+       Khi không còn trang vật lý nào, lập tức gọi `panic("%s: failed, no pages available? kr=%d @%s:%d")` tại `0xfffffff007ba4e64`!
+- **Nguyên Nhân Gốc Rễ: Nghẽn DRAM Thấp SM6225 (41.5 MB):**
+  - Trong `kernel/patch_ram_alignment.py`: `avail_end` bị chốt cứng ở `0x85800000ULL` do giả định carveout Qualcomm bắt đầu tại đó.
+  - `first_avail` bắt đầu tại `0x82e6c000` (sau kernel và initrd).
+  - Tổng RAM khả dụng cho XNU chỉ có **41.5 MB**.
+  - Toàn bộ 41.5 MB này đã bị `zone_bootstrap()`, `kmem_init()`, `vm_map_init()` và `vm_fault_init()` tiêu thụ hết, dẫn tới `mapping_free_prime()` bị cạn kiệt trang (0 free pages) và gọi `panic`.
+  - Hàm `panic()` cũ cố gọi `hk_render_screen_asm` vốn tắt MMU/đổi TTBR0 khiến CPU bị treo im lặng trên màn hình trước đó.
+
+### 2. Tư Liệu Đối Chiếu Từ Repo Upstream `ios-sapphire` (Angelpro09xd)
+- Đối chiếu với repo `ios-sapphire` chạy iOS 16 trên Redmi Note 13 4G (`sapphire` SM6225 Bengal):
+  - Dải thấp `0x80000000..0xafffffff`: Chứa các carveout cứng của Qualcomm (TrustZone `0x85800000`, Hyp, Modem, Audio ADSP, Video Venus, Display FB `0x5c000000`, `ramdump_fb` `0xaf000000`).
+  - Dải cao `0xb0000000..0xfd000000`: **1.2 GB DRAM vật lý liên tục, hoàn toàn sạch không hề có bất kỳ carveout nào**!
+  - Upstream giải quyết triệt để bài toán RAM bằng cách cấu hình `PHYS_BASE = 0xb0000000`, `MEM_SIZE = 0x4d000000` (1.2 GB).
+
+### 3. Thiết Kế & Giải Pháp Quyết Định Trong Build 102 (Commit `4a94e45`)
+1. **Chuyển dịch DRAM sapphire sang `0xb0000000` (1.2 GB DRAM sạch):**
+   - Trong `tools/mkadt.py`: Cập nhật `BOARDS['sapphire']['mem'] = (0xb0000000, 0x4d000000)`.
+   - Tạo lại `sapphire.adt` và cập nhật `tools/verify_sapphire_adt.py` (Passed 100% 9/9 checks).
+   - Trong `enxerto/board.h`: Mở rộng `DRAM_SIZE = 0x80000000UL` (bao phủ từ `0x80000000` đến `0x100000000`), cho phép Enxerto nạp và copy kernel tới `0xb0000000..0xfd000000` an toàn.
+   - Trong `kernel/patch_ram_alignment.py`: Khi `first >= 0xb0000000`, điều kiện clamp `0x85800000` tự động vô hiệu hóa, XNU nhận trọn vẹn **~76.000 trang 16KB (~1.2 GB)** tự do.
+2. **Hook Trực Tiếp Entry `panic()` Ra Vạch Đỏ Dày (Row 660) Qua Direct VA Drawer:**
+   - Trong `osfmk/kern/debug.c`: Đặt lệnh gọi `hk_draw_band_direct(0x00FF0000, 660, 20)` (Đỏ rực, 20 hàng) ngay tại lệnh đầu tiên của `panic()`, `panic_trap_to_debugger()`, và `panic_spin_forever()`.
+   - Gỡ bỏ hoàn toàn việc gọi `hk_render_screen_asm` (triệt tiêu nguy cơ treo do tắt MMU/đổi TTBR0).
+3. **Cài Đặt Thước Đo Vi Mô Xung Quanh `mapping_free_prime` & `machine_init`:**
+   - Row 508 (Gold `0x00FFD700`, 4 rows): Bắt đầu vào `mapping_free_prime()`
+   - Row 512 (Yellow `0x00FFFF00`, 4 rows): `mapping_free_prime()` hoàn tất
+   - Row 514 (Chartreuse `0x007FFF00`, 4 rows): Bắt đầu vào `machine_init()`
+   - Row 518 (DeepSkyBlue `0x0000BFFF`, 4 rows): `machine_init()` hoàn tất
+
+### 4. Tiến Độ Commit & CI Build 102
+- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `4a94e45`
+- GitHub Actions CI Run ID: `42381645538` (đang build)
+- Trạng thái: Theo dõi CI build và tải artifact boot image.
+
+---
+
 ## Agent handoff / active work (2026-11-07 20:25: CI Build 101 - pmap_startup & vm_mem_bootstrap Hoàn Tất, Chuyển Hướng 100% hk_draw_band Sang Direct VA & Đo Mốc kernel_bootstrap)
 
 ### 1. Đột Phá Thực Nghiệm Quyết Định Từ Build 100 (Commit `130215a`, Run `42374665222`)
