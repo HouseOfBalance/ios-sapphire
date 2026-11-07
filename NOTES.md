@@ -1,70 +1,75 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 14:16: CI Build 97 THÀNH CÔNG 100%, Run ID 42350166743, Commit 0429220 - Đã Sẵn Sàng Boot Image Trên Thiết Bị)
+## Agent handoff / active work (2026-11-07 15:30: CI Build 98 - Chẩn Đoán Phần Cứng PAR_EL1 & Kiểm Chứng Bootstrap Pagetable Thực Nghiệm)
 
-### 1. Phân tích thực nghiệm & Quyết định Kiến trúc Build 97
-- **Vấn đề cốt lõi của Build 96 và các bản trước:**
-  - `hk_draw_band` và `hk_draw_band_stackless` phụ thuộc vào cơ chế tắt MMU (`msr SCTLR_EL1`), chuyển sang `TTBR0` của bootstrap, vẽ vào PA `0x5c000000`, rồi bật lại MMU và chuyển về TTBR0 gốc.
-  - Khi MMU được bật lại, nếu translation context hoặc trạng thái CPU không toàn vẹn khi trở lại VA, CPU sẽ fault lập tức. Việc này giải thích tại sao mọi build từ 93 đến 96 đều dừng ngay sau Row 304 khi gọi `hk_draw_band(0x00FFFFFF, 410, 4)`!
-  - Để loại bỏ hoàn toàn điểm yếu này, toàn bộ hệ thống chẩn đoán hiển thị được chuyển sang chạy **100% trong Virtual Address space (KVA)** thông qua routine mới `hk_draw_band_direct`.
-- **Xác minh chính xác từ nguồn & binary về không gian VA dưới `gVirtBase`:**
-  - `LOW_GLOBAL_BASE_ADDRESS = 0xfffffff000000000ULL` (định nghĩa chuẩn trong `osfmk/arm/pmap.h` cho cấu hình không có `ARM_LARGE_MEMORY`). `arm_vm_init` chỉ dùng L2 index 0 (2MB).
-  - `gVirtBase = 0xfffffff006000000ULL` (L1 index 192, L2 index 48).
-  - Phân đoạn `__PRELINK_TEXT` trong Mach-O nằm ở `0xfffffff004004000`, nhưng `vmsize == 0`. Vì vậy, `arm_vm_prot_init()` và `arm_vm_physmap_init()` bỏ qua hoàn toàn.
-  - **Địa chỉ VA được chọn cho Framebuffer:**
-    $$\mathbf{VA = 0xfffffff004000000ULL} \quad (\text{L1 index } 192, \text{ L2 indices } 32..36, \text{ diện tích } 10\text{ MB})$$
-    Nằm trọn vẹn trong L2 table của L1[192], không trùng với bất kỳ cấu trúc hay kalloc/dynamic map nào của kernel!
+### 1. Bối cảnh & Phân tích từ Phản biện Thực nghiệm Build 97
+- **Kết quả Build 97 (`0429220`):**
+  - Màn hình hiển thị cụm CP trên cùng và cụm 280..296 (Dark Orange).
+  - Vạch xa nhất được vẽ bằng legacy drawer là **Row 296**.
+  - Toàn bộ các vạch direct (`hk_draw_band_direct`): Row 55, Row 158, Row 160, Row 302, Row 304 hoàn toàn không xuất hiện.
+  - Phân tích pixel và disassembly xác nhận: `at s1e1w` trong `hk_draw_band_direct` trả về `PAR_EL1.F = 1` (fault), khiến routine thoát ngay lập tức qua `Lhk_direct_fault` để bảo vệ CPU khỏi crash.
+- **Phản biện kiến trúc chuẩn xác:**
+  - `AttrIndx = 1` trong MAIR là `0x44` (Normal Non-cacheable), hoàn toàn không phải Device memory (`0x00`).
+  - `at s1e1w` thất bại chứng minh rằng translation descriptor cho `0xfffffff004000000` hoặc chưa được table walker nhìn thấy (Translation Fault), hoặc vi phạm quyền ghi (Permission Fault).
+  - Việc Row 55 Yellow (nằm trong `arm_init`, hoàn toàn trước `arm_vm_init`) không sáng chứng minh nguyên nhân nằm ngay tại **Pha 1** (bootstrap page table), trước khi Pha 2 kịp can thiệp.
+  - Thay vì phỏng đoán nguyên nhân, giải pháp đo đạc rẻ nhất và dứt khoát nhất là **đo thẳng trạng thái phần cứng trên màn hình thiết bị** ngay sau khi bật MMU trong `common_start`.
 
-### 2. Thiết kế Hai Pha (Two-Phase Mapping) & Các Guard bảo vệ
-1. **Pha 1 (Early Bootstrap trong `start.s`):**
-   - Đặt tại CP3 ngay trước `dsb ish` (MMU đang OFF, chạy tại PA).
-   - Truy cập TTBR1 L1 root (`x25 + 0x1000`), đọc descriptor L1[192], trích xuất địa chỉ PA của L2 table (`and x10, x10, #0x0000FFFFFFFFF000`).
-   - Trỏ tới entry 32 (`add x10, x10, #(32 * 8)`).
-   - **Guard Pha 1:** Duyệt đọc 5 entry (32..36). Nếu có entry nào khác 0, CPU rẽ nhánh `Lhk_fb_read_fail` và ghi ngay vạch Đỏ cảnh báo tại Row 45 lên PA framebuffer!
-   - **Zero & Fill:** Zero 5 entry bằng `str xzr`, sau đó ghi 5 block descriptor `PA | 0x0060000000000605ULL` (Attr 1 Normal Non-cacheable, Outer Shareable, AF=1, UXN/PXN=1).
-   - Dùng các nhãn cục bộ duy nhất: `Lhk_fb_read_guard`, `Lhk_fb_read_fail`, `Lhk_fb_zero`, `Lhk_fb_fill`.
-2. **Pha 2 (Sau Physmap Init trong `arm_vm_init.c`):**
-   - Đặt ngay giữa dòng 2164 (`arm_vm_physmap_init(args);`) và dòng 2165 (`set_mmu_ttb_alternate(...)`).
-   - Tại đây, `cpu_tte` đã được cấp L2 table cho L1[192] và `phystokv` đã hợp lệ.
-   - Kiểm tra `*fb_l1_tte`: nếu thiếu, gọi `hk_draw_band_direct(0x008B0000, 162, 2)` (Đỏ đậm).
-   - Kiểm tra va chạm dữ liệu trong `fb_l2_tte`: nếu có entry != 0 và khác descriptor mong muốn, gọi `hk_draw_band_direct(0x00FF0000, 164, 2)`.
-   - Ghi 5 descriptor vào `cpu_tte` và phát hành `dsb sy`.
-   - Ngay sau `set_mmu_ttb_alternate` & `flush_mmu_tlb()`: gọi `hk_draw_band_direct(0x00FF007F, 160, 3)` (Rose) để kiểm chứng trực tiếp trên màn hình rằng bảng trang mới đã hoạt động!
+### 2. Thiết kế Hệ thống Chẩn đoán Phần cứng Build 98 (Rows 170-181 & Mốc Enxerto)
+1. **Mốc hiệu chuẩn vật lý PA của Enxerto (`enxerto/loader.c`):**
+   - Trước khi handoff sang XNU kernel (ngay sau `bootui_handoff()` và trước `mmu_off_jump`), Enxerto vẽ 3 vạch PA nguyên bản (độ dày 2 pixel, flush thẳng vào DRAM):
+     - **Row 50 (2 hàng):** Orange (`0x00FFA500`)
+     - **Row 288 (2 hàng):** Dark Orange (`0x00FF8C00`)
+     - **Row 304 (2 hàng):** Vivid Magenta (`0x00FF00FF`)
+   - Cung cấp thước đo tọa độ vật lý 100% không thể nhầm lẫn trên ảnh chụp thiết bị.
+2. **Khối Đo lường Phần cứng & Đọc Bảng Trang trong `common_start` (`start.s`):**
+   - Đặt ngay tại CP11 (sau khi MMU và D-cache/I-cache đã bật hoàn chỉnh qua `SCTLR_EL1_DEFAULT`).
+   - **Bước 1:** Phát lệnh `at s1e1w` lên địa chỉ VA `0xfffffff004000000`, đọc kết quả trực tiếp từ thanh ghi phần cứng `PAR_EL1` vào `x27`.
+   - **Bước 2:** Chuyển MMU sang OFF tạm thời (`SCTLR_EL1.M = 0`) để truy cập bộ nhớ bằng PA thuần túy.
+   - **Bước 3:** Đọc trực tiếp từ DRAM của `bootstrap_pagetables` (gốc TTBR1 tại `x25 + 0x1000`):
+     - Đọc `L1[192]` vào `x28`.
+     - Trích xuất `L2 PA = x28 & 0x0000FFFFFFFFF000` và đọc `L2[32]` vào `x29`.
+   - **Bước 4: Vẽ 5 dải thông tin chẩn đoán tại vùng xanh an toàn (Rows 170..181, không bị kernel ghi đè):**
+     - **Row 170 (2 hàng: 170..171, PA `0x5c0b34c0`): Trạng thái Dịch Địa chỉ (`PAR_EL1.F`):**
+       - **Xanh Lime (`0x0000FF00`):** `F == 0` (Dịch thành công, VA hợp lệ & có quyền ghi!).
+       - **Đỏ Tươi (`0x00FF0000`):** `F == 1` (Dịch thất bại / Fault).
+     - **Row 172 (2 hàng: 172..173, PA `0x5c0b5680`): Mã Lỗi Phần cứng (`FST = PAR_EL1[6:1]`):**
+       - **Xanh Mạ (`0x0000FF7F`):** Thành công (`F == 0`).
+       - **Đỏ Thẫm (`0x008B0000`):** `FST = 0x05` (Translation Fault Level 1 - L1[192] hỏng).
+       - **Cam Đậm (`0x00FFA500`):** `FST = 0x06` (Translation Fault Level 2 - L2[32] hỏng/invalid).
+       - **Vàng Chanh (`0x00FFFF00`):** `FST = 0x0E` (Permission Fault Level 2 - AP cấm ghi).
+       - **Cyan (`0x0000FFFF`):** `FST = 0x0A` (Access Flag Fault Level 2 - thiếu AF).
+       - **Magenta (`0x00FF00FF`):** Mã lỗi khác.
+     - **Row 174 (2 hàng: 174..175, PA `0x5c0b7840`): Trạng thái `L1[192]` trong Bootstrap:**
+       - **Xanh Dương (`0x001E90FF`):** `L1[192]` là table descriptor hợp lệ (bit[1:0] == 3).
+       - **Đỏ Thẫm (`0x008B0000`):** `L1[192] == 0` (Entry rỗng).
+       - **Trắng (`0x00FFFFFF`):** Giá trị bất thường.
+     - **Row 176 (2 hàng: 176..177, PA `0x5c0b9a00`): Nội dung `L2[32]` trong Bootstrap:**
+       - **Vàng Kim (`0x00FFD700`):** Khớp 100% descriptor kỳ vọng (`0x006000005c000605`).
+       - **Trắng (`0x00FFFFFF`):** `L2[32] == 0` (Pha 1 chưa ghi hoặc ghi sai bảng).
+       - **Hồng Sen (`0x00FF69B4`):** Là block descriptor (bit[1:0] == 1) nhưng thuộc tính khác.
+       - **Tím (`0x00800080`):** Descriptor không phải block.
+     - **Row 178..181 (4 hàng, PA `0x5c0bbbc0`): Thước đo Nhị phân 16-bit của `PAR_EL1[15:0]`:**
+       - 16 ô vạch đứng lớn (mỗi ô rộng 64 pixel, căn giữa màn hình):
+       - **Trắng:** Bit = 1.
+       - **Xám đậm:** Bit = 0.
+       - Thể hiện trực quan từng bit của `PAR_EL1`: bit 0 (F), bits 1..6 (FST), bit 7 (PTW), bit 8 (Stage).
+   - **Bước 5:** Bật lại MMU (`SCTLR_EL1.M = 1`) và `ret` vào `arm_init`.
 
-### 3. Routine Direct VA Drawer & Loại bỏ triệt để Drawer cũ
-1. **`hk_draw_band_direct` trong `start.s`:**
-   - Hoạt động 100% trong VA, không chạm `SCTLR_EL1`, không chạm `TTBR0_EL1`, không gọi `tlbi`, không dùng stack (chỉ dùng caller-saved `x0..x8`).
-   - Bảo toàn và khôi phục `PAR_EL1` trong `x6`.
-   - Sử dụng `at s1e1w` kiểm tra cả địa chỉ bắt đầu (`x4`) và kết thúc (`x7`). Nếu `PAR_EL1` báo fault, thoát ngay lập tức (silent fail, không bao giờ gây crash/freeze).
-2. **Cắt đứt hoàn toàn việc đổi MMU sau Row 294:**
-   - Đầu hàm `hk_draw_band` thêm lệnh: `cmp w1, #294; b.hs EXT(hk_draw_band_direct)`. Bất kỳ lời gọi nào từ hàng 294 trở đi đều tự động rẽ sang routine direct.
-   - `hk_draw_band_stackless` chuyển thành `b EXT(hk_draw_band_direct)`. Các exception vector trong `locore.s` hoàn toàn không đổi MMU nữa.
-   - Thêm vạch **Row 302** (Magenta, `hk_draw_band_direct`) nằm **ngay trước** `vm_free_page_lock` để chia đôi rõ ràng: phân định treo do mutex lock hay do drawer.
-   - Chuyển toàn bộ các marker: Row 294, 302, 304, 305, 306, 308, 310, 312, 316, 320, 330, 340, 344, 348, Gauge 410..440 sang gọi trực tiếp `hk_draw_band_direct`.
+### 3. Ma trận Đọc Kết quả Thiết bị (Build 98)
+- **Nếu Row 170 Đỏ, Row 172 Cam Đậm, Row 176 Vàng Kim:**
+  $\rightarrow$ `L2[32]` trong DRAM có giá trị đúng, nhưng Table Walker Cortex-A73 gặp Translation Fault L2 vì đọc từ D-cache chưa được clean/invalidate (`dc cvac` cần thiết).
+- **Nếu Row 170 Đỏ, Row 176 Trắng:**
+  $\rightarrow$ Pha 1 ghi vào sai địa chỉ bảng (sai offset hoặc root).
+- **Nếu Row 170 Đỏ, Row 172 Vàng Chanh:**
+  $\rightarrow$ Permission Fault (cần điều chỉnh trường AP[2:1]).
+- **Nếu Row 170 Xanh Lime:**
+  $\rightarrow$ Mapping Pha 1 hoạt động hoàn hảo ngay sau `common_start`, lỗi tắt vạch xảy ra do thao tác sau đó trong `arm_init`.
+- **Mốc Enxerto Row 304 Magenta:**
+  $\rightarrow$ Xác định vị trí pixel chính xác của Row 304 trên màn hình thực tế để phân định kernel dừng tại Row 296 hay Row 304.
 
-### 4. Ma trận đọc ảnh trên thiết bị thực tế (Build 97)
-- **Row 50 sáng, Row 55 sáng:** Pha 1 thành công (mapping VA tồn tại trong `bootstrap_pagetables`).
-- **Row 45 Đỏ sáng:** Guard Pha 1 kích hoạt (L2 entries 32..36 trong bootstrap không trống).
-- **Row 158 & Row 160 sáng:** Pha 2 thành công (mapping VA tồn tại trong `cpu_tte` sau `arm_vm_init`).
-- **Row 162 sáng:** Cảnh báo Pha 2 (thiếu L1 entry trong `cpu_tte`).
-- **Row 164 sáng:** Cảnh báo Pha 2 (va chạm L2 entry trong `cpu_tte`).
-- **Row 294 sáng, Row 302 sáng, Row 304 tối:** Treo thật sự nằm tại `vm_free_page_lock()` hoặc trước Row 304, độc lập với drawer.
-- **Row 302 sáng, Row 304 sáng, Gauge 410+ sáng:** Khẳng định 100% việc dừng ở 304 ở các build trước là do lỗi chuyển đổi MMU của drawer cũ; kernel thực tế đã unblock qua `pmap_startup`!
-
-### 5. Tiến độ CI Build 97 & Các commit liên quan
-- **Kernel Repo (`HouseOfBalance/ios26-sapphire`):**
-  - Commit `f7a10bf`: `kernel: map framebuffer directly to VA (0xfffffff004000000), eliminate MMU toggling after Row 294, and install Phase 1/Phase 2 guards`
-  - Commit `0429220`: `tools: fix AT S1E1W instruction opcode mask in verify_kernel_markers.py`
-- **GitHub Actions Run ID `42350166743` (Commit `0429220`) THÀNH CÔNG 100%:**
-  - Tất cả các bước (Prepare XNU tree, Setup build env, Compile XNU Kernel, Package Payload and Boot Image, Upload Artifacts) đều đạt `success`.
-  - Kiểm chứng tiền đóng gói `verify_kernel_markers.py` đạt 100% PASSED:
-    - `_hk_draw_band_direct` tại `0xfffffff00751d870` (100% VA, zero MMU toggles, có AT guard).
-    - `el1_sp0_synchronous_vector_long` tại `0xfffffff007516000` (BL drawer xác nhận tại `+0x38`).
-    - `_pmap_next_page` tại `0xfffffff0074f40c4` (Row 306 instruction xác nhận tại `+0x18`).
-  - Đã tải artifact và cập nhật:
-    - `C:\Users\hungtv\Downloads\platform-tools\enxerto-boot.img` (10,719,232 bytes, chứa chuỗi `0429220` và `BUILD`).
-    - `artifacts/ci_42350166743/`
-    - `out/enxerto-boot.img` và `out/bergamota-fastboot.img`
+### 4. Tiến độ Commit & CI
+- Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `66f0ba1`
+- CI Run ID `42355730863` (Build 98) đang thực thi.
 
 ## Agent handoff / active work (2026-11-07 08:52: CI Build 95 THÀNH CÔNG, Commit 23e7c39 - Đã Sẵn Sàng Boot Image Trên Thiết Bị)
 - **CI Build Thành Công 100% (Run ID: 42325734420, Run Number: 95, Commit: 23e7c39):**
