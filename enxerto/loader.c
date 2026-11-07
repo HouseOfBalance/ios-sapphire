@@ -298,6 +298,11 @@ const char *loader_boot_payload(uintptr_t rd_start, uintptr_t rd_end, int verify
 	con_str("XNU", "jumping (fbcon clears screen)");
 	bootui_handoff();
 
+	/* Ground-truth physical PA calibration markers: */
+	con_rect(0, 50, FB_W, 2, 0x00FFA500);  /* Row 50: Orange (2 rows) */
+	con_rect(0, 288, FB_W, 2, 0x00FF8C00); /* Row 288: Dark Orange (2 rows) */
+	con_rect(0, 304, FB_W, 2, 0x00FF00FF); /* Row 304: Vivid Magenta (2 rows) */
+
 	/* Clean to memory, MMU and caches off, invalidate, jump (also right when mmu_rc failed). */
 #ifdef BOOT_PAUSE_MS
 	/* debug builds (BOOTPAUSE=ms build.sh): leave the log on screen long enough for a photo */
