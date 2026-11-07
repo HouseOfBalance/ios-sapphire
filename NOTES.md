@@ -1,6 +1,17 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 07:15: Stackless Vector Diagnostics, sleh_invalid_stack NULL-guard, & pmap Gauge, Commit 707cc4e)
+## Agent handoff / active work (2026-11-07 07:20: Refined Thickness & dc civac Diagnostics, Commit cda1dff)
+- **Cập nhật tinh chỉnh theo phản biện:**
+  1. **Độ dày vạch chẩn đoán:** Nâng toàn bộ vạch chu trình pmap lên >= 2 hàng:
+     - Row 306..307 (2 hàng: White): pmap_next_page entry.
+     - Row 308..309 (2 hàng: Cyan): returning TRUE.
+     - Row 310..311 (2 hàng: Purple): call-site nhận giá trị trả về.
+     - Row 312..315 (4 hàng: Deep Sky Blue): thân vòng lặp nạp trang lần đầu.
+     - Row 344..345 (2 hàng: Dark Orange): pmap_next_page returning FALSE (chuyển sang hàng 344 tránh cụm 304..315).
+  2. **Cache Clean & Invalidate:** Sửa sang dc civac cho chuỗi buffer tĩnh emsg.
+  3. **Con trỏ chuỗi hk_render_screen_asm:** Hàm đã tự động trừ loader_stub_slot[24] (tức gVirtBase - gPhysBase), bảo đảm emsg tĩnh được đọc bằng đúng địa chỉ vật lý PA khi MMU tắt.
+  4. **Bảo toàn Register Dump:** Trong el1_sp0_synchronous_vector_long, đã stp/ldp toàn bộ x2..x15, x29, x30 trước khi gọi hk_draw_band_stackless, reload lại ESR_EL1, đảm bảo context ngoại lệ không bị sai lệch.
+- **Commit mới nhất:** cda1dff (HouseOfBalance/ios26-sapphire).
 - **Mục tiêu cốt lõi:** Xác định chính xác vị trí treo kernel giữa POST-LOCK (Row 304 Vivid Magenta) và pmap_startup loop body (i == 0, Row 312), đồng thời bẫy mọi data abort / invalid stack double fault và hiển thị trạng thái phần cứng trên màn hình thiết bị.
 - **Hiện tượng Thực tế từ Phân tích Ảnh Boot Mới Nhất (media_1793971110092_0aea3f9d.jpg & media_1793971110144_c476709d.jpg):**
   - Subsystem 3 (STARTUP_SUB_LOCKS, Row 194 Cyan) ĐÃ VƯỢT QUA.
