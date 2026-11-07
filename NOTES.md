@@ -1,30 +1,24 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 08:20: BƯỚC NGOẶT LỊCH SỬ - ĐÃ VÀO BSD TASK 1 / bsdinit_task, HÀNG 630 SÁNG, ĐANG TREO TẠI load_init_program)
-- **KẾT QUẢ ĐO ĐẠC THỰC TẾ TRÊN PHẦN CỨNG (Ảnh media_1794013179628_2f74e704.jpg & media_1794013180354_01cc5d96.jpg):**
-  - **TOÀN BỘ EARLY BOOT & PMAP & BSD KHỞI TẠO ĐÃ QUA THÀNH CÔNG RỰC RỠ:**
-    - Subsystem 3 (STARTUP_SUB_LOCKS, Row 194 Cyan) **ĐÃ QUA**.
-    - pmap_startup / aperture steal loop (Rows 280, 288, 296, 304, 306..315, 348) **ĐÃ QUA**.
-    - pmap_startup thoát, vm_page_bootstrap trả về, sched_startup hoàn tất!
-    - `bsd_init` entered (Row 500: Goldenrod `0x00DAA520`) **ĐÃ QUA**.
-    - `bsd_init` completed (Row 580: Cyan `0x0000FFFF`) **ĐÃ QUA**.
-    - `vfs_mountroot()` THÀNH CÔNG (Row 615: Spring Green `0x0000FF7F`) **ĐÃ QUA**.
-    - `bsd_utaskbootstrap()` THÀNH CÔNG (Row 620: Deep Sky Blue `0x0000BFFF`) **ĐÃ QUA** (Tạo task 1, thread 1, proc 1 hoàn tất).
-    - **`bsdinit_task()` ĐÃ CHẠY! (Row 630: Dark Orange `0x00FF8C00`) ĐÃ XUẤT HIỆN RÕ RÀNG TRÊN MÀN HÌNH** (Đo pixel tại x=190: R=229 G=142 B=65, nằm ngay sau vạch Deep Sky Blue 620 tại x=185 và Spring Green 615 tại x=181).
-- **VỊ TRÍ DỪNG HIỆN TẠI ĐÃ ĐƯỢC KHOAN VÙNG CHÍNH XÁC:**
-  - Hàng 630 (Dark Orange: `bsdinit_task` entry) đã vẽ.
-  - Hàng 640 (Magenta: `load_init_program` handoff/return) CHƯA XUẤT HIỆN.
-  - Hàng 660 (Thick Red: `panic`) CHƯA XUẤT HIỆN (do `panic()` không được gọi, hoặc `PE_kputc == NULL` khiến `panic()` nhảy qua hook).
-  - Không có exception vector 198 (EC), không có double fault corrupt stack (204, 210, 216).
-  - **Kernel đang dừng/treo bên trong lời gọi `load_init_program(p)` tại `bsd/kern/kern_exec.c`!**
-  - Trong `_load_init_program`:
-    1. Thử gọi `load_init_program_at_path(p, scratch, "/usr/appleinternal/sbin/launchd.development")` -> trả về ENOENT (mockfs ramdisk không có file này).
-    2. Thử gọi `load_init_program_at_path(p, scratch, "/sbin/launchd")` -> gọi `__mac_execve` -> `exec_activate_image` -> `exec_mach_imgact` -> `load_machfile`.
-    3. Kernel đang dừng bên trong chuỗi thực thi này (hoặc chờ lock/sleep trong `exec_activate_image`, hoặc trong `load_machfile`, hoặc mã kiểm tra signature/entitlement).
-- **Kế hoạch hành động cụ thể kế tiếp:**
-  1. Đặt vạch chẩn đoán phân giải cao bên trong `load_init_program` và `exec_mach_imgact` (Rows 632, 634, 636, 638, 642).
-  2. Đặt hook `panic()` VÔ ĐIỀU KIỆN ngay dòng đầu tiên của `panic()` (Row 660), không phụ thuộc vào `PE_kputc`.
-  3. Bẫy `el1_sp1_synchronous_vector_long_spill_failed` (tránh spin im lặng `wfe; b .` tại `0xfffffff0075162bc`).
+## Agent handoff / active work (2026-11-07 08:35: ĐÍNH CHÍNH QUAN TRỌNG - KERNEL CHƯA QUA PMAP, DỪNG TẠI CỤM ROW 280..304)
+- **Đính chính và thống nhất 100% với nhận định người dùng:**
+  - Báo cáo trước đó bị nhầm lẫn hệ tọa độ khi đo đạc từ ảnh xoay ngang (`im1`).
+  - Điểm neo vật lý chuẩn xác: Logo Enxerto nằm ở `BLOCK_TOP = 530..600`. Toàn bộ vùng từ sau cụm vạch đến logo là nền xanh trơn (Row 500, 580, 615, 620, 630 HOÀN TOÀN KHÔNG TỒN TẠI trên màn hình).
+  - Kernel **CHƯA HỀ** tới `vfs_mountroot` hay `bsdinit_task`. Mọi giả thuyết về `load_init_program` được **hoãn lại hoàn toàn**.
+- **Kết quả đọc ảnh thực tế (Ảnh media_1794013179628 & media_1794013180):**
+  - **Câu hỏi quyết định:** Vạch 306..311 (trắng, cyan, tím) và Gauge 410..440 **HOÀN TOÀN KHÔNG XUẤT HIỆN**.
+  - Vạch cuối cùng hiển thị trên màn hình chỉ dừng tại cụm `vm_page_bootstrap` (khoảng Row 280..304). Sau cụm này là nền xanh trơn.
+  - Vạch Cyan/Teal cô lập ở phía trên là Row 194 (Subsystem 3 `STARTUP_SUB_LOCKS`) hoặc Row 198 (Vector EC).
+  - Vòng lặp `pmap_next_page` / lệnh gọi `BL _pmap_next_page` tại Row 304 vẫn là **NGHI PHẠM SỐ 1**.
+- **Hành động đã và đang thực hiện:**
+  1. **In Commit SHA / Build ID lên màn hình ngay từ Enxerto:**
+     - Đã thêm `BUILD <git_sha>` vào `enxerto/loader.c` và truyền cflags `-DENXERTO_GIT_SHA` từ `enxerto/build.py`.
+     - Loại bỏ hoàn toàn mọi nghi ngờ flash nhầm build cũ.
+  2. **Chồng lưới và đo đạc:**
+     - Đã tạo artifact `ladder_grid_annotated.png` trực quan hóa toàn bộ dải vạch từ Bezel (Row 0), Camera hole (Row ~100), Row 194/198, và điểm dừng tại Row 280..304.
+  3. **Bảo toàn tính tối giản:**
+     - Hoãn toàn bộ các breadcrumb trong `kern_exec.c`.
+     - Giữ lại hook `panic()` vô điều kiện.
 - **CI Build Thành Công 100% (Run ID: 42320860894, Run Number: 93, Commit: 7495b6c):**
   - Tất cả các bước (Prepare XNU tree, Setup build env, Compile XNU Kernel, Package Payload and Boot Image, Upload Artifacts) đều đạt `success`.
   - Đã tải và giải nén artifact: `artifacts/ci_42320860894/` và cập nhật file boot cục bộ `out/enxerto-boot.img` (10,719,232 bytes).
