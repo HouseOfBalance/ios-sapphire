@@ -1,6 +1,14 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 07:25: 100% Stackless Vector Diagnostics & Row 330 Isolation, Commit c3cad8c)
+## Agent handoff / active work (2026-11-07 07:40: Sửa Lỗi Undefined Symbols & CI Run 42319615177, Commit 4182df8)
+- **Khắc phục lỗi linker Mach-O (Commit 4182df8):**
+  1. **Lỗi `_get_saved_state_lr`:**
+     - Trong XNU ARM64 không tồn tại hàm `get_saved_state_lr`. Thanh ghi LR (x30) trong XNU ARM64 được truy xuất qua `get_saved_state_reg(state, 30)`.
+     - Đã thay thế toàn bộ các lời gọi `get_saved_state_lr` tại `sleh.c` (unhandled UNDEF, unhandled fault, và `sleh_invalid_stack`) sang `get_saved_state_reg(..., 30)`.
+  2. **Lỗi `_need_ram_ranges_init`:**
+     - Biến `need_ram_ranges_init` nguyên bản được khai báo `static bool` trong `osfmk/arm/pmap/pmap.c` (local symbol, type 0xe). Khi `vm_resident.c` khai báo `extern boolean_t need_ram_ranges_init` để đo gauge tại Row 436, `ld64` báo lỗi Undefined Symbol khi link kernel Mach-O.
+     - Đã cập nhật `kernel/patch_ram_alignment.py` để loại bỏ `static` (`bool need_ram_ranges_init = true;`), biến cờ trở thành global export (type 0xf), đồng thời chuẩn hóa kiểu `extern bool need_ram_ranges_init` trong `vm_resident.c`.
+  3. **Đang theo dõi CI:** Run ID `42319615177` (workflow `Build HakiOS XNU 12377 (iOS 26)`).
 - **Khắc phục lỗi logic nghiêm trọng trong vector (Commit c3cad8c):**
   1. **Loại bỏ 100% stp/ldp trong el1_sp0_synchronous_vector_long:**
      - Trước đó dùng chuỗi stp lưu x2..x15, x29/x30 lên SP_EL1. Nếu SP_EL1 bị lỗi/unmapped, chính chuỗi stp sẽ gây double fault lồng nhau trước khi vẽ được vạch 198, khiến kết quả không có vạch bị đánh lừa.
@@ -9,7 +17,7 @@
   2. **Dời Row 344 sang Row 330:**
      - pmap_next_page returning FALSE được dời sang Row 330..331 (Dark Orange, 2 hàng), hoàn toàn cô lập khỏi cả cụm 304..315 lẫn vạch loop completed ở 348..351.
   3. **Vị trí Row 220:** Đặt SAU khi hk_render_screen_asm hoàn tất, đảm bảo nếu Row 220 sáng thì text panic đã được render ra màn hình.
-- **Commit mới nhất:** c3cad8c (HouseOfBalance/ios26-sapphire).
+- **Commit mới nhất:** 4182df8 (HouseOfBalance/ios26-sapphire).
 - **Cập nhật tinh chỉnh theo phản biện:**
   1. **Độ dày vạch chẩn đoán:** Nâng toàn bộ vạch chu trình pmap lên >= 2 hàng:
      - Row 306..307 (2 hàng: White): pmap_next_page entry.
