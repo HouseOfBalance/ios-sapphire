@@ -1,6 +1,15 @@
 # iOS 16 / iOS 26 on sweet & sapphire (Redmi Note 13 4G, SM6225 Bengal) - working notes
 
-## Agent handoff / active work (2026-11-07 07:20: Refined Thickness & dc civac Diagnostics, Commit cda1dff)
+## Agent handoff / active work (2026-11-07 07:25: 100% Stackless Vector Diagnostics & Row 330 Isolation, Commit c3cad8c)
+- **Khắc phục lỗi logic nghiêm trọng trong vector (Commit c3cad8c):**
+  1. **Loại bỏ 100% stp/ldp trong el1_sp0_synchronous_vector_long:**
+     - Trước đó dùng chuỗi stp lưu x2..x15, x29/x30 lên SP_EL1. Nếu SP_EL1 bị lỗi/unmapped, chính chuỗi stp sẽ gây double fault lồng nhau trước khi vẽ được vạch 198, khiến kết quả không có vạch bị đánh lừa.
+     - Đã chuyển sang 100% STACKLESS: lưu duy nhất lr vào x28 (thanh ghi callee-saved không bị hk_draw_band_stackless đụng chạm), nạp lại ESR_EL1 sau khi gọi, 0 byte stack, không đụng SP.
+     - Vạch 198 (Cyan EC) được bảo đảm 100% sẽ vẽ được bất kể SP_EL1 có hỏng hay không!
+  2. **Dời Row 344 sang Row 330:**
+     - pmap_next_page returning FALSE được dời sang Row 330..331 (Dark Orange, 2 hàng), hoàn toàn cô lập khỏi cả cụm 304..315 lẫn vạch loop completed ở 348..351.
+  3. **Vị trí Row 220:** Đặt SAU khi hk_render_screen_asm hoàn tất, đảm bảo nếu Row 220 sáng thì text panic đã được render ra màn hình.
+- **Commit mới nhất:** c3cad8c (HouseOfBalance/ios26-sapphire).
 - **Cập nhật tinh chỉnh theo phản biện:**
   1. **Độ dày vạch chẩn đoán:** Nâng toàn bộ vạch chu trình pmap lên >= 2 hàng:
      - Row 306..307 (2 hàng: White): pmap_next_page entry.
