@@ -67,6 +67,14 @@
 - **Mốc Enxerto Row 304 Magenta:**
   $\rightarrow$ Xác định vị trí pixel chính xác của Row 304 trên màn hình thực tế để phân định kernel dừng tại Row 296 hay Row 304.
 
+### 3b. Review của reviewer ngoài (2026-11-07 16:44), chưa kiểm chứng trên máy
+- Descriptor `0x006000005c000605` hợp lệ (block L2, Attr1=Normal-NC, AP=00, AF=1, không vi phạm RES0).
+- Giả thuyết mạnh nhất: Enxerto để lại cache line dirty/stale trên trang `bootstrap_pagetables`. Fix nếu Build 98 cho FST 0x6 + L2[32]=...605: `dc civac` trang L1/L2 TRƯỚC khi ghi, ghi descriptor, `dc civac` lại + `dsb sy` (nên làm thêm ở Enxerto trước khi jump).
+- Pha 2: thêm `dc civac` cho `fb_l2_tte`; kiểm tra không cộng index 2 lần.
+- Sau Row 304: chưa xác định. Nghi drawer cũ hỏng (TTBR0 -> bootstrap đã bị tái dùng sau arm_vm_init). KHÔNG sửa pmap trước khi vạch direct chạy.
+- Dự phòng: ghi trạng thái vào RAM cố định (~0x82f00000, có magic) rồi warm reboot vào ảnh dump.
+- Bảng đọc: F=0 -> lỗi ở routine direct; FST 5 -> sai bảng/index L1; FST 6 + L2=0 -> ghi nhầm chỗ; FST 6 + L2=...605 -> stale cache; FST 0xE -> kiểm tra APTable/PXNTable của L1[192].
+
 ### 4. Tiến độ Commit & CI
 - Kernel repo (`HouseOfBalance/ios26-sapphire`): Commit `66f0ba1`
 - CI Run ID `42355730863` (Build 98) THÀNH CÔNG 100%.
