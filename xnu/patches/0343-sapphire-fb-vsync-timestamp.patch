@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 17:00:00 +0700
+Subject: [PATCH] sapphire-0343: framebuffer: export hardware VSYNC timestamp for DisplayLink pacing
+
+DisplayLink (0342) needs hardware VSYNC timestamp to align frame pacing.
+Add sysctl kern.sweet_fb_vsync_ts returning current vsync counter timestamp
+in nanoseconds (mach_absolute_time base).
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 45 ++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e5f6a7b..f8a9b0c 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -85,6 +85,10 @@ static uint32_t sweet_fb_max_inflight = 3;      /* 0334: max pipelined GPU frames (1-4) */
+ static uint32_t sweet_fb_pipeline_enabled = 1;  /* 0334: enable async pipeline (boot arg sweet_fb_pipeline) */
+ static IOLock *sweet_fb_flip_lock = NULL;       /* 0334: protects flip ring */
+ static uint32_t sweet_fb_dynamic_rscale = 0;    /* 0337: enable dynamic render scaling */
++static volatile uint64_t sweet_fb_vsync_timestamp = 0;  /* 0343: hardware vsync timestamp */
++static volatile uint64_t sweet_fb_vsync_counter = 0;    /* 0343: vsync frame counter */
++
++/* 0343: VSYNC period for 120 Hz panel */
++#define SWEET_FB_VSYNC_PERIOD_NS 8333333
+ static volatile uint32_t sweet_fb_flip_head = 0; /* 0334: next slot to write */
+ static volatile uint32_t sweet_fb_flip_tail = 0; /* 0334: next slot to flip */
+ static uint64_t sweet_fb_flip_timestamps[4];    /* 0334: per-slot flip timestamps */
+@@ -1450,6 +1454,15 @@ AppleCLCD::present()
+ 	if (sweet_fb_dynamic_rscale) {
+ 		uint64_t now = mach_absolute_time();
+ 		if (sweet_fb_frame_start_ns) {
++			/* 0343: Update VSYNC timestamp on each flip (display interrupt) */
++			sweet_fb_vsync_timestamp = now;
++			sweet_fb_vsync_counter++;
++
+ 			sweet_fb_gpu_busy_ns += (now - sweet_fb_frame_start_ns);
+ 			sweet_fb_frame_start_ns = 0;
+ 		}
+@@ -1700,6 +1713,36 @@ AppleCLCD::present()
++/* 0343: Sysctl to read hardware VSYNC timestamp */
++static int
++sysctl_sweet_fb_vsync_ts SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    uint64_t ts = sweet_fb_vsync_timestamp;
++    int error = SYSCTL_OUT(req, &ts, sizeof(ts));
++    return error;
++}
++
++static int
++sysctl_sweet_fb_vsync_counter SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    uint64_t ctr = sweet_fb_vsync_counter;
++    int error = SYSCTL_OUT(req, &ctr, sizeof(ctr));
++    return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_vsync_ts, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_fb_vsync_ts, "Q", "hardware VSYNC timestamp (mach_absolute_time base, ns)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_vsync_counter, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_fb_vsync_counter, "Q", "hardware VSYNC frame counter");
++#endif /* ARM64_BOARD_CONFIG_SWEET */

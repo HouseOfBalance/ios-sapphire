@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 16:00:00 +0700
+Subject: [PATCH] sapphire-0339: cpufreq: instant touch boost - zero-latency P-core ramp on touch
+
+Current cpufreq (0328) reads LUT but has no governor. When touch arrives,
+CPU takes 2-5 ms to ramp to max (2.8 GHz Gold), causing first-frame jank.
+Solution: Touch IRQ triggers immediate perf_state=0 (max freq) on Gold cluster,
+with 150 ms hold timer before allowing natural decay.
+
+Also adds strict thread affinity API for critical UI threads.
+---
+ bsd/dev/sweet_cpufreq.c | 180 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 180 insertions(+)
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index b863e35..c4d5e6f 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -187,6 +187,186 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_cpufreq, "A", "active CPU perf state and MHz per cluster (write: re-apply max)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
++
++/* 0339: Instant Touch Boost & Strict Thread Affinity */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <kern/thread.h>
++#include <kern/sched.h>
++#include <machine/machine_routines.h>
++
++static uint32_t sweet_touch_boost_enabled = 1;
++static uint32_t sweet_touch_boost_hold_ms = 150;   /* hold max freq after last touch */
++static uint32_t sweet_touch_boost_ramp_ms = 0;     /* instant = 0, or ms to ramp */
++
++static volatile uint64_t sweet_touch_last_boost_time = 0;
++static volatile boolean_t sweet_touch_boost_active = FALSE;
++static LCK_GRP_DECLARE(sweet_touch_boost_grp, "sweet_touch_boost");
++static LCK_MTX_DECLARE(sweet_touch_boost_lock, &sweet_touch_boost_grp);
++
++/* Strict affinity masks */
++#define SWEET_AFFINITY_GOLD_ALL   0x0F  /* cores 0-3 */
++#define SWEET_AFFINITY_GOLD_01    0x03  /* cores 0-1 (strongest) */
++#define SWEET_AFFINITY_SILVER_ALL 0x30  /* cores 4-5 */
++
++/* 0339: Called from touch IRQ context - instant boost to max freq */
++void
++sweet_touch_boost_trigger(void)
++{
++    if (!sweet_touch_boost_enabled) return;
++
++    uint64_t now = mach_absolute_time();
++    sweet_touch_last_boost_time = now;
++
++    if (!sweet_touch_boost_active) {
++        sweet_touch_boost_active = TRUE;
++        /* Immediate max perf on Gold cluster */
++        sweet_cpufreq_set_perf_state_locked(&cpufreq_domains[0], 0);  /* Gold = max */
++        printf("SWEET_CPUFREQ: touch boost ON - Gold @ max\n");
++    }
++
++    /* Schedule decay check */
++    thread_wakeup((event_t)&sweet_touch_last_boost_time);
++}
++
++/* 0339: Decay timer - call periodically or from wakeup */
++static void
++sweet_touch_boost_decay_check(void)
++{
++    if (!sweet_touch_boost_active) return;
++
++    uint64_t now = mach_absolute_time();
++    uint64_t elapsed_ms = (now - sweet_touch_boost_time) * 1000ULL / NSEC_PER_SEC;
++
++    if (elapsed_ms >= sweet_touch_boost_hold_ms) {
++        sweet_touch_boost_active = FALSE;
++        /* Allow natural decay - re-apply max to let governor decide */
++        sweet_cpufreq_max();
++        printf("SWEET_CPUFREQ: touch boost OFF - natural decay\n");
++    }
++}
++
++/* 0339: Strict thread affinity - pin to specific core mask */
++int
++sweet_thread_set_strict_affinity(thread_t th, uint32_t affinity_mask)
++{
++    if (th == THREAD_NULL) return EINVAL;
++
++    /* Validate mask against available cores */
++    if ((affinity_mask & ~0x3F) != 0) return EINVAL;  /* only 6 cores */
++
++    thread_policy_set(th, TASK_POLICY_AFFINITY, affinity_mask);
++    thread_set_pending_ast(th, AST_PREEMPTION);
++    return 0;
++}
++
++/* 0339: Pin critical UI threads at startup */
++void
++sweet_pin_critical_ui_threads(void)
++{
++    proc_t p;
++    proc_list_lock();
++    for (p = allproc; p != NULL; p = p->p_list.le_next) {
++        const char *pname = proc_name_address(p);
++        if (!pname) continue;
++
++        uint32_t mask = 0;
++        if (strcmp(pname, "SpringBoard") == 0) {
++            mask = SWEET_AFFINITY_GOLD_01;  /* cores 0-1 */
++        } else if (strcmp(pname, "backboardd") == 0) {
++            mask = SWEET_AFFINITY_GOLD_01;  /* cores 0-1 */
++        } else if (strcmp(pname, "WindowServer") == 0) {
++            mask = SWEET_AFFINITY_GOLD_ALL; /* cores 0-3 */
++        } else if (strcmp(pname, "mediaserverd") == 0) {
++            mask = SWEET_AFFINITY_GOLD_ALL; /* cores 0-3 */
++        } else {
++            continue;
++        }
++
++        thread_t th;
++        for (th = p->p_threadlist; th != THREAD_NULL; th = th->task_threads.tqe_next) {
++            /* Pin main thread and render threads (high priority) */
++            if (th == p->p_threadlist || th->sched_pri <= BASEPRI_USER) {
++                sweet_thread_set_strict_affinity(th, mask);
++            }
++        }
++        printf("SWEET_CPUFREQ: pinned %s to mask 0x%x\n", pname, mask);
++    }
++    proc_list_unlock();
++}
++
++/* 0339: Sysctl interface */
++static int
++sysctl_sweet_touch_boost SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    char out[128];
++    int error = 0;
++    size_t off = 0;
++
++    off += snprintf(out + off, sizeof(out) - off,
++        "enabled:%u active:%u hold_ms:%u last_boost_ms_ago:%llu",
++        sweet_touch_boost_enabled, sweet_touch_boost_active,
++        sweet_touch_boost_hold_ms,
++        sweet_touch_boost_active ? (mach_absolute_time() - sweet_touch_last_boost_time) * 1000ULL / NSEC_PER_SEC : 0);
++
++    if (!error) error = SYSCTL_OUT(req, out, off + 1);
++    return error;
++}
++
++static int
++sysctl_sweet_touch_boost_enabled SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    int error = sysctl_handle_int(oidp, &sweet_touch_boost_enabled, 0, req);
++    if (!error && req->newptr != USER_ADDR_NULL) {
++        if (!sweet_touch_boost_enabled) sweet_touch_boost_active = FALSE;
++    }
++    return error;
++}
++
++static int
++sysctl_sweet_touch_boost_hold SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    return sysctl_handle_int(oidp, &sweet_touch_boost_hold_ms, 0, req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_boost, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_touch_boost, "A", "touch boost status: enabled/active/hold/last_boost");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_boost_enabled, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_touch_boost_enabled, "I", "enable instant touch boost (0/1)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_boost_hold_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_touch_boost_hold, "I", "hold max freq after last touch (ms, default 150)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -20,6 +20,11 @@
  * - Frame pacing stats via sysctl kern.sapphire_dl_stats
  * - Adaptive promotion: only promote if GPU util < 80% (reads kern.sweet_fb_dynamic_rscale)
  *
+ * 0342 additions:
+ * - Hardware VSYNC-aligned frame pacing: read kernel vsync timestamp, schedule at vsync - render_budget
+ * - Predictive quality scaling: reduce render quality on consecutive deadline misses
+ * - Frame deadline monitoring with adaptive budget based on GPU utilization
+ *
  * Only Objective-C method replacement (no function hooks). /var/jb/var/sapphire-dl-off turns it off (at the
  * next launch of each process). After HackiOS userland/src/inject_sb.c display_link_rates() (7caa457, MIT).
  */
@@ -34,6 +39,7 @@
 #include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 
 /* /var/tmp/dl-log present at launch: every display link made and every rate asked go to /var/tmp/dl.<process>.log */
 static FILE *dl_log;
@@ -65,6 +71,7 @@ typedef struct {
 static id (*o_with)(id, SEL, id, SEL);
 static void (*o_fps)(id, SEL, long);
 static void (*o_range)(id, SEL, frame_rate_range);
+static void (*o_callback)(id, SEL, CAAnimation *);  /* 0342: displayLinkCallback: hook */
 static char full_key;                   /* the mark a display link made for FULL_FOR carries */
 static char scroll_key;                 /* the mark a scroll-animation display link carries */
 static bool is_springboard;
@@ -88,6 +95,26 @@ typedef struct {
 
 static dl_profile_t *dl_profiles = NULL;
 static size_t dl_profile_count = 0;
+
+/* 0342: Hardware VSYNC-aligned Frame Pacing */
+typedef struct {
+    uint64_t vsync_period_ns;        /* 8,333,333 ns for 120 Hz */
+    uint64_t last_vsync_ts;          /* last hardware vsync timestamp */
+    uint64_t render_budget_ns;       /* time budget for render (target 70% = 5.8ms) */
+    uint64_t next_frame_target_ts;   /* when next frame should be ready */
+    uint32_t phase_offset_us;        /* microsecond offset from vsync */
+    boolean_t vsync_aligned;         /* true when locked to hardware vsync */
+    uint32_t consecutive_misses;     /* frames missing deadline */
+    uint32_t quality_level;          /* 0=full, 1=half-res, 2=minimal */
+    uint64_t frame_start_ts;         /* frame render start timestamp */
+} dl_frame_pacing_t;
+
+static dl_frame_pacing_t dl_pacing = {
+    .vsync_period_ns = 8333333,
+    .render_budget_ns = 5833333,     /* 70% of frame */
+    .phase_offset_us = 500,          /* 500 µs before vsync */
+    .quality_level = 0,
+};
 
 static bool
 has_ci(const char *s, const char *needle)
@@ -280,6 +307,115 @@ dl_predictive_boost(id link)
 	dl_last_frame_time = now;
 }
 
+/* 0342: Read hardware VSYNC timestamp from kernel */
+static uint64_t
+dl_read_hw_vsync_ts(void)
+{
+    size_t len = sizeof(uint64_t);
+    uint64_t ts = 0;
+    sysctlbyname("kern.sweet_fb_vsync_ts", &ts, &len, NULL, 0);
+    return ts;
+}
+
+/* 0342: Read current GPU utilization for budget adjustment */
+static uint32_t
+dl_read_gpu_util(void)
+{
+    size_t len = 0;
+    sysctlbyname("kern.sweet_fb_dynamic_rscale", NULL, &len, NULL, 0);
+    if (len > 0) {
+        char *buf = malloc(len);
+        if (buf) {
+            sysctlbyname("kern.sweet_fb_dynamic_rscale", buf, &len, NULL, 0);
+            char *p = strstr(buf, "gpu_util:");
+            uint32_t util = 0;
+            if (p) sscanf(p, "gpu_util:%u", &util);
+            free(buf);
+            return util;
+        }
+    }
+    return 500;  /* default 50% */
+}
+
+/* 0342: Update frame pacing parameters based on vsync phase */
+static void
+dl_update_frame_pacing(void)
+{
+    uint64_t now = mach_absolute_time();
+    uint64_t hw_vsync = dl_read_hw_vsync_ts();
+
+    if (hw_vsync == 0) return;  /* not available yet */
+
+    if (!dl_pacing.vsync_aligned) {
+        /* First sync - align to next vsync boundary */
+        uint64_t phase = (now - hw_vsync) % dl_pacing.vsync_period_ns;
+        dl_pacing.next_frame_target_ts = hw_vsync + dl_pacing.vsync_period_ns - dl_pacing.phase_offset_us * 1000;
+        dl_pacing.vsync_aligned = TRUE;
+        printf("SapphireDL: VSYNC aligned, phase=%llu ns\n", phase);
+        return;
+    }
+
+    /* Check if we missed the deadline */
+    if (now > dl_pacing.next_frame_target_ts) {
+        dl_pacing.consecutive_misses++;
+        uint64_t late_ns = now - dl_pacing.next_frame_target_ts;
+
+        if (dl_pacing.consecutive_misses >= 3 && dl_pacing.quality_level < 2) {
+            dl_pacing.quality_level++;
+            dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * (70 - dl_pacing.quality_level * 15) / 100;
+            printf("SapphireDL: quality reduced to level %u, budget=%llu ns\n",
+                   dl_pacing.quality_level, dl_pacing.render_budget_ns);
+        }
+    } else {
+        dl_pacing.consecutive_misses = 0;
+        if (dl_pacing.quality_level > 0) {
+            dl_pacing.quality_level--;
+            dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * (70 + dl_pacing.quality_level * 15) / 100;
+        }
+    }
+
+    /* Schedule next frame at vsync - render_budget */
+    uint64_t next_vsync = hw_vsync + dl_pacing.vsync_period_ns;
+    dl_pacing.next_frame_target_ts = next_vsync - dl_pacing.render_budget_ns;
+
+    /* Adjust for GPU utilization */
+    uint32_t gpu_util = dl_read_gpu_util();
+    if (gpu_util > 800) {
+        dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * 60 / 100;  /* reduce to 60% */
+    } else if (gpu_util < 500) {
+        dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * 80 / 100;  /* increase to 80% */
+    }
+}
+
+/* 0342: Predictive frame scheduling - call before CADisplayLink callback */
+static void
+dl_predictive_schedule(id link)
+{
+    dl_update_frame_pacing();
+
+    uint64_t now = mach_absolute_time();
+    int64_t time_to_deadline = (int64_t)(dl_pacing.next_frame_target_ts - now);
+
+    if (time_to_deadline > 1000000) {  /* >1ms early */
+        /* Yield CPU to avoid burning cycles */
+        usleep(time_to_deadline / 1000 - 500);  /* leave 500 µs margin */
+    } else if (time_to_deadline < -500000) {  /* >500µs late */
+        /* Frame already missed - skip or reduce quality */
+        dl_pacing.consecutive_misses++;
+    }
+
+    dl_pacing.frame_start_ts = now;
+}
+
+/* 0342: Hook into CADisplayLink callback to enforce pacing */
+static void
+my_callback(id self, SEL sel, CAAnimation *anim)
+{
+    dl_predictive_schedule(self);
+    if (o_callback) o_callback(self, sel, anim);
+    dl_predictive_boost(self);  /* from 0339 */
+}
+
 /* 0339: Load app profiles from property list */
 static void
 dl_load_profiles(void)
@@ -316,6 +452,21 @@ sysctl_sapphire_dl_stats(char *buf, size_t len)
 	    dl_get_gpu_util());
 }
 
+/* 0342: Sysctl for frame pacing stats */
+static int
+sysctl_sapphire_dl_pacing(char *buf, size_t len)
+{
+    return snprintf(buf, len,
+        "aligned:%u vsync_period:%llu budget:%llu target:%llu misses:%u quality:%u offset_us:%u",
+        dl_pacing.vsync_aligned,
+        (unsigned long long)dl_pacing.vsync_period_ns,
+        (unsigned long long)dl_pacing.render_budget_ns,
+        (unsigned long long)dl_pacing.next_frame_target_ts,
+        dl_pacing.consecutive_misses,
+        dl_pacing.quality_level,
+        dl_pacing.phase_offset_us);
+}
+
 __attribute__((constructor)) static void
 init(void)
 {
@@ -349,6 +500,7 @@ init(void)
 	Method made = class_getClassMethod(link, sel_registerName("displayLinkWithTarget:selector:"));
 	Method fps = class_getInstanceMethod(link, sel_registerName("setPreferredFramesPerSecond:"));
 	Method range = class_getInstanceMethod(link, sel_registerName("setPreferredFrameRateRange:"));
+	Method callback = class_getInstanceMethod(link, sel_registerName("displayLinkCallback:"));  /* 0342 */
 	if (made == NULL || fps == NULL || range == NULL) {
 		NSLog(@TAG "CADisplayLink methods missing (made %p fps %p range %p): nothing changed", made, fps, range);
 		return;
@@ -356,5 +508,8 @@ init(void)
 	o_with = (id (*)(id, SEL, id, SEL))method_setImplementation(made, (IMP)my_with);
 	o_fps = (void (*)(id, SEL, long))method_setImplementation(fps, (IMP)my_fps);
 	o_range = (void (*)(id, SEL, frame_rate_range))method_setImplementation(range, (IMP)my_range);
+	if (callback) {
+	    o_callback = (void (*)(id, SEL, CAAnimation *))method_setImplementation(callback, (IMP)my_callback);
+	}
 	(void)TAG;
 }

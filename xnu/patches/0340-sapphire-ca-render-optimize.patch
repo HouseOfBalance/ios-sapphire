@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 16:15:00 +0700
+Subject: [PATCH] sapphire-0340: CoreAnimation: blur reduction, dirty region enforcement, half-res backdrop
+
+Adreno 610 fillrate cannot sustain full-res Gaussian blur on 1080x2400.
+Optimizations applied via QuartzCore environment variables and CA flags:
+- CA_DISABLE_BLUR=1: disable expensive CIFilter Gaussian blur
+- CA_HALFRES_BACKDROP=1: render backdrop filters at 1/2 resolution
+- CA_FORCE_DIRTY_RECTS=1: enforce partial updates, no full-screen redraw
+- CA_COLOR_OPAQUE=1: hint opaque layers to skip blending
+- CA_DEBUG_TRANSPARENT=0: disable transparent debugging overlay
+
+Also adds sysctl kern.sapphire_ca_render for runtime tuning.
+---
+ bsd/kern/sapphire_ca_render.c | 240 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 240 insertions(+)
+
+diff --git a/bsd/kern/sapphire_ca_render.c b/bsd/kern/sapphire_ca_render.c
+index 0000000..d5e6f7a 100644
+--- /dev/null
++++ b/bsd/kern/sapphire_ca_render.c
+@@ -0,0 +1,240 @@
++/*
++ * sapphire-0340: CoreAnimation Render Optimizations for Adreno 610
++ * Applies via environment variables read by QuartzCore at process start.
++ * Also provides sysctl for runtime override.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/proc.h>
++#include <sys/kernel.h>
++#include <kern/task.h>
++
++static uint32_t sapphire_ca_disable_blur = 1;
++static uint32_t sapphire_ca_halfres_backdrop = 1;
++static uint32_t sapphire_ca_force_dirty_rects = 1;
++static uint32_t sapphire_ca_color_opaque = 1;
++static uint32_t sapphire_ca_debug_transparent = 0;
++static uint32_t sapphire_ca_max_backdrop_layers = 2;  /* limit stacked backdrops */
++static uint32_t sapphire_ca_shadow_quality = 1;     /* 0=off, 1=low, 2=medium, 3=high */
++
++/* 0340: Apply CA environment to a process at exec/execve */
++void
++sapphire_ca_apply_env(proc_t p)
++{
++    const char *pname = proc_name_address(p);
++    if (!pname) return;
++
++    /* Only apply to UI processes that use CoreAnimation heavily */
++    boolean_t is_ui = FALSE;
++    if (strcmp(pname, "SpringBoard") == 0 ||
++        strcmp(pname, "backboardd") == 0 ||
++        strcmp(pname, "WindowServer") == 0 ||
++        strcmp(pname, "UIKit") == 0 ||
++        strstr(pname, "UI") != NULL) {
++        is_ui = TRUE;
++    }
++
++    if (!is_ui) return;
++
++    /* Set environment variables for QuartzCore */
++    char *envp[] = {
++        sapphire_ca_disable_blur ? "CA_DISABLE_BLUR=1" : "CA_DISABLE_BLUR=0",
++        sapphire_ca_halfres_backdrop ? "CA_HALFRES_BACKDROP=1" : "CA_HALFRES_BACKDROP=0",
++        sapphire_ca_force_dirty_rects ? "CA_FORCE_DIRTY_RECTS=1" : "CA_FORCE_DIRTY_RECTS=0",
++        sapphire_ca_color_opaque ? "CA_COLOR_OPAQUE=1" : "CA_COLOR_OPAQUE=0",
++        sapphire_ca_debug_transparent ? "CA_DEBUG_TRANSPARENT=1" : "CA_DEBUG_TRANSPARENT=0",
++        "CA_MAX_BACKDROP_LAYERS=2",
++        "CA_SHADOW_QUALITY=1",
++        "CA_OPTIMIZE_FOR_TILE=1",
++        "CA_DISABLE_DEPTH_SORT=1",
++        NULL
++    };
++
++    /* Apply to process environment */
++    for (int i = 0; envp[i]; i++) {
++        char *eq = strchr(envp[i], '=');
++        if (eq) {
++            *eq = '\0';
++            setenv(envp[i], eq + 1, 1);
++            *eq = '=';
++        }
++    }
++
++    printf("SAPPHIRE_CA: applied render optimizations to %s\n", pname);
++}
++
++/* 0340: Hook into proc_exec to apply CA env */
++static int
++sapphire_ca_exec_hook(struct proc *p, struct image_params *imgp)
++{
++    sapphire_ca_apply_env(p);
++    return 0;
++}
++
++/* 0340: Sysctl for runtime tuning */
++static int
++sysctl_sapphire_ca_render SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    char out[256];
++    int error = 0;
++    size_t off = 0;
++
++    off += snprintf(out + off, sizeof(out) - off,
++        "blur:%u halfres:%u dirty:%u opaque:%u transparent:%u max_backdrop:%u shadow:%u",
++        sapphire_ca_disable_blur, sapphire_ca_halfres_backdrop,
++        sapphire_ca_force_dirty_rects, sapphire_ca_color_opaque,
++        sapphire_ca_debug_transparent, sapphire_ca_max_backdrop_layers,
++        sapphire_ca_shadow_quality);
++
++    if (!error) error = SYSCTL_OUT(req, out, off + 1);
++    return error;
++}
++
++static int
++sysctl_sapphire_ca_blur SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    return sysctl_handle_int(oidp, &sapphire_ca_disable_blur, 0, req);
++}
++
++static int
++sysctl_sapphire_ca_halfres SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    return sysctl_handle_int(oidp, &sapphire_ca_halfres_backdrop, 0, req);
++}
++
++static int
++sysctl_sapphire_ca_dirty SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    return sysctl_handle_int(oidp, &sapphire_ca_force_dirty_rects, 0, req);
++}
++
++static int
++sysctl_sapphire_ca_shadow SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    return sysctl_handle_int(oidp, &sapphire_ca_shadow_quality, 0, req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_render, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sapphire_ca_render, "A", "CoreAnimation render optimization status");
++SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_disable_blur, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sapphire_ca_blur, "I", "disable Gaussian blur (0/1)");
++SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_halfres_backdrop, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sapphire_ca_halfres, "I", "half-res backdrop filters (0/1)");
++SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_force_dirty_rects, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sapphire_ca_dirty, "I", "enforce dirty region partial updates (0/1)");
++SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_shadow_quality, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sapphire_ca_shadow, "I", "shadow quality 0=off 1=low 2=med 3=high");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
