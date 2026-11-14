@@ -1,25 +1,44 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sapphire <sapphire@local>
 Date: Sat, 14 Nov 2026 13:30:00 +0700
-Subject: [PATCH] sapphire-0332: gpu: small-only zero default without persistent 1G map
+Subject: [PATCH] sapphire-0332: gpu: keep gpu_zero=1 default and always bind WC attribute on GPOOL_PA
 
-Default gpu_zero to 0 so large render targets (>= 256 KB) are not zeroed
-on every GEM_NEW, avoiding per-allocation 0.5 ms WC bzero stalls without
-mapping the 1 GiB GPOOL_PA range into compact 4K kernel VA space.
+Keep gpu_zero=1 by default and always call pm->map(kIOMapWriteCombineCache)
+even when zeroing is skipped for >= 256 KB buffers. Because GPOOL_PA is an
+unmanaged carve-out (withPhysicalAddress), skipping the kernel WC map caused
+IOConnectMapMemory64 in userspace to map >= 256 KB slabs as Device memory,
+crashing HakiosMetal::writeBorderColors (0x40000 cmdbuf slab) with
+EXC_ARM_DA_ALIGN on unaligned NEON stores.
 ---
- iokit/Kernel/arm/SapphireGpu.cpp | edit
- 1 file changed
+ iokit/Kernel/arm/SapphireGpu.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 --- a/iokit/Kernel/arm/SapphireGpu.cpp
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -3762,6 +3762,6 @@
+@@ -3762,19 +3762,21 @@
+ 		 * showed white frames (and once the whole screen went yellow), which gpu_zero=1 took away.
+ 		 */
  		static int zero_all = -1;
  		if (zero_all < 0) {
--			int z = 1;              /* 0215: on by default again (gpu_zero=0: 0205's way); see below */
-+			int z = 0;              /* 0332: zero small (<256 KB) buffers only by default; gpu_zero=1 zeroes all */
+ 			int z = 1;              /* 0215: on by default again (gpu_zero=0: 0205's way); see below */
  			PE_parse_boot_argn("gpu_zero", &z, sizeof(z));
  			zero_all = z != 0;
  		}
+ 		bool zeroed = pm != NULL;
+-		if (pm != NULL && (zero_all || size < 256 * 1024)) {
++		if (pm != NULL) {
+ 			IOMemoryMap *km = pm->map(kIOMapWriteCombineCache);
+ 			if (km != NULL) {
+-				bzero((void *)km->getVirtualAddress(), size);
++				if (zero_all || size < 256 * 1024) {
++					bzero((void *)km->getVirtualAddress(), size);
++				}
+ 				km->release();
+ 			} else {
+ 				zeroed = false;
+ 			}
+ 		}
+ 		IOLockLock(service_lock);
 -- 
 2.53.0
