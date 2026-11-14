@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 14:00:00 +0700
+Subject: [PATCH] sapphire-0333: gpu: adaptive fence polling - aggressive short wait, yield long wait
+
+0329 polls 10×5 µs then sleeps 25 µs. At 120 fps (8.33 ms frame budget) this is
+too conservative: typical GPU latency is 100–500 µs. Use adaptive polling:
+- First 200 µs: spin aggressively (IODelay(1) every 1 µs) for sub-µs fence catch
+- 200 µs–2 ms: poll every 5 µs (400×) to catch mid-latency completions
+- Beyond 2 ms: yield with delay_for_interval(50 µs) to avoid CPU burn
+
+Also add per-fence histogram sysctl (kern.sapphire_gpu_fence_hist) to tune.
+---
+ iokit/Kernel/arm/SapphireGpu.cpp | 65 ++++++++++++++++++++++++++++++++------
+ 1 file changed, 55 insertions(+), 10 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 2e785d1..a1b2c3d 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -3318,16 +3318,61 @@ static bool
+ msm_wait(uint32_t f, uint64_t ms)
+ {
+ 	uint64_t deadline, now;
+-	uint32_t polls = 0;
++	uint32_t polls = 0;
++	uint64_t start = mach_absolute_time();
++	static uint64_t hist[8] = {0};  /* <50us, <100us, <200us, <500us, <1ms, <2ms, <5ms, >=5ms */
+
+ 	if (msm_fence_done(f)) {
+ 		return true;
+ 	}
+
+ 	clock_deadline_for_duration(ms * NSEC_PER_MSEC, &deadline);
+
++	/* 0333: adaptive fence polling for 120 fps (8.33 ms budget) */
++	while (1) {
++		if (msm_fence_done(f)) {
++			uint64_t elapsed_ns = (mach_absolute_time() - start) * (NSEC_PER_SEC / mach_timebase_info().denom);
++			if (elapsed_ns < 50000) hist[0]++;
++			else if (elapsed_ns < 100000) hist[1]++;
++			else if (elapsed_ns < 200000) hist[2]++;
++			else if (elapsed_ns < 500000) hist[3]++;
++			else if (elapsed_ns < 1000000) hist[4]++;
++			else if (elapsed_ns < 2000000) hist[5]++;
++			else if (elapsed_ns < 5000000) hist[6]++;
++			else hist[7]++;
++			return true;
++		}
++
++		now = mach_absolute_time();
++		if (now >= deadline) {
++			uint64_t elapsed_ns = (now - start) * (NSEC_PER_SEC / mach_timebase_info().denom);
++			if (elapsed_ns >= 5000000) hist[7]++;
++			return false; /* timeout */
++		}
++
++		uint64_t elapsed_us = (now - start) / (NSEC_PER_USEC * mach_timebase_info().denom / NSEC_PER_SEC);
++
++		if (elapsed_us < 200) {
++			/* Phase 1: sub-200 µs - aggressive spin (1 µs granularity) */
++			IODelay(1);
++		} else if (elapsed_us < 2000) {
++			/* Phase 2: 200 µs–2 ms - moderate poll (5 µs) */
++			IODelay(5);
++		} else {
++			/* Phase 3: >2 ms - yield to scheduler (50 µs) */
++			delay_for_interval(50, NSEC_PER_USEC);
++		}
++		polls++;
+ 	}
+ 	return true;
+ }
++
++/* Sysctl to read fence wait histogram for tuning */
++static int
++sysctl_sapphire_gpu_fence_hist SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char out[256];
++	int error = 0;
++	size_t off = 0;
++	const char *labels[8] = {"<50us", "<100us", "<200us", "<500us", "<1ms", "<2ms", "<5ms", ">=5ms"};
++
++	for (int i = 0; i < 8; i++) {
++		int n = snprintf(out + off, sizeof(out) - off, "%s:%llu ", labels[i], (unsigned long long)hist[i]);
++		if (n < 0 || (size_t)n >= sizeof(out) - off) {
++			error = ENOMEM;
++			break;
++		}
++		off += n;
++	}
++	if (!error) {
++		error = SYSCTL_OUT(req, out, off + 1);
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sapphire_gpu_fence_hist, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sapphire_gpu_fence_hist, "A", "GPU fence wait latency histogram");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--
+2.53.0

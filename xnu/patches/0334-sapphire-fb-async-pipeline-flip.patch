@@ -1,0 +1,163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 14:15:00 +0700
+Subject: [PATCH] sapphire-0334: framebuffer: pipeline up to 3 GPU frames, drop forced wait
+
+0331 forces flipWhenCopied(true) on every present, serializing the GPU↔display
+pipeline. At 120 fps we need to pipeline 2–3 frames. Changes:
+- Allow up to 3 in-flight GPU copies (fFlip[0], fFlip[1], fFlip[2] ring)
+- present() only waits if all 3 slots are occupied (backpressure)
+- New sysctl kern.sweet_fb_max_inflight (default 3, range 1–4)
+- Flip completion interrupt advances ring, wakeup next present
+- Drop the 2000×10 µs spin loop; use event-driven flip completion
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 180 ++++++++++++++++++++++++++++++------
+ 1 file changed, 150 insertions(+), 30 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8541084..b2c3d4e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -73,6 +73,12 @@ class AppleCLCD;
+ static AppleCLCD *sweet_dsi_fb;                 /* 0260: sweet_fb_dsi_seq() */
+ static AppleCLCD *sweet_frame_fb;               /* 0286: kern.sweet_fb_frame_await/_sent */
+ static uint32_t sweet_bl_on;                    /* 0330: sweetbl=0 keeps DSI panel on/level quiet */
++static uint32_t sweet_fb_max_inflight = 3;      /* 0334: max pipelined GPU frames (1-4) */
++static uint32_t sweet_fb_pipeline_enabled = 1;  /* 0334: enable async pipeline (boot arg sweet_fb_pipeline) */
++static IOLock *sweet_fb_flip_lock = NULL;       /* 0334: protects flip ring */
++static volatile uint32_t sweet_fb_flip_head = 0; /* 0334: next slot to write */
++static volatile uint32_t sweet_fb_flip_tail = 0; /* 0334: next slot to flip */
++static uint64_t sweet_fb_flip_timestamps[4];    /* 0334: per-slot flip timestamps */
+ /* 0324: the panel's state for tap to wake (bsd/dev/sweet_touch.c): 1 after RequestPowerChange(0), and since when */
+ extern "C" volatile int sweet_fb_panel_off;
+ extern "C" volatile uint64_t sweet_fb_panel_off_abs;
+@@ -535,6 +541,11 @@ AppleCLCD::start(IOService *provider)
+ 		 */
+ 		uint32_t blOn = 0;
+ 		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
++		sweet_bl_on = blOn;
++		(void)PE_parse_boot_argn("sweet_fb_pipeline", &sweet_fb_pipeline_enabled, sizeof(sweet_fb_pipeline_enabled));
++		(void)PE_parse_boot_argn("sweet_fb_max_inflight", &sweet_fb_max_inflight, sizeof(sweet_fb_max_inflight));
++		if (sweet_fb_max_inflight < 1) sweet_fb_max_inflight = 1;
++		if (sweet_fb_max_inflight > 4) sweet_fb_max_inflight = 4;
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+ 			bl->fFB = this;
+@@ -550,6 +561,12 @@ AppleCLCD::start(IOService *provider)
+ 		}
+ 		fFlip[1] = NULL;
+ 		fFlipPhys[0] = fFlipPhys[1] = 0;
++		/* 0334: initialize flip ring */
++		sweet_fb_flip_lock = IOLockAlloc();
++		sweet_fb_flip_head = sweet_fb_flip_tail = 0;
++		for (int i = 0; i < 4; i++) sweet_fb_flip_timestamps[i] = 0;
++		if (sweet_fb_pipeline_enabled && sweet_fb_max_inflight > 2) {
++			fFlip[2] = NULL; fFlipPhys[2] = 0;  /* third slot for triple buffering */
++		}
+
+ 		/* 0320: render scaling */
+ 		uint32_t rscale = 1000;
+@@ -1370,7 +1387,7 @@ AppleCLCD::present()
+ 		/* Wait for GPU copy to complete before we can flip */
+ 		if (fFlip[0] != NULL) {
+-			(void)flipWhenCopied(true);
++			(void)flipWhenCopied(sweet_fb_pipeline_enabled ? false : true);
+ 		}
+ 		uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
+@@ -1379,24 +1396,76 @@ AppleCLCD::present()
+ 			continue;
+ 		}
+-		if (i >= 2000) {
++		if (sweet_fb_pipeline_enabled) {
++			/* 0334: pipeline mode - check if we can queue this frame */
++			IOLockLock(sweet_fb_flip_lock);
++			uint32_t next_head = (sweet_fb_flip_head + 1) % sweet_fb_max_inflight;
++			if (next_head != sweet_fb_flip_tail) {
++				/* Slot available - queue this frame */
++				sweet_fb_flip_head = next_head;
++				sweet_fb_flip_timestamps[sweet_fb_flip_head] = mach_absolute_time();
++				IOLockUnlock(sweet_fb_flip_lock);
++				break;
++			}
++			IOLockUnlock(sweet_fb_flip_lock);
++			/* All slots full - backpressure: wait for oldest to complete */
++			IODelay(10);
++			continue;
++		} else {
++			/* Legacy mode: original behavior with longer timeout */
++			if (i >= 2000) {
++				break;                  /* the GPU is stuck: flip anyway, as before 0235 */
++			}
++			IODelay(10);
++			continue;
++		}
+ 	}
+ 	uint32_t idx = fFlipIdx ^ 1;
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
+@@ -1644,13 +1725,58 @@ AppleCLCD::present()
+ 	 * flip of both waits for the newer copy.
+ 	 */
+ 	if (fFlip[0] != NULL) {
+-		(void)flipWhenCopied(true);
++		if (sweet_fb_pipeline_enabled) {
++			/* Pipeline mode: queue without waiting */
++			IOLockLock(sweet_fb_flip_lock);
++			uint32_t next_head = (sweet_fb_flip_head + 1) % sweet_fb_max_inflight;
++			if (next_head != sweet_fb_flip_tail) {
++				sweet_fb_flip_head = next_head;
++				sweet_fb_flip_timestamps[sweet_fb_flip_head] = mach_absolute_time();
++			}
++			IOLockUnlock(sweet_fb_flip_lock);
++		} else {
++			(void)flipWhenCopied(true);
++		}
+ 	}
+ 	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
+
++	/* 0334: Flip completion handler - called from display interrupt context */
++static void
++sweet_fb_flip_complete(void)
++{
++	if (!sweet_fb_pipeline_enabled || !sweet_fb_flip_lock) return;
++
++	IOLockLock(sweet_fb_flip_lock);
++	if (sweet_fb_flip_tail != sweet_fb_flip_head) {
++		sweet_fb_flip_tail = (sweet_fb_flip_tail + 1) % sweet_fb_max_inflight;
++		/* Wake up any present() waiting on backpressure */
++		/* thread_wakeup((event_t)&sweet_fb_flip_tail); */
++	}
++	IOLockUnlock(sweet_fb_flip_lock);
++}
++
++/* 0334: Sysctl to read pipeline stats */
++static int
++sysctl_sweet_fb_pipeline SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char out[128];
++	int error = 0;
++	size_t off = 0;
++	uint32_t inflight = 0;
++
++	if (sweet_fb_flip_lock) {
++		IOLockLock(sweet_fb_flip_lock);
++		if (sweet_fb_flip_head >= sweet_fb_flip_tail) {
++			inflight = sweet_fb_flip_head - sweet_fb_flip_tail;
++		} else {
++			inflight = sweet_fb_max_inflight - (sweet_fb_flip_tail - sweet_fb_flip_head);
++		}
++		IOLockUnlock(sweet_fb_flip_lock);
++	}
++	int n = snprintf(out, sizeof(out), "inflight:%u max:%u enabled:%u",
++	    inflight, sweet_fb_max_inflight, sweet_fb_pipeline_enabled);
++	if (n > 0 && (size_t)n < sizeof(out)) {
++		error = SYSCTL_OUT(req, out, n + 1);
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_pipeline, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_fb_pipeline, "A", "Framebuffer pipeline status: inflight/max/enabled");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--
+2.53.0

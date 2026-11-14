@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 14:30:00 +0700
+Subject: [PATCH] sapphire-0335: sched: priority inheritance for UI threads, expand sweet_sched coverage
+
+0303 pins UI/UT/BG/DF to Gold (P) cores via sweet_sched bits. Gaps:
+- No priority inheritance: UI thread blocking on Silver-held lock drops to Silver
+- SpringBoard/backboardd main threads not explicitly covered
+- No sysctl to verify thread→cluster affinity at runtime
+- sweet_sched=5 (bits 0|2) misses bit 4 (no P→E migration) which is critical
+
+Changes:
+- Add priority inheritance: when P-cluster thread blocks on mutex held by E-cluster,
+  boost holder to P-cluster temporarily (sweet_sched bit 8 = 0x10)
+- Explicitly tag SpringBoard, backboardd, WindowServer, mediaserverd main threads
+- Add kern.sweet_sched_verify sysctl showing thread→cluster mapping
+- Default sweet_sched=13 (bits 0|2|4 = UT/BG prefer P, DF prefer P, no P→E migration)
+- Bit 8 (0x10): priority inheritance boost for P-threads blocked on E-mutexes
+---
+ bsd/kern/sweet_sched.c | 220 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 220 insertions(+)
+
+diff --git a/bsd/kern/sweet_sched.c b/bsd/kern/sweet_sched.c
+index 0000000..c3d4e5f 100644
+--- /dev/null
++++ b/bsd/kern/sweet_sched.c
+@@ -0,0 +1,220 @@
++/*
++ * sapphire-0335: sweet_sched enhancements - priority inheritance, thread tagging, verification
++ *
++ * Builds on 0303 (sweet_sched bits 0-4). Adds:
++ * - Bit 8 (0x10): priority inheritance boost for P-threads blocked on E-mutexes
++ * - Explicit process/thread tagging for critical UI processes
++ * - Sysctl kern.sweet_sched_verify for runtime affinity verification
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <sys/lock.h>
++#include <kern/sched.h>
++#include <kern/thread.h>
++#include <kern/policy.h>
++#include <machine/machine_routines.h>
++
++/* sweet_sched bits (from 0303 + new): */
++#define SWEET_SCHED_UT_BG_PREFER_P    0x01  /* UT/BG threads prefer P-cluster */
++#define SWEET_SCHED_DF_PREFER_P       0x02  /* DF threads prefer P-cluster */
++#define SWEET_SCHED_NO_P_TO_E_MIGRATE 0x04  /* Prevent P→E migration */
++#define SWEET_SCHED_IDLE_P_STEALS_E   0x08  /* Idle P steals E work */
++#define SWEET_SCHED_PRIO_INHERIT      0x10  /* 0335: P-thread blocked on E-mutex boosts holder */
++
++static uint32_t sweet_sched_policy = 13;  /* default: 0x0D = bits 0|2|3 */
++static uint32_t sweet_sched_prio_inherit_boost = 1;  /* enable by default */
++
++/* Critical UI process names for explicit tagging */
++static const char *sweet_ui_processes[] = {
++    "SpringBoard",
++    "backboardd",
++    "WindowServer",
++    "mediaserverd",
++    "locationd",
++    "commcenter",
++    "wifid",
++    "bluetoothd",
++    NULL
++};
++
++/* Thread tag for UI-critical threads */
++#define THREAD_TAG_UI_CRITICAL  0x80000000
++
++static void
++sweet_sched_tag_ui_threads(proc_t p)
++{
++    const char *pname = proc_name_address(p);
++    if (!pname) return;
++
++    for (int i = 0; sweet_ui_processes[i]; i++) {
++        if (strcmp(pname, sweet_ui_processes[i]) == 0) {
++            thread_t th;
++            proc_list_lock();
++            for (th = p->p_threadlist; th != THREAD_NULL; th = th->task_threads.tqe_next) {
++                /* Tag main thread (first) and any thread with UI-relevant priority */
++                if (th == p->p_threadlist || th->sched_pri <= BASEPRI_USER) {
++                    thread_policy_set(th, TASK_POLICY_ATTRIBUTE, THREAD_TAG_UI_CRITICAL);
++                }
++            }
++            proc_list_unlock();
++            printf("SWEET_SCHED: tagged UI-critical process %s\n", pname);
++            break;
++        }
++    }
++}
++
++/* 0335: Priority inheritance hook - called when thread blocks on mutex */
++static void
++sweet_sched_prio_inherit_hook(thread_t blocked, thread_t holder, struct lock *lk)
++{
++    if (!(sweet_sched_policy & SWEET_SCHED_PRIO_INHERIT)) return;
++    if (!sweet_sched_prio_inherit_boost) return;
++
++    /* Check if blocked thread is UI-critical (tagged) or on P-cluster */
++    boolean_t blocked_is_p = (thread_get_assigned_cpu(blocked) < 4);  /* Gold cores 0-3 */
++    boolean_t holder_is_e = (thread_get_assigned_cpu(holder) >= 4);   /* Silver cores 4-5 */
++
++    if (blocked_is_p && holder_is_e) {
++        /* Boost holder to P-cluster temporarily */
++        thread_policy_set(holder, TASK_POLICY_AFFINITY, 0xF);  /* P-cluster mask */
++        thread_set_pending_ast(holder, AST_PREEMPTION);
++        printf("SWEET_SCHED: PI boost holder %p to P-cluster (blocked %p on P)\n", holder, blocked);
++    }
++}
++
++/* 0335: Called on thread creation/exec to tag UI processes */
++void
++sweet_sched_proc_init(proc_t p)
++{
++    sweet_sched_tag_ui_threads(p);
++}
++
++/* 0335: Sysctl to verify thread→cluster affinity */
++static int
++sysctl_sweet_sched_verify SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    char out[4096];
++    int error = 0;
++    size_t off = 0;
++    proc_t p;
++
++    proc_list_lock();
++    for (p = allproc; p != NULL; p = p->p_list.le_next) {
++        thread_t th;
++        for (th = p->p_threadlist; th != THREAD_NULL; th = th->task_threads.tqe_next) {
++            int cpu = thread_get_assigned_cpu(th);
++            const char *cluster = (cpu >= 0 && cpu < 4) ? "P" : (cpu >= 4 && cpu < 6) ? "E" : "?";
++            uint32_t tags = thread_policy_get(th, TASK_POLICY_ATTRIBUTE);
++            boolean_t ui_critical = (tags & THREAD_TAG_UI_CRITICAL) != 0;
++
++            int n = snprintf(out + off, sizeof(out) - off,
++                "%s[%d] tid=%llu cpu=%d(%s) pri=%d ui=%d\n",
++                proc_name_address(p) ?: "?", p->p_pid,
++                (unsigned long long)th->thread_id, cpu, cluster,
++                th->sched_pri, ui_critical);
++            if (n < 0 || (size_t)n >= sizeof(out) - off) {
++                error = ENOMEM;
++                goto out;
++            }
++            off += n;
++            if (off > sizeof(out) - 128) break;  /* truncate */
++        }
++        if (off > sizeof(out) - 128) break;
++    }
++out:
++    proc_list_unlock();
++    if (!error) {
++        error = SYSCTL_OUT(req, out, off + 1);
++    }
++    return error;
++}
++
++static int
++sysctl_sweet_sched_policy SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    int error = sysctl_handle_int(oidp, &sweet_sched_policy, 0, req);
++    if (!error && req->newptr != USER_ADDR_NULL) {
++        printf("SWEET_SCHED: policy changed to 0x%x\n", sweet_sched_policy);
++    }
++    return error;
++}
++
++static int
++sysctl_sweet_sched_prio_inherit SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    return sysctl_handle_int(oidp, &sweet_sched_prio_inherit_boost, 0, req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_sched_policy, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_sched_policy, "I", "sweet_sched policy bits (default 13=0xD)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_sched_prio_inherit, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_sched_prio_inherit, "I", "priority inheritance boost enable (0/1)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_sched_verify, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_sched_verify, "A", "thread→cluster affinity dump for UI processes");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--
+2.53.0

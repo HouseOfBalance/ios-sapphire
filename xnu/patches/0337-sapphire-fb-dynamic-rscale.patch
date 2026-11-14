@@ -1,0 +1,170 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 15:00:00 +0700
+Subject: [PATCH] sapphire-0337: framebuffer: dynamic render scaling based on GPU load
+
+0320/0321 implement static render scaling (sweet_fb_rscale permille, default 750).
+At 120 fps, GPU load varies: home screen ~30%, games ~90%. Static 75% wastes
+quality when GPU has headroom, starves when loaded.
+
+Changes:
+- Dynamic rscale: target 70% GPU utilization, adjust ±50 permille per frame
+- Min 500 (50%), max 1000 (100%), step 50 permille (5%)
+- GPU utilization from fence wait time vs frame budget (8.33 ms at 120 Hz)
+- Sysctl kern.sweet_fb_dynamic_rscale (0/1), kern.sweet_fb_rscale_target (permille, default 700)
+- Boot args: sweet_fb_dyn_rscale=1, sweet_fb_rscale_target=700
+- Smooth transition: blend over 4 frames to avoid pop
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 120 +++++++++++++++++++++++++++++++---
+ 1 file changed, 105 insertions(+), 15 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index b2c3d4e..e5f6a7b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -79,6 +79,15 @@ static uint32_t sweet_bl_on;                    /* 0330: sweetbl=0 keeps DSI panel on/level quiet */
+ static uint32_t sweet_fb_max_inflight = 3;      /* 0334: max pipelined GPU frames (1-4) */
+ static uint32_t sweet_fb_pipeline_enabled = 1;  /* 0334: enable async pipeline (boot arg sweet_fb_pipeline) */
+ static IOLock *sweet_fb_flip_lock = NULL;       /* 0334: protects flip ring */
++static uint32_t sweet_fb_dynamic_rscale = 0;    /* 0337: enable dynamic render scaling */
++static uint32_t sweet_fb_rscale_target = 700;   /* 0337: target GPU util permille (700=70%) */
++static uint32_t sweet_fb_rscale_min = 500;      /* 0337: min scale permille (50%) */
++static uint32_t sweet_fb_rscale_max = 1000;     /* 0337: max scale permille (100%) */
++static uint32_t sweet_fb_rscale_step = 50;      /* 0337: adjustment step permille (5%) */
++static int32_t sweet_fb_current_rscale = 750;   /* 0337: current scale (permille) */
++static int32_t sweet_fb_target_rscale = 750;    /* 0337: target scale for smooth transition */
++static uint32_t sweet_fb_transition_frames = 0; /* 0337: frames left in transition */
++static uint64_t sweet_fb_gpu_busy_ns = 0;       /* 0337: GPU busy time this frame */
++static uint64_t sweet_fb_frame_start_ns = 0;    /* 0337: frame start timestamp */
+ static volatile uint32_t sweet_fb_flip_head = 0; /* 0334: next slot to write */
+ static volatile uint32_t sweet_fb_flip_tail = 0; /* 0334: next slot to flip */
+ static uint64_t sweet_fb_flip_timestamps[4];    /* 0334: per-slot flip timestamps */
+@@ -547,6 +556,16 @@ AppleCLCD::start(IOService *provider)
+ 		if (sweet_fb_max_inflight < 1) sweet_fb_max_inflight = 1;
+ 		if (sweet_fb_max_inflight > 4) sweet_fb_max_inflight = 4;
+
++		/* 0337: dynamic render scaling config */
++		(void)PE_parse_boot_argn("sweet_fb_dyn_rscale", &sweet_fb_dynamic_rscale, sizeof(sweet_fb_dynamic_rscale));
++		(void)PE_parse_boot_argn("sweet_fb_rscale_target", &sweet_fb_rscale_target, sizeof(sweet_fb_rscale_target));
++		(void)PE_parse_boot_argn("sweet_fb_rscale_min", &sweet_fb_rscale_min, sizeof(sweet_fb_rscale_min));
++		(void)PE_parse_boot_argn("sweet_fb_rscale_max", &sweet_fb_rscale_max, sizeof(sweet_fb_rscale_max));
++		if (sweet_fb_rscale_target < 500) sweet_fb_rscale_target = 500;
++		if (sweet_fb_rscale_target > 1000) sweet_fb_rscale_target = 1000;
++		if (sweet_fb_rscale_min < 300) sweet_fb_rscale_min = 300;
++		if (sweet_fb_rscale_max > 1000) sweet_fb_rscale_max = 1000;
++		sweet_fb_current_rscale = sweet_fb_target_rscale = sweet_fb_rscale;  /* from 0320 sweet_fb_rscale */
++
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+ 			bl->fFB = this;
+@@ -1390,6 +1409,25 @@ AppleCLCD::present()
+ 			continue;
+ 		}
+
++		/* 0337: Frame start - record timestamp for GPU util calculation */
++		if (sweet_fb_dynamic_rscale && sweet_fb_frame_start_ns == 0) {
++			sweet_fb_frame_start_ns = mach_absolute_time();
++			sweet_fb_gpu_busy_ns = 0;
++		}
++
++		/* 0337: Dynamic render scaling adjustment (once per frame) */
++		if (sweet_fb_dynamic_rscale && sweet_fb_transition_frames == 0) {
++			sweet_fb_adjust_rscale();
++		}
++
+ 		if (sweet_fb_pipeline_enabled) {
+ 			/* 0334: pipeline mode - check if we can queue this frame */
+ 			IOLockLock(sweet_fb_flip_lock);
+@@ -1450,6 +1488,65 @@ AppleCLCD::present()
+ 	}
+ 	uint32_t idx = fFlipIdx ^ 1;
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
++
++	/* 0337: Frame end - accumulate GPU busy time */
++	if (sweet_fb_dynamic_rscale) {
++		uint64_t now = mach_absolute_time();
++		if (sweet_fb_frame_start_ns) {
++			sweet_fb_gpu_busy_ns += (now - sweet_fb_frame_start_ns);
++			sweet_fb_frame_start_ns = 0;
++		}
++	}
+ }
+
++/* 0337: Adjust render scale based on GPU utilization */
++void
++sweet_fb_adjust_rscale(void)
++{
++    uint64_t frame_budget_ns = 8333333;  /* 120 Hz = 8.33 ms */
++    uint64_t gpu_busy_ns = sweet_fb_gpu_busy_ns;
++
++    if (frame_budget_ns == 0) return;
++
++    /* GPU utilization in permille */
++    uint32_t gpu_util = (uint32_t)((gpu_busy_ns * 1000) / frame_budget_ns);
++
++    /* Adjust target scale */
++    if (gpu_util > sweet_fb_rscale_target + 50) {  /* >75% util -> reduce scale */
++        if (sweet_fb_target_rscale > sweet_fb_rscale_min + sweet_fb_rscale_step) {
++            sweet_fb_target_rscale -= sweet_fb_rscale_step;
++        } else if (sweet_fb_target_rscale > sweet_fb_rscale_min) {
++            sweet_fb_target_rscale = sweet_fb_rscale_min;
++        }
++    } else if (gpu_util < sweet_fb_rscale_target - 50) {  /* <65% util -> increase scale */
++        if (sweet_fb_target_rscale < sweet_fb_rscale_max - sweet_fb_rscale_step) {
++            sweet_fb_target_rscale += sweet_fb_rscale_step;
++        } else if (sweet_fb_target_rscale < sweet_fb_rscale_max) {
++            sweet_fb_target_rscale = sweet_fb_rscale_max;
++        }
++    }
++
++    /* Start smooth transition over 4 frames */
++    if (sweet_fb_current_rscale != sweet_fb_target_rscale) {
++        sweet_fb_transition_frames = 4;
++    }
++}
++
++/* 0337: Apply current render scale (called per frame) */
++uint32_t
++sweet_fb_get_current_rscale(void)
++{
++    if (!sweet_fb_dynamic_rscale) {
++        return sweet_fb_rscale;  /* static from 0320 */
++    }
++
++    /* Smooth transition */
++    if (sweet_fb_transition_frames > 0) {
++        int32_t diff = sweet_fb_target_rscale - sweet_fb_current_rscale;
++        int32_t step = diff / sweet_fb_transition_frames;
++        if (step == 0) step = (diff > 0) ? 1 : -1;
++        sweet_fb_current_rscale += step;
++        sweet_fb_transition_frames--;
++    }
++
++    return (uint32_t)sweet_fb_current_rscale;
++}
++
++/* 0337: Sysctl for dynamic rscale status */
++static int
++sysctl_sweet_fb_dynamic_rscale SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    char out[256];
++    int error = 0;
++    size_t off = 0;
++
++    off += snprintf(out + off, sizeof(out) - off,
++        "enabled:%u current:%d target:%d min:%u max:%u step:%u trans:%u gpu_util:%llu‰",
++        sweet_fb_dynamic_rscale, sweet_fb_current_rscale, sweet_fb_target_rscale,
++        sweet_fb_rscale_min, sweet_fb_rscale_max, sweet_fb_rscale_step,
++        sweet_fb_transition_frames,
++        sweet_fb_frame_start_ns ? (sweet_fb_gpu_busy_ns * 1000 / 8333333) : 0);
++
++    if (!error) error = SYSCTL_OUT(req, out, off + 1);
++    return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_dynamic_rscale, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_fb_dynamic_rscale, "A", "dynamic render scale status: current/target/min/max/transition/gpu_util");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--
+2.53.0
