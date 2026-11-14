@@ -1,12 +1,11 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sapphire <sapphire@local>
 Date: Sat, 14 Nov 2026 13:30:00 +0700
-Subject: [PATCH] sapphire-0332: gpu: persistent gpool WC mapping and small-only zero default
+Subject: [PATCH] sapphire-0332: gpu: small-only zero default without persistent 1G map
 
-Default gpu_zero to 0 so large render targets are not zeroed on every
-GEM_NEW, and keep one persistent write-combined mapping of GPOOL_PA so
-zeroing small buffers no longer creates and tears down a kernel IOMemoryMap
-(and cross-CPU TLB shootdowns) per allocation.
+Default gpu_zero to 0 so large render targets (>= 256 KB) are not zeroed
+on every GEM_NEW, avoiding per-allocation 0.5 ms WC bzero stalls without
+mapping the 1 GiB GPOOL_PA range into compact 4K kernel VA space.
 ---
  iokit/Kernel/arm/SapphireGpu.cpp | edit
  1 file changed
@@ -14,55 +13,13 @@ zeroing small buffers no longer creates and tears down a kernel IOMemoryMap
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 --- a/iokit/Kernel/arm/SapphireGpu.cpp
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -3762,19 +3762,43 @@
- 		 * showed white frames (and once the whole screen went yellow), which gpu_zero=1 took away.
- 		 */
+@@ -3762,6 +3762,6 @@
  		static int zero_all = -1;
-+		static IOMemoryMap *gpool_map = NULL;
-+		static uint8_t *gpool_va = NULL;
-+		static bool gpool_tried = false;
  		if (zero_all < 0) {
 -			int z = 1;              /* 0215: on by default again (gpu_zero=0: 0205's way); see below */
-+			int z = 0;              /* 0332: small buffers only by default; persistent WC mapping avoids per-alloc TLB shootdowns */
++			int z = 0;              /* 0332: zero small (<256 KB) buffers only by default; gpu_zero=1 zeroes all */
  			PE_parse_boot_argn("gpu_zero", &z, sizeof(z));
  			zero_all = z != 0;
  		}
- 		bool zeroed = pm != NULL;
- 		if (pm != NULL && (zero_all || size < 256 * 1024)) {
--			IOMemoryMap *km = pm->map(kIOMapWriteCombineCache);
--			if (km != NULL) {
--				bzero((void *)km->getVirtualAddress(), size);
--				km->release();
-+			if (gpool_va == NULL && !gpool_tried) {
-+				IOMemoryMap *m = map_phys(GPOOL_PA, GPOOL_SIZE, true);
-+				IOLockLock(service_lock);
-+				if (gpool_va == NULL) {
-+					gpool_tried = true;
-+					gpool_map = m;
-+					if (gpool_map != NULL) {
-+						__asm__ volatile ("dmb ish" ::: "memory");
-+						gpool_va = (uint8_t *)gpool_map->getVirtualAddress();
-+					}
-+					m = NULL;
-+				}
-+				IOLockUnlock(service_lock);
-+				if (m != NULL) {
-+					m->release();
-+				}
-+			}
-+			if (gpool_va != NULL) {
-+				bzero(gpool_va + (pa - GPOOL_PA), size);
- 			} else {
--				zeroed = false;
-+				IOMemoryMap *km = pm->map(kIOMapWriteCombineCache);
-+				if (km != NULL) {
-+					bzero((void *)km->getVirtualAddress(), size);
-+					km->release();
-+				} else {
-+					zeroed = false;
-+				}
- 			}
- 		}
- 		IOLockLock(service_lock);
 -- 
 2.53.0

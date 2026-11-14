@@ -6,9 +6,8 @@ Subject: [PATCH] sapphire-0331: framebuffer: do not overwrite pending GPU flip b
 In AppleCLCD::present(), flipWhenCopied(!gpu_frame) let pipelined GPU
 frames overwrite the same back buffer and push last_copy_fence forward
 indefinitely without ever flipping during continuous animation. Always
-wait for any pending copy to flip first (flipWhenCopied(true)), poll in
-10 us increments, and also try flipWhenCopied(false) right after queuing
-the 2D blit.
+wait for any pending copy to flip first (flipWhenCopied(true)) and poll
+in 10 us increments before writing into the back flip buffer.
 ---
  iokit/Kernel/arm/SweetFramebuffer.cpp | edit
  1 file changed
@@ -38,13 +37,5 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	}
  	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
  	if (fFlip[0] == NULL && fVig0 != NULL && fScanPhys != fBootSrc) {
-@@ -1824,6 +1824,7 @@
- 		 */
- 		if (fFlip[0] != NULL) {
- 			fFlipWait = true;
-+			(void)flipWhenCopied(false);
- 		}
- 		if (sweet_fb_stats_on()) {
- 			sweet_fb_stats.gpu++;
 -- 
 2.53.0
