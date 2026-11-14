@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 13:30:00 +0700
+Subject: [PATCH] sapphire-0331: framebuffer: do not overwrite pending GPU flip buffer
+
+In AppleCLCD::present(), flipWhenCopied(!gpu_frame) let pipelined GPU
+frames overwrite the same back buffer and push last_copy_fence forward
+indefinitely without ever flipping during continuous animation. Always
+wait for any pending copy to flip first (flipWhenCopied(true)), poll in
+10 us increments, and also try flipWhenCopied(false) right after queuing
+the 2D blit.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | edit
+ 1 file changed
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1379,10 +1379,10 @@
+ 			IODelay(20);
+ 			continue;
+ 		}
+-		if (i >= 200) {
++		if (i >= 2000) {
+ 			break;                  /* the GPU is stuck: flip anyway, as before 0235 */
+ 		}
+-		IODelay(100);
++		IODelay(10);
+ 	}
+ 	uint32_t idx = fFlipIdx ^ 1;
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
+@@ -1644,7 +1644,7 @@
+ 	 * flip of both waits for the newer copy.
+ 	 */
+ 	if (fFlip[0] != NULL) {
+-		(void)flipWhenCopied(!gpu_frame);
++		(void)flipWhenCopied(true);
+ 	}
+ 	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
+ 	if (fFlip[0] == NULL && fVig0 != NULL && fScanPhys != fBootSrc) {
+@@ -1824,6 +1824,7 @@
+ 		 */
+ 		if (fFlip[0] != NULL) {
+ 			fFlipWait = true;
++			(void)flipWhenCopied(false);
+ 		}
+ 		if (sweet_fb_stats_on()) {
+ 			sweet_fb_stats.gpu++;
+-- 
+2.53.0
