@@ -1,4 +1,4 @@
-# 0339-0342: Boot arguments for all performance optimizations (Phase 2)
+# 0339-0343: Boot arguments for all performance optimizations (Phase 2)
 # Append to existing boot args in /redwood/boot-args.txt or equivalent
 BOOT_ARGS_FILE="/redwood/boot-args.txt"
 TOUCH_BOOT_ARGS="/redwood/boot-args.d/99-performance.conf"
@@ -6,14 +6,14 @@ TOUCH_BOOT_ARGS="/redwood/boot-args.d/99-performance.conf"
 mkdir -p /redwood/boot-args.d
 
 cat > "$TOUCH_BOOT_ARGS" <<'EOF'
-# Sapphire 0339-0342 Phase 2 Performance Boot Arguments
+# Sapphire 0339-0343 Phase 2 Performance Boot Arguments
 
 # GPU Pipeline (0333, 0338)
 gpu_batch_us=200
 gpu_batch_max=64
 gpu_shader_cache=1
 
-# Display Pipeline (0334, 0337)
+# Display Pipeline (0334, 0337, 0343)
 sweet_fb_pipeline=1
 sweet_fb_max_inflight=3
 sweet_fb_dyn_rscale=1

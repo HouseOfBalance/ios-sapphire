@@ -24,7 +24,21 @@ mkdir -p /private/var/cache/mesa_buffer_pool
 chown mobile:mobile /private/var/cache/mesa_buffer_pool
 chmod 1777 /private/var/cache/mesa_buffer_pool
 
-# 0341: Force Mesa environment for GPU processes
+# 0341: Force Mesa environment for GPU processes via /redwood/glenv (read by eagl.c at load time)
+cat > /redwood/glenv <<'EOF'
+# Mesa/freedreno environment for GMEM tiling and performance (0341)
+# This file is read by libredwood-gl.dylib (eagl.c) on every GPU process launch
+# Empty FD_MESA_DEBUG forces GMEM tiling, disables sysmem fallback
+FD_MESA_DEBUG=
+mesa_glthread=true
+mesa_async_flush=true
+FD_PERF=1
+FD_DEBUG=0
+IR3_SHADER_DEBUG=0
+EOF
+chmod 644 /redwood/glenv
+
+# Also create boot.d script for processes that don't use eagl.c
 cat > /redwood/boot.d/56-mesa-env.sh <<'EOF'
 #!/bin/bash
 # Apply Mesa/freedreno environment variables for GPU processes
