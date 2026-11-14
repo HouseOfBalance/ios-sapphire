@@ -1,0 +1,29 @@
+0329: SapphireGpu: fast-path poll up to 50 us (10 x IODelay(5)) in msm_wait before falling back to delay_for_interval(25, NSEC_PER_USEC)
+
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 109953f..2e785d1 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -3321,6 +3321,7 @@ static bool
+ msm_wait(uint32_t f, uint64_t ms)
+ {
+ 	uint64_t deadline, now;
++	uint32_t polls = 0;
+ 
+ 	if (msm_fence_done(f)) {
+ 		return true;
+@@ -3342,7 +3343,13 @@ msm_wait(uint32_t f, uint64_t ms)
+ 			}
+ 			return false;
+ 		}
+-		delay_for_interval(50, NSEC_PER_USEC);
++		/* 0329: fast-path poll up to 50 us before sleeping (delay_for_interval sleeps 50-150+ us) */
++		if (polls < 10u) {
++			IODelay(5);
++			polls++;
++		} else {
++			delay_for_interval(25, NSEC_PER_USEC);
++		}
+ 	}
+ 	return true;
+ }

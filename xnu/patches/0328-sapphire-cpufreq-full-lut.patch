@@ -1,0 +1,192 @@
+From 56a3a690715ed3f02f89c09995d8e31d3508268c Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 14 Nov 2026 12:14:30 +0700
+Subject: [PATCH] sapphire-0328: full 40-row cpufreq LUT and kern.sweet_cpufreq
+ sysctl
+
+---
+ bsd/dev/sweet_cpufreq.c | 132 +++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 122 insertions(+), 10 deletions(-)
+
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 128fd74..b863e35 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -4,11 +4,18 @@
+  * layout): LUT at +0x110, 32-byte rows, PERF_STATE at +0x920.
+  * sapphire 0216: the Silver cluster too (freq-domain0 at 0xf521000), now
+  * that a 4 KiB-page kernel runs it as the E cluster.
++ * sapphire 0328: full 40-row LUT (Snapdragon 685 upper OPPs up to 2.80 GHz
++ * gold / 1.90 GHz silver sit past row 12) and kern.sweet_cpufreq sysctl.
+  * Nothing scales it down again: there is no XNU cpufreq driver yet.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <pexpert/pexpert.h>
+ #include <machine/machine_routines.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -19,20 +26,52 @@ int sweet_cpufreq_max(void);
+ #define CPUFREQ_FREQ_LUT        0x110u
+ #define CPUFREQ_LUT_ROW         0x20u
+ #define CPUFREQ_PERF_STATE      0x920u
+-#define CPUFREQ_LUT_MAX         12
++#define CPUFREQ_LUT_MAX         40
++
++struct sweet_cpufreq_domain {
++	const char *name;
++	uint32_t pa;
++	vm_offset_t base;
++};
++
++static struct sweet_cpufreq_domain cpufreq_domains[] = {
++	{ "gold",   CPUFREQ_GOLD_PA,   0 },
++	{ "silver", CPUFREQ_SILVER_PA, 0 },
++};
++
++static LCK_GRP_DECLARE(sweet_cpufreq_grp, "sweet_cpufreq");
++static LCK_MTX_DECLARE(sweet_cpufreq_lock, &sweet_cpufreq_grp);
++
++static vm_offset_t
++sweet_cpufreq_map_locked(struct sweet_cpufreq_domain *dom)
++{
++	if (dom->base == 0) {
++		dom->base = ml_io_map(dom->pa, 0x1000);
++	}
++	return dom->base;
++}
++
++static uint32_t
++sweet_cpufreq_lut_khz(vm_offset_t base, uint32_t row)
++{
++	if (row >= (uint32_t)CPUFREQ_LUT_MAX) {
++		return 0;
++	}
++	uint32_t v = *(volatile uint32_t *)(base + CPUFREQ_FREQ_LUT + row * CPUFREQ_LUT_ROW);
++	uint32_t src = (v >> 30) & 3u, lval = v & 0xffu;
++	return src ? 19200u * lval : 300000u;
++}
+ 
+ static int
+-sweet_cpufreq_domain_max(uint32_t pa, const char *name)
++sweet_cpufreq_domain_max_locked(struct sweet_cpufreq_domain *dom)
+ {
+-	vm_offset_t b = ml_io_map(pa, 0x1000);
++	vm_offset_t b = sweet_cpufreq_map_locked(dom);
+ 	if (b == 0) {
+ 		return -1;
+ 	}
+ 	uint32_t best = 0, bestKHz = 0, prevKHz = 0;
+-	for (uint32_t i = 0; i < CPUFREQ_LUT_MAX; i++) {
+-		uint32_t v = *(volatile uint32_t *)(b + CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
+-		uint32_t src = (v >> 30) & 3u, lval = v & 0xffu;
+-		uint32_t khz = src ? 19200u * lval : 300000u;
++	for (uint32_t i = 0; i < (uint32_t)CPUFREQ_LUT_MAX; i++) {
++		uint32_t khz = sweet_cpufreq_lut_khz(b, i);
+ 		if (i > 0 && khz == prevKHz) {
+ 			break;          /* the LUT repeats its last entry */
+ 		}
+@@ -46,10 +85,55 @@ sweet_cpufreq_domain_max(uint32_t pa, const char *name)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	*(volatile uint32_t *)(b + CPUFREQ_PERF_STATE) = best;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+-	printf("SWEET CPUFREQ: %s perf state %u -> %u (%u MHz)\n", name, old, best, bestKHz / 1000);
++	printf("SWEET CPUFREQ: %s perf state %u -> %u (%u MHz)\n", dom->name, old, best, bestKHz / 1000u);
++	return 0;
++}
++
++static int
++sweet_cpufreq_domain_read_locked(struct sweet_cpufreq_domain *dom, uint32_t *state_out, uint32_t *mhz_out)
++{
++	vm_offset_t b = sweet_cpufreq_map_locked(dom);
++	if (b == 0) {
++		return -1;
++	}
++	uint32_t state = *(volatile uint32_t *)(b + CPUFREQ_PERF_STATE);
++	*state_out = state;
++	*mhz_out = sweet_cpufreq_lut_khz(b, state) / 1000u;
+ 	return 0;
+ }
+ 
++static int
++sweet_cpufreq_format(char *buf, size_t len)
++{
++	if (len == 0) {
++		return EINVAL;
++	}
++	size_t off = 0;
++	int rc = 0;
++
++	lck_mtx_lock(&sweet_cpufreq_lock);
++	for (size_t i = 0; i < sizeof(cpufreq_domains) / sizeof(cpufreq_domains[0]); i++) {
++		uint32_t state = 0, mhz = 0;
++		if (sweet_cpufreq_domain_read_locked(&cpufreq_domains[i], &state, &mhz) != 0) {
++			rc = ENXIO;
++			break;
++		}
++		int n = snprintf(buf + off, len - off, "%s%s state %u (%u MHz)",
++		    i != 0 ? ", " : "", cpufreq_domains[i].name, state, mhz);
++		if (n < 0) {
++			rc = EIO;
++			break;
++		}
++		if ((size_t)n >= len - off) {
++			rc = ENOMEM;
++			break;
++		}
++		off += (size_t)n;
++	}
++	lck_mtx_unlock(&sweet_cpufreq_lock);
++	return rc;
++}
++
+ int
+ sweet_cpufreq_max(void)
+ {
+@@ -58,8 +142,36 @@ sweet_cpufreq_max(void)
+ 	if (!on) {
+ 		return 0;
+ 	}
+-	int rc = sweet_cpufreq_domain_max(CPUFREQ_GOLD_PA, "gold");
+-	(void)sweet_cpufreq_domain_max(CPUFREQ_SILVER_PA, "silver");
++	lck_mtx_lock(&sweet_cpufreq_lock);
++	int rc = 0;
++	for (size_t i = 0; i < sizeof(cpufreq_domains) / sizeof(cpufreq_domains[0]); i++) {
++		int err = sweet_cpufreq_domain_max_locked(&cpufreq_domains[i]);
++		if (err != 0 && rc == 0) {
++			rc = err;
++		}
++	}
++	lck_mtx_unlock(&sweet_cpufreq_lock);
+ 	return rc;
+ }
++
++static int
++sysctl_sweet_cpufreq SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char out[128];
++	int error = sweet_cpufreq_format(out, sizeof(out));
++	if (error != 0) {
++		return error;
++	}
++	error = SYSCTL_OUT(req, out, strlen(out) + 1);
++	if (!error && req->newptr != USER_ADDR_NULL) {
++		if (sweet_cpufreq_max() != 0) {
++			return ENXIO;
++		}
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cpufreq, "A", "active CPU perf state and MHz per cluster (write: re-apply max)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+-- 
+2.56.0.windows.4
+

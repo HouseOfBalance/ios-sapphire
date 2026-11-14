@@ -60,7 +60,7 @@ extra=${3:-}
 mkdir -p shim/out
 python3 tools/mkadt.py shim/out/sapphire.adt --highmem ${gpufw[@]+"${gpufw[@]}"} ${amp[@]+"${amp[@]}"}
 python3 tools/mkpayload.py "$kernel" shim/out/sapphire.adt shim/out/payload.bin \
-	--cmdline "debug=0xc serial=3 cpus=$cpus keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin $rw launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 $con sweetfb_hz=60 sweettouch_rx=8640 sweettouch_ry=9600 $extra"
+	--cmdline "debug=0xc serial=3 cpus=$cpus keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin $rw launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 $con sweetfb_hz=240 sweetsched=15 sweetrscale=850 sweetmetal=2 sweet_glload=1 sweettouchfast=1 sweetbl=0 sweettouch_rx=8640 sweettouch_ry=9600 $extra"
 shim/build.sh ../shim/out/payload.bin
 [[ $out == shim/out/shim-boot.img ]] || cp shim/out/shim-boot.img "$out"
 sha256sum "$out"

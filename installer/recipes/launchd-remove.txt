@@ -7,3 +7,9 @@ com.apple.MobileSoftwareUpdate.CleanupPreparePathService
 com.apple.OTATaskingAgent
 com.apple.softwareupdateservicesd
 com.apple.OTACrashCopier
+com.apple.parsecd
+com.apple.cdpd
+com.apple.searchpartyd
+com.apple.biomesyncd
+com.apple.duetexpertd
+com.apple.parsec-fbf

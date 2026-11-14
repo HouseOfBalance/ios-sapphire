@@ -1,0 +1,58 @@
+From c4f71b7715e9298fe0a5c6161a13f6cc7ada7634 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 12:42:47 +0700
+Subject: [PATCH] sapphire-0330: framebuffer: skip DSI setPanelOn/setPanelLevel
+ when sweetbl=0
+
+When sweetbl=0 (default), skip sending DSI display on/off (0x29/0x28) and
+DCS brightness (0x51) commands in AppleCLCD::setPanelOn() and
+AppleCLCD::setPanelLevel(). Certain sapphire AMOLED panel variants blank
+2 seconds after wake if DSI 0x28/0x51 commands are issued, while
+vsyncFired still blanks the scanout buffer in RAM on display power off.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6db6dbc..8541084 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -76,6 +76,7 @@ class AppleCLCD;
+ static AppleCLCD *sweet_cons_fb;
+ static AppleCLCD *sweet_dsi_fb;                 /* 0260: sweet_fb_dsi_seq() */
+ static AppleCLCD *sweet_frame_fb;               /* 0286: kern.sweet_fb_frame_await/_sent */
++static uint32_t sweet_bl_on;                    /* 0330: sweetbl=0 keeps DSI panel on/level quiet */
+ /* 0324: the panel's state for tap to wake (bsd/dev/sweet_touch.c): 1 after RequestPowerChange(0), and since when */
+ extern "C" volatile int sweet_fb_panel_off;
+ extern "C" volatile uint64_t sweet_fb_panel_off_abs;
+@@ -535,6 +536,7 @@ AppleCLCD::start(IOService *provider)
+ 		 */
+ 		uint32_t blOn = 0;
+ 		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
++		sweet_bl_on = blOn;
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+ 			bl->fFB = this;
+@@ -1162,6 +1164,9 @@ AppleCLCD::dsiSend(const uint8_t hdr[4], const uint8_t *payload, uint32_t len)
+ void
+ AppleCLCD::setPanelOn(bool on)
+ {
++	if (!sweet_bl_on) {
++		return;
++	}
+ 	uint8_t hdr[4] = { (uint8_t)(on ? 0x29 : 0x28), 0, 0x05, 0x80 };
+ 	IOLockLock(fBlLock);
+ 	bool done = false;
+@@ -1178,6 +1183,9 @@ AppleCLCD::setPanelOn(bool on)
+ void
+ AppleCLCD::setPanelLevel(uint32_t level)
+ {
++	if (!sweet_bl_on) {
++		return;
++	}
+ 	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };   /* MSB first */
+ 	IOLockLock(fBlLock);
+ 	bool done = false;
+-- 
+2.53.0
+

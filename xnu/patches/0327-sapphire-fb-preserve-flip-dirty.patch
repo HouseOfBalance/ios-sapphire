@@ -1,0 +1,36 @@
+From 3cfa346f9752713f1f50b100193678a07e6d13a6 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 12:13:18 +0700
+Subject: [PATCH] sapphire-0327: framebuffer: spin briefly on fast 2D GPU
+ copies in flipWhenCopied(false)
+
+When AppleCLCD::flipWhenCopied(false) is called at a swap or vsync tick and a
+GPU copy is still pending, spin up to 15 iterations of IODelay(20) (300 us max)
+before returning false. Fast 2D blitter copies that finish within 300 us flip
+immediately on the current swap instead of waiting a full vsync tick (4.2-8.3 ms)
+and without letting a second GPU copy overwrite the backbuffer before the first
+copy has landed.
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1b21388..6db6dbc 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1364,7 +1364,12 @@ AppleCLCD::flipWhenCopied(bool wait)
+ 	}
+ 	for (unsigned i = 0; sapphire_gpu_copy_pending(); i++) {
+ 		if (!wait) {
+-			return false;
++			/* 0327: fast 2D blitter copies finish within 300 us; spin briefly so this swap flips now */
++			if (i >= 15) {
++				return false;
++			}
++			IODelay(20);
++			continue;
+ 		}
+ 		if (i >= 200) {
+ 			break;                  /* the GPU is stuck: flip anyway, as before 0235 */
+-- 
+2.53.0
