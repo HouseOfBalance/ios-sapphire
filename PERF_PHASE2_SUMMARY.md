@@ -261,11 +261,12 @@ userland/tweaks/displaylink/
 installer/update/steps.d/
 ├── 55-sapphire-fluidity-120hz.sh      (all sysctls)
 ├── 56-sapphire-gpu-gl-cache.sh        (Mesa env + buffer pool)
-├── 57-sapphire-quiet-daemons.sh       (60+ daemons, renice -15, pin cores)
+├── 57-sapphire-quiet-daemons.sh       (FIXED: only safe daemons, restores backup)
 └── 58-sapphire-boot-args.sh           (centralized boot args)
 
 tools/
-└── sapphire-perf-monitor.sh           (monitoring script)
+├── sapphire-perf-monitor.sh           (monitoring script)
+└── recovery-fix-launchd.sh            (NEW: Recovery mode launchd.plist restore)
 ```
 
 ---
@@ -296,3 +297,41 @@ tools/
 - **Partitions:** Preserve `modemst1/2`, `fsg`, `fsc`, `recovery`, `dtbo`, `persist`
 - **Rollback:** Remove `/redwood/boot-args.d/99-performance.conf` to disable all
 - **Kernel panic risk:** Low - all patches are additive with feature flags
+
+---
+
+## CRITICAL BUG FIX: launchd.plist Corruption (v0.4.1)
+
+**Issue:** v0.4.0 installer script `57-sapphire-quiet-daemons.sh` incorrectly disabled critical system daemons, causing `backboardd` and `installcoordinat` crashes on boot.
+
+**Root Cause:** The `JOBS` list included daemons that `backboardd` and `installcoordinat` depend on:
+- `com.apple.containermanagerd` - System container URL resolution (CRITICAL)
+- `com.apple.cfprefsd.xpc.daemon` - Preferences system
+- `com.apple.securityd` / `com.apple.trustd` - Security framework
+- `com.apple.locationd` / `com.apple.geod` - Location services
+- `com.apple.wifid` / `com.apple.bluetoothd` - Wireless daemons
+- `com.apple.mavrouterd` / `com.apple.pcscd` - Modem/IPC
+- Network daemons (`nehelper`, `networkd`, `apsd`, `pushd`)
+- Account/iCloud daemons (`accountsd`, `fmfd`, `findmydeviced`)
+- Store daemons (`appstored`, `itunesstored`, `mobileassetd`, `commerce`)
+- System daemons (`coresymbolicationd`, `coreduetd`, `spotlight`, `mds`, `mdwrite`)
+
+**Symptoms:**
+- Boot hangs at text console ("core zlib memory 0x8000")
+- `installcoordinat` crash: "Failed to fetch system container URL"
+- `backboardd` crash: `NSInvalidArgumentException` - `[NSURL initFileURLWithPath:]: nil string parameter`
+
+**Fix Applied to `57-sapphire-quiet-daemons.sh`:**
+1. **Removed all critical daemons** from `JOBS` list
+2. **Added restore logic**: If `/var/root/launchd.plist.pre-quiet` exists, restore it first
+3. **Safe JOBS list** now only includes truly non-essential daemons:
+   - `parsecd`, `cdpd`, `searchpartyd`, `biomesyncd`, `duetexpertd`, `parsec-fbf`
+   - `atc`, `askpermissiond`, `managedsettingsd`
+   - `cloudpaird`, `magicswitchd`, `dasd`
+   - `diagnosticd`, `syslogd`, `reportcrash`
+   - `routinehubd`, `sirid`, `assistantd`, `virtualbuttond`
+
+**Recovery Tool Created:** `tools/recovery-fix-launchd.sh`
+- Run from Recovery mode: `./recovery-fix-launchd.sh /mnt/iosroot`
+- Restores `launchd.plist` from backup OR rebuilds minimal plist with all critical daemons
+- Patches `57-sapphire-quiet-daemons.sh` on target to prevent recurrence
