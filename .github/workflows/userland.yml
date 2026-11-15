@@ -21,15 +21,9 @@ jobs:
       - name: Install dependencies & SDK
         run: |
           mkdir -p /usr/local/bin $HOME/sdks
-          curl -sSL -o /usr/local/bin/ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macos_x86_64 2>/dev/null || true
-          if [ -s /usr/local/bin/ldid ]; then
-            chmod +x /usr/local/bin/ldid
-          else
-            printf '#!/bin/sh\nexec codesign -f -s - "$@"\n' | sudo tee /usr/local/bin/ldid >/dev/null
-            sudo chmod +x /usr/local/bin/ldid
-          fi
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/ldid >/dev/null
+          sudo chmod +x /usr/local/bin/ldid
           git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks/theos-sdks
-          ls -la $HOME/sdks/theos-sdks/
 
       - name: Build userland components
         run: |
@@ -48,10 +42,22 @@ jobs:
           SDK="$SDK_PATH" LDID="$LDID_BIN" bash build.sh ../../obj
           cd ../..
 
-          # 2. Build btmonitor
+          # 2. Build btmonitor & daemons
           echo "Building btmonitor..."
           clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/btmonitor bluetooth/btmonitor.c
           $LDID_BIN -S obj/btmonitor
+
+          echo "Building sensord..."
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/sensord sensors/sensord.c || true
+          $LDID_BIN -S obj/sensord || true
+
+          echo "Building vibd..."
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/vibd haptics/vibd.c || true
+          $LDID_BIN -S obj/vibd || true
+
+          echo "Building thermald..."
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/thermald thermal/thermald.c || true
+          $LDID_BIN -S obj/thermald || true
 
           # 3. Build eagl.dylib
           echo "Building eagl.dylib..."
