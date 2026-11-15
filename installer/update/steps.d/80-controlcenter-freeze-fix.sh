@@ -16,9 +16,10 @@ echo "=== [80] Applying Control Center freeze fix (REAL keys only) ==="
 # 1. eagl.c driver level: COMPLETELY DISABLE Gaussian blur (vblur=0)
 # This is the ONLY way to stop the Gaussian blur shader from executing on Adreno 610
 # vblur=0: disable blur entirely | vblur=2: mask-based blur (lighter but still runs shader)
+# glwait=1: CRITICAL - ensures glFinish() at frame_end, fixes Adreno 610 GMEM tiling corruption
 mkdir -p /private/var/tmp /var/tmp
 cat > /var/tmp/gl.args <<'EOF'
-vblur=0 glwait=0 glprecision=0
+vblur=0 glwait=1 glprecision=0
 EOF
 chmod 644 /var/tmp/gl.args
 cp -f /var/tmp/gl.args /private/var/tmp/gl.args 2>/dev/null || true
@@ -26,7 +27,7 @@ cp -f /var/tmp/gl.args /private/var/tmp/gl.args 2>/dev/null || true
 # Also persist in /redwood for reference
 mkdir -p /redwood
 cat > /redwood/gl.args <<'EOF'
-vblur=0 glwait=0 glprecision=0
+vblur=0 glwait=1 glprecision=0
 EOF
 chmod 644 /redwood/gl.args
 
@@ -34,11 +35,12 @@ chmod 644 /redwood/gl.args
 mkdir -p /redwood/boot.d
 cat > /redwood/boot.d/80-controlcenter-gl-args.sh <<'BOOT_EOF'
 #!/bin/bash
-# Enforce vblur=0 glwait=0 glprecision=0 at every boot for Control Center stability
+# Enforce vblur=0 glwait=1 glprecision=0 at every boot for Control Center stability
 # vblur=0 DISABLES Gaussian blur pass in eagl.c entirely - critical for Adreno 610
+# glwait=1 ENSURES glFinish() at frame_end - fixes black rectangle tiling on Adreno 610 GMEM
 mkdir -p /private/var/tmp /var/tmp
 cat > /var/tmp/gl.args <<'EOF2'
-vblur=0 glwait=0 glprecision=0
+vblur=0 glwait=1 glprecision=0
 EOF2
 chmod 644 /var/tmp/gl.args
 cp -f /var/tmp/gl.args /private/var/tmp/gl.args 2>/dev/null || true
@@ -168,6 +170,6 @@ echo "  sapphire_ca_halfres_backdrop=1"
 echo "  sapphire_ca_force_dirty_rects=1"
 echo ""
 echo "ENFORCED AT EVERY BOOT via /redwood/boot.d/80-controlcenter-gl-args.sh:"
-echo "  vblur=0 glwait=0 glprecision=0"
+echo "  vblur=0 glwait=1 glprecision=0"
 
 true

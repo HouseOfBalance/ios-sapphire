@@ -664,8 +664,9 @@ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's
 static int async_frames;
 extern void redwood_after_flush(void (*fn)(void *), void *data) __attribute__((weak_import));
 
-/* 0348: Adaptive fence sync - skip glClientWaitSync when GPU is ahead or async_frames active */
-static int adaptive_fence_sync = 1;     /* boot-arg adaptive_fence=1: skip sync when GPU ahead */
+/* 0348: Adaptive fence sync - DISABLED for Adreno 610 (caused black rectangle tiling corruption)
+ * Fixed timeout (200ms) used in frame_end instead of adaptive logic with timeout=0 */
+static int adaptive_fence_sync = 0;     /* DISABLED: boot-arg adaptive_fence=1 no longer supported */
 static uint64_t last_gpu_wait_us = 0;   /* track GPU wait time for adaptive decision */
 
 /* 0348: Async shader pre-compilation */
@@ -2292,27 +2293,19 @@ frame_end(struct eagl *e, bool finished)
 		 * sends everything held back to the kernel now; the GPU is not waited for. (Taken once for
 		 * the cause of frames with parts missing; that was drawing into the surface itself, see
 		 * blit_targets.)
+		 *
+		 * FIX: On Adreno 610 (TBDR with GMEM), we MUST wait for GPU completion before the
+		 * display controller scans out. Using timeout=0 in glClientWaitSync does NOT wait -
+		 * it only flushes. This caused black rectangle tiling corruption (GMEM tiles not resolved).
+		 * Use a proper timeout (200ms) to ensure GPU finishes rendering all tiles.
 		 */
-
-		/* 0348: Adaptive fence sync - skip wait if GPU consistently ahead */
-		if (adaptive_fence_sync && last_gpu_wait_us < 500) {
-			/* GPU has been finishing within 500µs - just flush, don't wait */
-			GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-			if (sync != NULL) {
-				(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-				glDeleteSync(sync);
-			}
+		GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+		if (sync != NULL) {
+			sync_wait_start = now_us();
+			/* Wait with 200ms timeout - ensures GMEM tiles are resolved before scanout */
+			(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 200000000ull);
+			glDeleteSync(sync);
 			did_sync_wait = true;
-		} else if (!adaptive_fence_sync || last_gpu_wait_us >= 500) {
-			/* Normal path: wait with FLUSH_COMMANDS_BIT */
-			GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-
-			if (sync != NULL) {
-				sync_wait_start = now_us();
-				(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-				glDeleteSync(sync);
-				did_sync_wait = true;
-			}
 		}
 	}
 	waited = now_us();
@@ -6624,8 +6617,10 @@ install(void)
 		say("redwood-gl: a frame is waited for %s\n", wait_for_frames ? "here, before it is handed to the display" :
 		    "by the display's driver, not here");
 
-		/* 0348: Adaptive fence sync */
-		adaptive_fence_sync = strstr(arguments, "adaptive_fence=0") == NULL;
+		/* 0348: Adaptive fence sync - DISABLED by default for Adreno 610 stability
+		 * The adaptive logic with timeout=0 caused black rectangle tiling corruption.
+		 * Use fixed 200ms timeout in frame_end instead. */
+		adaptive_fence_sync = 0;
 
 		/* 0348: Async shader compilation */
 		async_shader_compile = strstr(arguments, "async_shader=0") == NULL;

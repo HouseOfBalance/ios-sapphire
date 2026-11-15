@@ -51,8 +51,9 @@ mesa_shader_cache_max_mb=256
 # eagl.c vblur control (disable expensive Gaussian blur on Adreno 610)
 # vblur=0: disable blur entirely (CRITICAL for Control Center freeze on Adreno 610)
 # vblur=2: mask-based blur (lighter, but still runs shader - NOT enough for CC freeze)
+# glwait=1: CRITICAL - ensures glFinish() at frame_end, fixes Adreno 610 GMEM tiling corruption
 vblur=0
-glwait=0
+glwait=1
 glprecision=0
 
 # Brightness control - use native eagl.c bridge (backboardd -> AppleCLCD)

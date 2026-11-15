@@ -451,9 +451,9 @@ cp /redwood/glenv /private/var/tmp/gl.env 2>/dev/null || true
 cp /redwood/glenv /redwood/glenv 2>/dev/null || true
 
 # Also write gl.args for immediate effect
-printf "vblur=0 glwait=0 glprecision=0 glthread=1 async=1" > /var/tmp/gl.args 2>/dev/null || true
-printf "vblur=0 glwait=0 glprecision=0 glthread=1 async=1" > /private/var/tmp/gl.args 2>/dev/null || true
-printf "vblur=0 glwait=0 glprecision=0 glthread=1 async=1" > /redwood/gl.args 2>/dev/null || true
+printf "vblur=0 glwait=1 glprecision=0 glthread=1 async=1" > /var/tmp/gl.args 2>/dev/null || true
+printf "vblur=0 glwait=1 glprecision=0 glthread=1 async=1" > /private/var/tmp/gl.args 2>/dev/null || true
+printf "vblur=0 glwait=1 glprecision=0 glthread=1 async=1" > /redwood/gl.args 2>/dev/null || true
 chmod 666 /var/tmp/gl.args /private/var/tmp/gl.args /redwood/gl.args 2>/dev/null || true
 
 # ─────────────────────────────────────────────────────────────────
