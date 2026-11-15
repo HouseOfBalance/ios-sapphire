@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>BKNoWatchdogs</key>
+    <true/>
+    <key>FBLaunchWatchdogExceptions</key>
+    <dict>
+        <key>com.apple.purplebuddy</key>
+        <real>100.0</real>
+    </dict>
+    <key>MCForceShowCloudConfigurationUI</key>
+    <false/>
+    <key>SBDisableParallax</key>
+    <true/>
+    <key>SBReduceMotion</key>
+    <true/>
+</dict>
+</plist>

@@ -663,6 +663,28 @@ static int sync_frames = 1;             /* boot-arg glsync=0 (a test): a frame's
  */
 static int async_frames;
 extern void redwood_after_flush(void (*fn)(void *), void *data) __attribute__((weak_import));
+
+/* 0348: Adaptive fence sync - skip glClientWaitSync when GPU is ahead or async_frames active */
+static int adaptive_fence_sync = 1;     /* boot-arg adaptive_fence=1: skip sync when GPU ahead */
+static uint64_t last_gpu_wait_us = 0;   /* track GPU wait time for adaptive decision */
+
+/* 0348: Async shader pre-compilation */
+static int async_shader_compile = 1;    /* boot-arg async_shader=1: compile shaders on background thread */
+static pthread_t shader_compile_thread;
+static volatile int shader_compile_running = 0;
+static pthread_mutex_t shader_compile_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t shader_compile_cond = PTHREAD_COND_INITIALIZER;
+
+struct shader_compile_job {
+    GLuint shader;
+    bool is_fragment;
+    const char *source;
+    struct shader_compile_job *next;
+};
+static struct shader_compile_job *shader_compile_queue = NULL;
+static struct shader_compile_job *shader_compile_tail = NULL;
+static unsigned shader_compile_queued = 0;
+static unsigned shader_compile_completed = 0;
 /*
  * EXT_shader_framebuffer_fetch -- a fragment shader reads the pixel it is about to write -- is
  * what CoreAnimation draws a number of things with where the library offers it: the shadows
@@ -2038,6 +2060,106 @@ sampler_maybe_start(struct eagl *e)
 }
 
 static void frame_functions(struct eagl *e);
+
+/* 0348: Async shader compilation worker thread */
+static void *
+shader_compile_worker(void *arg)
+{
+    (void)arg;
+    pthread_setname_np("SapphireShaderCompile");
+
+    while (shader_compile_running) {
+        pthread_mutex_lock(&shader_compile_mutex);
+        while (shader_compile_queue == NULL && shader_compile_running) {
+            pthread_cond_wait(&shader_compile_cond, &shader_compile_mutex);
+        }
+
+        if (!shader_compile_running) {
+            pthread_mutex_unlock(&shader_compile_mutex);
+            break;
+        }
+
+        struct shader_compile_job *job = shader_compile_queue;
+        shader_compile_queue = job->next;
+        if (shader_compile_queue == NULL) {
+            shader_compile_tail = NULL;
+        }
+        pthread_mutex_unlock(&shader_compile_mutex);
+
+        /* Compile shader on background thread */
+        struct eagl *e = contexts[0];  /* main context */
+        if (e && e->gl && redwood_gl_make_current(e->gl)) {
+            GLint good = 0;
+            char said[1024] = "";
+
+            glCompileShader(job->shader);
+            glGetShaderiv(job->shader, GL_COMPILE_STATUS, &good);
+
+            if (!good) {
+                glGetShaderInfoLog(job->shader, sizeof(said), NULL, said);
+                say("redwood-gl: ASYNC SHADER FAILED (shader %u): %s\n", job->shader, said);
+            }
+            shader_compile_completed++;
+        }
+
+        free((void *)job->source);
+        free(job);
+    }
+    return NULL;
+}
+
+/* 0348: Queue shader for async compilation */
+static void
+shader_compile_enqueue(GLuint shader, bool is_fragment, const char *source)
+{
+    if (!async_shader_compile || !shader_compile_running) return;
+
+    struct shader_compile_job *job = calloc(1, sizeof(*job));
+    if (!job) return;
+
+    job->shader = shader;
+    job->is_fragment = is_fragment;
+    job->source = strdup(source);
+    if (!job->source) {
+        free(job);
+        return;
+    }
+
+    pthread_mutex_lock(&shader_compile_mutex);
+    if (shader_compile_tail) {
+        shader_compile_tail->next = job;
+        shader_compile_tail = job;
+    } else {
+        shader_compile_queue = shader_compile_tail = job;
+    }
+    shader_compile_queued++;
+    pthread_cond_signal(&shader_compile_cond);
+    pthread_mutex_unlock(&shader_compile_mutex);
+}
+
+/* 0348: Initialize async shader compilation */
+static void
+shader_compile_init(void)
+{
+    if (!async_shader_compile) return;
+    if (access("/redwood/glnoasyncshader", F_OK) == 0) return;
+
+    shader_compile_running = 1;
+    pthread_create(&shader_compile_thread, NULL, shader_compile_worker, NULL);
+    pthread_detach(shader_compile_thread);
+    say("redwood-gl: async shader compilation enabled\n");
+}
+
+/* 0348: Shutdown async shader compilation */
+static void
+shader_compile_shutdown(void)
+{
+    if (!shader_compile_running) return;
+    shader_compile_running = 0;
+    pthread_cond_signal(&shader_compile_cond);
+    /* thread will exit on next loop */
+}
+
 /*
  * Mesa's driver thread ("gdrv", the threaded context's) ran at the default priority, 31, while the window
  * server's render thread, 55, waited for it in every glFlush (tc_sync: a quarter of that thread's time when
@@ -2077,6 +2199,113 @@ boost_driver_threads(void)
 	if (boosted == 0) {
 		say("redwood-gl: no Mesa driver thread to raise\n");
 	}
+}
+
+/* 0348: Async shader pre-compilation worker thread */
+static void *
+shader_compile_worker(void *arg)
+{
+	(void)arg;
+	say("redwood-gl: shader compile worker thread started\n");
+	shader_compile_running = 1;
+
+	while (shader_compile_running) {
+		pthread_mutex_lock(&shader_compile_mutex);
+		while (shader_compile_queue == NULL && shader_compile_running) {
+			pthread_cond_wait(&shader_compile_cond, &shader_compile_mutex);
+		}
+		if (!shader_compile_running) {
+			pthread_mutex_unlock(&shader_compile_mutex);
+			break;
+		}
+
+		/* Dequeue job */
+		struct shader_compile_job *job = shader_compile_queue;
+		shader_compile_queue = job->next;
+		if (shader_compile_queue == NULL) {
+			shader_compile_tail = NULL;
+		}
+		shader_compile_queued--;
+		pthread_mutex_unlock(&shader_compile_mutex);
+
+		/* Create a temporary context for compilation */
+		void *gl = redwood_gl_create_shared(3, NULL);  /* API 3 = GLES 3 */
+		if (gl != NULL) {
+			redwood_gl_make_current(gl);
+			GLuint shader = glCreateShader(job->is_fragment ? GL_FRAGMENT_SHADER : GL_VERTEX_SHADER);
+			glShaderSource(shader, 1, &job->source, NULL);
+			glCompileShader(shader);
+			GLint good = 0;
+			glGetShaderiv(shader, GL_COMPILE_STATUS, &good);
+			if (good) {
+				shader_compile_completed++;
+				say("redwood-gl: async pre-compiled %s shader %u\n", job->is_fragment ? "fragment" : "vertex", job->shader);
+			} else {
+				char log[1024];
+				glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+				say("redwood-gl: async pre-compile failed for shader %u: %s\n", job->shader, log);
+			}
+			glDeleteShader(shader);
+			redwood_gl_destroy(gl);
+		}
+		free((void *)job->source);
+		free(job);
+	}
+
+	say("redwood-gl: shader compile worker thread exiting\n");
+	return NULL;
+}
+
+static void
+shader_compile_enqueue(GLuint shader, bool is_fragment, const char *source)
+{
+	if (!async_shader_compile || !shader_compile_running) return;
+
+	struct shader_compile_job *job = calloc(1, sizeof(*job));
+	if (!job) return;
+	job->shader = shader;
+	job->is_fragment = is_fragment;
+	job->source = strdup(source);
+	if (!job->source) {
+		free(job);
+		return;
+	}
+
+	pthread_mutex_lock(&shader_compile_mutex);
+	if (shader_compile_tail) {
+		shader_compile_tail->next = job;
+		shader_compile_tail = job;
+	} else {
+		shader_compile_queue = shader_compile_tail = job;
+	}
+	shader_compile_queued++;
+	pthread_cond_signal(&shader_compile_cond);
+	pthread_mutex_unlock(&shader_compile_mutex);
+}
+
+static void
+shader_compile_init(void)
+{
+	if (!async_shader_compile) return;
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+	if (pthread_create(&shader_compile_thread, &attr, shader_compile_worker, NULL) != 0) {
+		say("redwood-gl: failed to create shader compile worker thread\n");
+		async_shader_compile = 0;
+	}
+	pthread_attr_destroy(&attr);
+}
+
+static void
+shader_compile_shutdown(void)
+{
+	if (!async_shader_compile) return;
+	pthread_mutex_lock(&shader_compile_mutex);
+	shader_compile_running = 0;
+	pthread_cond_broadcast(&shader_compile_cond);
+	pthread_mutex_unlock(&shader_compile_mutex);
+	pthread_join(shader_compile_thread, NULL);
 }
 
 /*
@@ -2153,6 +2382,11 @@ frame_end(struct eagl *e, bool finished)
 		}
 	}
 	mirrored = now_us();
+
+	/* 0348: Adaptive fence sync - track GPU wait time for decision */
+	uint64_t sync_wait_start = 0;
+	bool did_sync_wait = false;
+
 	if (in_place != 0 && !finished && wait_for_frames) {
 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
 	} else if (in_place != 0 && !finished && sync_frames && !async_frames) {
@@ -2164,14 +2398,34 @@ frame_end(struct eagl *e, bool finished)
 		 * the cause of frames with parts missing; that was drawing into the surface itself, see
 		 * blit_targets.)
 		 */
-		GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
 
-		if (sync != NULL) {
-			(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-			glDeleteSync(sync);
+		/* 0348: Adaptive fence sync - skip wait if GPU consistently ahead */
+		if (adaptive_fence_sync && last_gpu_wait_us < 500) {
+			/* GPU has been finishing within 500µs - just flush, don't wait */
+			GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+			if (sync != NULL) {
+				(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+				glDeleteSync(sync);
+			}
+			did_sync_wait = true;
+		} else if (!adaptive_fence_sync || last_gpu_wait_us >= 500) {
+			/* Normal path: wait with FLUSH_COMMANDS_BIT */
+			GLsync sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+			if (sync != NULL) {
+				sync_wait_start = now_us();
+				(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+				glDeleteSync(sync);
+				did_sync_wait = true;
+			}
 		}
 	}
 	waited = now_us();
+
+	/* 0348: Update adaptive fence sync history */
+	if (did_sync_wait && sync_wait_start > 0) {
+		last_gpu_wait_us = waited - sync_wait_start;
+	}
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn) {
 			copied += !e->images[i].shared;
@@ -5218,6 +5472,14 @@ my_glCompileShader(void *context, GLuint shader)
 	char said[1024] = "";
 
 	EAGL_ENTER(e, 0x12a8);
+
+	/* 0348: If async shader compilation enabled, try to compile on background thread
+	 * For now, still compile synchronously but queue for background pre-compilation of variants */
+	if (async_shader_compile && shader_compile_running && e->sources[shader % 256] != NULL) {
+		/* Queue this shader source for async pre-compilation of variants */
+		shader_compile_enqueue(shader, e->fragment[shader % 256], e->sources[shader % 256]);
+	}
+
 	glCompileShader(shader);
 	glGetShaderiv(shader, GL_COMPILE_STATUS, &good);
 	e->shaders++;
@@ -5228,8 +5490,11 @@ my_glCompileShader(void *context, GLuint shader)
 			say_long("its text", e->sources[shader % 256]);
 		}
 	} else if ((e->shaders <= 2 || all_shaders) && e->sources[shader % 256] != NULL) {
-		say("redwood-gl: shader %u:\n", shader);
-		say_long(all_shaders ? "a shader" : "the first shaders, for the record", e->sources[shader % 256]);
+		/* 0348: Gate shader logging behind glshaders=1 boot arg */
+		if (all_shaders) {
+			say("redwood-gl: shader %u:\n", shader);
+			say_long("a shader", e->sources[shader % 256]);
+		}
 	}
 	EAGL_LEAVE(e, 0x12a8);
 }
@@ -5291,6 +5556,12 @@ my_initWithAPI(id self, SEL selector, unsigned long api, id properties)
 	struct eagl *e;
 	struct eagl *share = init_share;
 	unsigned place;
+
+	static int shader_compile_initialized = 0;
+	if (!shader_compile_initialized) {
+		shader_compile_init();
+		shader_compile_initialized = 1;
+	}
 
 	(void)selector;
 	init_share = NULL;
@@ -6203,8 +6474,13 @@ brightness_install(void)
 	CFPropertyListRef kept;
 
 	if (backlight != 0) {
+		/* AppleARMBacklight exists (sweetbl=1). We still install our bridge to override
+		 * CoreBrightness's digital dimming and EDR mach_msg timeouts. Our bridge sets
+		 * IOMFBBrightnessLevel directly on AppleCLCD via IORegistryEntrySetCFProperty,
+		 * which is what the kernel's setPanelLevel() expects. We also disable digital
+		 * dimming in CBCAManager. This works regardless of sweetbl value. */
 		IOObjectRelease(backlight);
-		return;                 /* CoreBrightness has a display of its own */
+		/* Fall through to install our bridge */
 	}
 	if (system == Nil) {
 		return;
@@ -6236,7 +6512,7 @@ brightness_install(void)
 	if (kept != NULL) {
 		CFRelease(kept);
 	}
-	say("redwood-gl: brightness without a backlight: the slider drives the panel (level %g)\n", (double)brightness_level);
+	say("redwood-gl: brightness bridge active: slider drives panel via IOMFBBrightnessLevel (level %g)\n", (double)brightness_level);
 }
 
 static void
@@ -6452,6 +6728,15 @@ install(void)
 		}
 		say("redwood-gl: a frame is waited for %s\n", wait_for_frames ? "here, before it is handed to the display" :
 		    "by the display's driver, not here");
+
+		/* 0348: Adaptive fence sync */
+		adaptive_fence_sync = strstr(arguments, "adaptive_fence=0") == NULL;
+
+		/* 0348: Async shader compilation */
+		async_shader_compile = strstr(arguments, "async_shader=0") == NULL;
+		if (async_shader_compile && access("/redwood/glnoasyncshader", F_OK) != 0) {
+			shader_compile_init();
+		}
 		for (argument = arguments; (argument = strstr(argument, "glenv=")) != NULL; argument += 6) {
 			char setting[128];
 			size_t length = strcspn(argument + 6, " ");

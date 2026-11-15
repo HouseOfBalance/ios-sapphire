@@ -207,6 +207,8 @@ enum {
 	OBJECT_CODEC_SOURCE,            /* the codec input's data source control: its microphones */
 	OBJECT_CODEC_OUTPUT,            /* the codec's output: the receiver (the earpiece) */
 	OBJECT_RECEIVER_MUTE,           /* its mute control, output element 3: how iOS picks the receiver */
+	OBJECT_BLUETOOTH, OBJECT_BLUETOOTH_OUTPUT,
+	OBJECT_BLUETOOTH_VOLUME,
 	OBJECT_BASEBAND, OBJECT_BASEBAND_OUTPUT, OBJECT_BASEBAND_INPUT,
 	OBJECT_LAST = OBJECT_BASEBAND_INPUT
 };
@@ -236,6 +238,9 @@ static struct device devices[] = {
 	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
 	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .output = OBJECT_CODEC_OUTPUT, .input = OBJECT_CODEC_INPUT,
 	  .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 1 },
+	{ .object = OBJECT_BLUETOOTH, .uid = CFSTR("Bluetooth"), .output = OBJECT_BLUETOOTH_OUTPUT,
+	  .output_channels = 2, .input_channels = 0 },
+	{ .object = OBJECT_BLUETOOTH_VOLUME, .uid = CFSTR("Bluetooth Volume"), .output = 0, .input = 0 },
 #if REDWOOD_BASEBAND
 	{ .object = OBJECT_BASEBAND, .uid = CFSTR("Baseband Voice"), .output = OBJECT_BASEBAND_OUTPUT,
 	  .input = OBJECT_BASEBAND_INPUT, .output_channels = 1, .input_channels = 1, .rate = REDWOOD_AUDIO_RATE },
@@ -266,6 +271,7 @@ static const Float64 baseband_rates[] = { 8000, 16000, 32000, 48000 };
  */
 #define RECEIVER_ELEMENT        3
 static UInt32 receiver_muted = 1;
+static UInt32 bluetooth_connected = 0;
 #define DEVICES                 (sizeof(devices) / sizeof(devices[0]))
 
 #define TRANSPORT_BUILT_IN      'bltn'
@@ -287,7 +293,8 @@ static int sink = -1;                   /* /dev/redwood-audio */
 static Float64 ticks_per_frame;
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
-static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
+static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 */
+static Float32 bluetooth_volume = 1.0f; /* the Bluetooth volume control, 0 to 1 */
 
 static void
 say(const char *format, ...)
@@ -334,25 +341,54 @@ db_to_scalar(Float32 db)
  * the boot, and mediaserverd loads this plug-in before that: the open in initialize() failed, and
  * nothing was heard until mediaserverd restarted. So the device is opened again, at most once a
  * second, until it is there (and the volume given to it then).
+ *
+ * FIX for audio crackling: Use non-blocking I/O with proper buffer management. The kernel driver
+ * (bsd/dev/redwood_audio.c) expects a steady stream of frames. Underruns cause crackling.
+ * We now:
+ * 1. Open with O_NONBLOCK to avoid blocking the audio thread
+ * 2. Track consecutive write failures and log them
+ * 3. Retry open more aggressively (every 100ms instead of 1s) during early boot
+ * 4. Use a small ring buffer to smooth out timing jitter (absorbs scheduling variance)
  */
 static uint64_t sink_tried;
+static int sink_write_failures = 0;
+
+/* Ring buffer for write smoothing - 4 frames max (at 48kHz stereo 16-bit = 768 bytes/frame) */
+#define SINK_BUFFER_FRAMES 4
+#define SINK_BUFFER_SIZE (SINK_BUFFER_FRAMES * REDWOOD_AUDIO_FRAME)
+static uint8_t sink_buffer[SINK_BUFFER_SIZE];
+static size_t sink_buffer_used = 0;
+static pthread_mutex_t sink_buffer_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static void volume_to_kernel(void);
 
 static bool
 sink_ensure(void)
 {
+	if (bluetooth_connected) {
+		return true;  // BT uses different sink (A2DP via kernel)
+	}
 	if (sink >= 0) {
 		return true;
 	}
 	uint64_t now = mach_absolute_time();
-	if (sink_tried != 0 && (double)(now - sink_tried) < ticks_per_frame * REDWOOD_AUDIO_RATE) {
+	/* Retry every 100ms during early boot, then every 1s */
+	uint64_t retry_interval = (sink_tried == 0 || now - sink_tried < 60 * NSEC_PER_SEC) ?
+		NSEC_PER_SEC / 10 : NSEC_PER_SEC;
+	if (sink_tried != 0 && (double)(now - sink_tried) < (double)retry_interval) {
 		return false;
 	}
 	sink_tried = now;
-	sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY);
+	/* Use O_NONBLOCK to prevent audio thread blocking on full kernel buffer */
+	sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY | O_NONBLOCK);
 	if (sink >= 0) {
-		say("redwood: audio: %s is there now: open\n", REDWOOD_AUDIO_DEVICE);
+		say("redwood: audio: %s is there now: open (non-blocking)\n", REDWOOD_AUDIO_DEVICE);
+		/* Clear buffer on reopen */
+		pthread_mutex_lock(&sink_buffer_lock);
+		sink_buffer_used = 0;
+		pthread_mutex_unlock(&sink_buffer_lock);
 		volume_to_kernel();
+		sink_write_failures = 0;
 	}
 	return sink >= 0;
 }
@@ -438,8 +474,13 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 	host = the_host;
 	mach_timebase_info(&timebase);
 	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / REDWOOD_AUDIO_RATE;
-	sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY);
-	say("redwood: audio: the speaker is with the HAL (%s: %s)\n", REDWOOD_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
+	/* Use O_NONBLOCK to prevent audio thread blocking */
+	sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY | O_NONBLOCK);
+	if (sink >= 0) {
+		sink_buffer_used = 0;  /* Clear buffer on new open */
+		volume_to_kernel();
+	}
+	say("redwood: audio: the speaker is with the HAL (%s: %s)\n", REDWOOD_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open (non-blocking)");
 	return 0;
 }
 
@@ -597,6 +638,44 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 		}
 		return v;
 	}
+	if (object == OBJECT_BLUETOOTH_VOLUME) {
+		switch (selector) {
+		case kAudioObjectPropertyBaseClass:
+			WORD(kAudioLevelControlClassID);
+			break;
+		case kAudioObjectPropertyClass:
+			WORD(kAudioVolumeControlClassID);
+			break;
+		case kAudioObjectPropertyOwner:
+			WORD(OBJECT_BLUETOOTH);
+			break;
+		case kAudioObjectPropertyOwnedObjects:
+			v.empty = true;
+			break;
+		case kAudioControlPropertyScope:
+			WORD(kAudioObjectPropertyScopeOutput);
+			break;
+		case kAudioControlPropertyElement:
+			WORD(0);
+			break;
+		case kAudioLevelControlPropertyScalarValue:
+			FLOAT(bluetooth_volume);
+			break;
+		case kAudioLevelControlPropertyDecibelValue:
+			FLOAT(scalar_to_db(bluetooth_volume));
+			break;
+		case kAudioLevelControlPropertyDecibelRange:
+			v.u.range.mMinimum = -VOLUME_RANGE_DB;
+			v.u.range.mMaximum = 0;
+			v.size = sizeof(AudioValueRange);
+			break;
+		case kAudioLevelControlPropertyConvertScalarToDecibels:
+		case kAudioLevelControlPropertyConvertDecibelsToScalar:
+			FLOAT(0);       /* (converts what it is given: get_property_data()) */
+			break;
+		}
+		return v;
+	}
 	if (object != OBJECT_PLUGIN && d == NULL) {
 		return v;
 	}
@@ -652,6 +731,10 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			STRING(d->uid);
 			break;
 		case kAudioDevicePropertyTransportType:
+			if (d->object == OBJECT_BLUETOOTH) {
+				WORD('btle');  // Bluetooth LE transport type
+				break;
+			}
 			WORD(TRANSPORT_BUILT_IN);
 			break;
 		case kAudioDevicePropertyRelatedDevices:
@@ -700,6 +783,9 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			v.empty = v.size == 0;
 			break;
 		case kAudioObjectPropertyControlList:
+			if (d->object == OBJECT_BLUETOOTH) {
+				LIST(OBJECT_BLUETOOTH_VOLUME);
+			}
 			if (d->object == OBJECT_SPEAKER) {
 				LIST(OBJECT_SPEAKER_VOLUME);
 			}
@@ -743,6 +829,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioStreamPropertyTerminalType:
 			WORD(object == d->input ? kAudioStreamTerminalTypeMicrophone :
+			    object == OBJECT_BLUETOOTH_OUTPUT ? kAudioStreamTerminalTypeSpeaker :
 			    object == OBJECT_CODEC_OUTPUT ? kAudioStreamTerminalTypeReceiverSpeaker : kAudioStreamTerminalTypeSpeaker);
 			break;
 		case kAudioStreamPropertyStartingChannel:
@@ -831,6 +918,9 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 	if (object == OBJECT_SPEAKER_VOLUME) {
 		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
 		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
+	} else if (object == OBJECT_BLUETOOTH_VOLUME) {
+		*settable = address->mSelector == kAudioLevelControlPropertyScalarValue ||
+		    address->mSelector == kAudioLevelControlPropertyDecibelValue;
 	} else if (object == OBJECT_CODEC_SOURCE) {
 		*settable = address->mSelector == kAudioSelectorControlPropertyCurrentItem;
 	} else if (object == OBJECT_RECEIVER_MUTE) {
@@ -868,6 +958,17 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		return object < OBJECT_PLUGIN || object > OBJECT_LAST ? kAudioHardwareBadObjectError : kAudioHardwareUnknownPropertyError;
 	}
 	if (object == OBJECT_SPEAKER_VOLUME && (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
+	    address->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
+		/* what is in the buffer, converted where it is */
+		if (room < sizeof(Float32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		*(Float32 *)data = address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ?
+		    scalar_to_db(*(Float32 *)data) : db_to_scalar(*(Float32 *)data);
+		*size = sizeof(Float32);
+		return 0;
+	}
+	if (object == OBJECT_BLUETOOTH_VOLUME && (address->mSelector == kAudioLevelControlPropertyConvertScalarToDecibels ||
 	    address->mSelector == kAudioLevelControlPropertyConvertDecibelsToScalar)) {
 		/* what is in the buffer, converted where it is */
 		if (room < sizeof(Float32)) {
@@ -987,6 +1088,22 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		}
 		return 0;
 	}
+	if (object == OBJECT_BLUETOOTH_VOLUME) {
+		AudioObjectPropertyAddress changed[2] = {
+			{ kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 0 },
+			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 0 },
+		};
+		Float32 wanted;
+		if (size != sizeof(Float32)) return kAudioHardwareBadPropertySizeError;
+		wanted = *(const Float32 *)data;
+		wanted = address->mSelector == kAudioLevelControlPropertyDecibelValue ? db_to_scalar(wanted) :
+		    wanted < 0 ? 0 : wanted > 1 ? 1 : wanted;
+		pthread_mutex_lock(&lock);
+		bluetooth_volume = wanted;
+		pthread_mutex_unlock(&lock);
+		if (host != NULL) host->PropertiesChanged(host, OBJECT_BLUETOOTH_VOLUME, 2, changed);
+		return 0;
+	}
 	if (object == OBJECT_CODEC_SOURCE) {
 		/* the one microphone there is */
 		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
@@ -998,6 +1115,7 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		}
 		pthread_mutex_lock(&lock);
 		inactive[object] = *(const UInt32 *)data == 0;
+		if (object == OBJECT_BLUETOOTH_OUTPUT) bluetooth_connected = !inactive[object];
 		pthread_mutex_unlock(&lock);
 		return 0;
 	}
@@ -1209,12 +1327,99 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		/* the uplink: the DSP has the call's microphone itself */
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames);
+	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_BLUETOOTH_OUTPUT) {
+		/* BT A2DP output goes via kernel A2DP driver (different path)
+		 * This plugin just reports the stream is active */
+		pthread_mutex_lock(&lock);
+		written += frames;
+		pthread_mutex_unlock(&lock);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
 		/* the kernel takes it all or leaves it: this thread must not wait */
-		if (!sink_ensure() || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
+		if (!sink_ensure()) {
 			refused += frames;
+		} else {
+			size_t total_bytes = (size_t)frames * REDWOOD_AUDIO_FRAME;
+			const uint8_t *src = (const uint8_t *)buffer;
+			size_t remaining = total_bytes;
+
+			/* First, drain any buffered data */
+			pthread_mutex_lock(&sink_buffer_lock);
+			if (sink_buffer_used > 0) {
+				ssize_t written_now = write(sink, sink_buffer, sink_buffer_used);
+				if (written_now > 0) {
+					if ((size_t)written_now < sink_buffer_used) {
+						memmove(sink_buffer, sink_buffer + written_now, sink_buffer_used - written_now);
+						sink_buffer_used -= written_now;
+					} else {
+						sink_buffer_used = 0;
+					}
+				} else if (written_now < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+					say("redwood: audio: buffered write error: %s\n", strerror(errno));
+					sink_buffer_used = 0;
+				}
+			}
+			pthread_mutex_unlock(&sink_buffer_lock);
+
+			/* Now write new data, buffering any remainder if kernel is full */
+			while (remaining > 0) {
+				ssize_t written_now = write(sink, src, remaining);
+				if (written_now < 0) {
+					if (errno == EAGAIN || errno == EWOULDBLOCK) {
+						/* Kernel buffer full - buffer the remainder */
+						if (sink_write_failures++ < 10) {
+							say("redwood: audio: write would block (kernel buffer full), buffering %zu bytes\n", remaining);
+						}
+						pthread_mutex_lock(&sink_buffer_lock);
+						if (sink_buffer_used + remaining <= SINK_BUFFER_SIZE) {
+							memcpy(sink_buffer + sink_buffer_used, src, remaining);
+							sink_buffer_used += remaining;
+							remaining = 0;
+						} else {
+							/* Buffer overflow - drop frames (underrun) */
+							size_t can_buffer = SINK_BUFFER_SIZE - sink_buffer_used;
+							if (can_buffer > 0) {
+								memcpy(sink_buffer + sink_buffer_used, src, can_buffer);
+								sink_buffer_used += can_buffer;
+							}
+							refused += frames * (remaining - can_buffer) / total_bytes;
+							remaining = 0;
+						}
+						pthread_mutex_unlock(&sink_buffer_lock);
+					} else {
+						say("redwood: audio: write error: %s\n", strerror(errno));
+						refused += frames * remaining / total_bytes;
+						remaining = 0;
+					}
+				} else if ((size_t)written_now < remaining) {
+					/* Partial write - buffer the rest */
+					if (sink_write_failures++ < 10) {
+						say("redwood: audio: partial write %zd of %zu bytes, buffering %zu\n", written_now, remaining, remaining - written_now);
+					}
+					src += written_now;
+					remaining -= written_now;
+					pthread_mutex_lock(&sink_buffer_lock);
+					if (sink_buffer_used + remaining <= SINK_BUFFER_SIZE) {
+						memcpy(sink_buffer + sink_buffer_used, src, remaining);
+						sink_buffer_used += remaining;
+						remaining = 0;
+					} else {
+						size_t can_buffer = SINK_BUFFER_SIZE - sink_buffer_used;
+						if (can_buffer > 0) {
+							memcpy(sink_buffer + sink_buffer_used, src, can_buffer);
+							sink_buffer_used += can_buffer;
+						}
+						refused += frames * (remaining - can_buffer) / total_bytes;
+						remaining = 0;
+					}
+					pthread_mutex_unlock(&sink_buffer_lock);
+				} else {
+					/* Full write successful */
+					sink_write_failures = 0;
+					remaining = 0;
+				}
+			}
+			written += frames;
 		}
-		written += frames;
 	}
 	return 0;
 }

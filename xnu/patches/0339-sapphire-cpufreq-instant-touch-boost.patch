@@ -6,18 +6,19 @@ Subject: [PATCH] sapphire-0339: cpufreq: instant touch boost - zero-latency P-co
 Current cpufreq (0328) reads LUT but has no governor. When touch arrives,
 CPU takes 2-5 ms to ramp to max (2.8 GHz Gold), causing first-frame jank.
 Solution: Touch IRQ triggers immediate perf_state=0 (max freq) on Gold cluster,
-with 150 ms hold timer before allowing natural decay.
+with 300 ms hold timer before allowing natural decay.
 
-Also adds strict thread affinity API for critical UI threads.
+Also adds strict thread affinity API for critical UI threads with separated cores.
+App launch boost keeps max freq for 2 seconds after exec.
 ---
- bsd/dev/sweet_cpufreq.c | 180 ++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 180 insertions(+)
+ bsd/dev/sweet_cpufreq.c | 220 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 220 insertions(+)
 
 diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
 index b863e35..c4d5e6f 100644
 --- a/bsd/dev/sweet_cpufreq.c
 +++ b/bsd/dev/sweet_cpufreq.c
-@@ -187,6 +187,186 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+@@ -187,6 +187,226 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
      0, 0, sysctl_sweet_cpufreq, "A", "active CPU perf state and MHz per cluster (write: re-apply max)");
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 +
@@ -33,9 +34,14 @@ index b863e35..c4d5e6f 100644
 +#include <machine/machine_routines.h>
 +
 +static uint32_t sweet_touch_boost_enabled = 1;
-+static uint32_t sweet_touch_boost_hold_ms = 150;   /* hold max freq after last touch */
++static uint32_t sweet_touch_boost_hold_ms = 300;   /* hold max freq after last touch (increased for sustained gestures) */
 +static uint32_t sweet_touch_boost_ramp_ms = 0;     /* instant = 0, or ms to ramp */
 +
++/* 0348: App launch boost - keep max freq for 2 seconds after exec */
++static uint32_t sweet_launch_boost_enabled = 1;
++static uint32_t sweet_launch_boost_hold_ms = 2000; /* hold max freq after app launch */
++static volatile uint64_t sweet_launch_last_boost_time = 0;
++static volatile boolean_t sweet_launch_boost_active = FALSE;
 +static volatile uint64_t sweet_touch_last_boost_time = 0;
 +static volatile boolean_t sweet_touch_boost_active = FALSE;
 +static LCK_GRP_DECLARE(sweet_touch_boost_grp, "sweet_touch_boost");
@@ -43,7 +49,12 @@ index b863e35..c4d5e6f 100644
 +
 +/* Strict affinity masks */
 +#define SWEET_AFFINITY_GOLD_ALL   0x0F  /* cores 0-3 */
-+#define SWEET_AFFINITY_GOLD_01    0x03  /* cores 0-1 (strongest) */
++#define SWEET_AFFINITY_GOLD_0     0x01  /* core 0 (strongest) */
++#define SWEET_AFFINITY_GOLD_1     0x02  /* core 1 */
++#define SWEET_AFFINITY_GOLD_2     0x04  /* core 2 */
++#define SWEET_AFFINITY_GOLD_3     0x08  /* core 3 */
++#define SWEET_AFFINITY_GOLD_01    0x03  /* cores 0-1 */
++#define SWEET_AFFINITY_GOLD_23    0x0C  /* cores 2-3 */
 +#define SWEET_AFFINITY_SILVER_ALL 0x30  /* cores 4-5 */
 +
 +/* 0339: Called from touch IRQ context - instant boost to max freq */
@@ -83,6 +94,43 @@ index b863e35..c4d5e6f 100644
 +    }
 +}
 +
++/* 0348: Launch boost trigger - call from exec path */
++void
++sweet_launch_boost_trigger(void)
++{
++    if (!sweet_launch_boost_enabled) return;
++
++    uint64_t now = mach_absolute_time();
++    sweet_launch_last_boost_time = now;
++
++    if (!sweet_launch_boost_active) {
++        sweet_launch_boost_active = TRUE;
++        /* Immediate max perf on Gold cluster */
++        sweet_cpufreq_set_perf_state_locked(&cpufreq_domains[0], 0);  /* Gold = max */
++        printf("SWEET_CPUFREQ: launch boost ON - Gold @ max for %u ms\n", sweet_launch_boost_hold_ms);
++    }
++
++    /* Schedule decay check */
++    thread_wakeup((event_t)&sweet_launch_last_boost_time);
++}
++
++/* 0348: Launch boost decay check */
++static void
++sweet_launch_boost_decay_check(void)
++{
++    if (!sweet_launch_boost_active) return;
++
++    uint64_t now = mach_absolute_time();
++    uint64_t elapsed_ms = (now - sweet_launch_last_boost_time) * 1000ULL / NSEC_PER_SEC;
++
++    if (elapsed_ms >= sweet_launch_boost_hold_ms) {
++        sweet_launch_boost_active = FALSE;
++        /* Allow natural decay */
++        sweet_cpufreq_max();
++        printf("SWEET_CPUFREQ: launch boost OFF - natural decay\n");
++    }
++}
++
 +/* 0339: Strict thread affinity - pin to specific core mask */
 +int
 +sweet_thread_set_strict_affinity(thread_t th, uint32_t affinity_mask)
@@ -97,7 +145,7 @@ index b863e35..c4d5e6f 100644
 +    return 0;
 +}
 +
-+/* 0339: Pin critical UI threads at startup */
++/* 0348: Pin critical UI threads at startup - SEPARATED CORES */
 +void
 +sweet_pin_critical_ui_threads(void)
 +{
@@ -107,27 +155,38 @@ index b863e35..c4d5e6f 100644
 +        const char *pname = proc_name_address(p);
 +        if (!pname) continue;
 +
-+        uint32_t mask = 0;
++        uint32_t main_mask = 0;
++        uint32_t render_mask = 0;
++
 +        if (strcmp(pname, "SpringBoard") == 0) {
-+            mask = SWEET_AFFINITY_GOLD_01;  /* cores 0-1 */
++            main_mask = SWEET_AFFINITY_GOLD_0;      /* core 0 - main thread */
++            render_mask = SWEET_AFFINITY_GOLD_1;    /* core 1 - render thread */
 +        } else if (strcmp(pname, "backboardd") == 0) {
-+            mask = SWEET_AFFINITY_GOLD_01;  /* cores 0-1 */
++            main_mask = SWEET_AFFINITY_GOLD_2;      /* core 2 - main thread */
++            render_mask = SWEET_AFFINITY_GOLD_3;    /* core 3 - render thread */
 +        } else if (strcmp(pname, "WindowServer") == 0) {
-+            mask = SWEET_AFFINITY_GOLD_ALL; /* cores 0-3 */
++            main_mask = SWEET_AFFINITY_GOLD_01;     /* cores 0-1 */
++            render_mask = SWEET_AFFINITY_GOLD_23;   /* cores 2-3 */
 +        } else if (strcmp(pname, "mediaserverd") == 0) {
-+            mask = SWEET_AFFINITY_GOLD_ALL; /* cores 0-3 */
++            main_mask = SWEET_AFFINITY_GOLD_23;     /* cores 2-3 */
++            render_mask = SWEET_AFFINITY_GOLD_01;   /* cores 0-1 */
 +        } else {
 +            continue;
 +        }
 +
 +        thread_t th;
++        int thread_index = 0;
 +        for (th = p->p_threadlist; th != THREAD_NULL; th = th->task_threads.tqe_next) {
-+            /* Pin main thread and render threads (high priority) */
-+            if (th == p->p_threadlist || th->sched_pri <= BASEPRI_USER) {
-+                sweet_thread_set_strict_affinity(th, mask);
++            /* Pin main thread (first) to main_mask, render threads to render_mask */
++            if (th == p->p_threadlist) {
++                sweet_thread_set_strict_affinity(th, main_mask);
++            } else if (th->sched_pri <= BASEPRI_USER) {
++                /* High priority threads = render threads */
++                sweet_thread_set_strict_affinity(th, render_mask);
++                thread_index++;
 +            }
 +        }
-+        printf("SWEET_CPUFREQ: pinned %s to mask 0x%x\n", pname, mask);
++        printf("SWEET_CPUFREQ: pinned %s main=0x%x render=0x%x\n", pname, main_mask, render_mask);
 +    }
 +    proc_list_unlock();
 +}
@@ -169,10 +228,52 @@ index b863e35..c4d5e6f 100644
 +    return sysctl_handle_int(oidp, &sweet_touch_boost_hold_ms, 0, req);
 +}
 +
++static int
++sysctl_sweet_launch_boost SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    char out[128];
++    int error = 0;
++    size_t off = 0;
++
++    off += snprintf(out + off, sizeof(out) - off,
++        "enabled:%u active:%u hold_ms:%u last_boost_ms_ago:%llu",
++        sweet_launch_boost_enabled, sweet_launch_boost_active,
++        sweet_launch_boost_hold_ms,
++        sweet_launch_boost_active ? (mach_absolute_time() - sweet_launch_last_boost_time) * 1000ULL / NSEC_PER_SEC : 0);
++
++    if (!error) error = SYSCTL_OUT(req, out, off + 1);
++    return error;
++}
++
++static int
++sysctl_sweet_launch_boost_enabled SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    int error = sysctl_handle_int(oidp, &sweet_launch_boost_enabled, 0, req);
++    if (!error && req->newptr != USER_ADDR_NULL) {
++        if (!sweet_launch_boost_enabled) sweet_launch_boost_active = FALSE;
++    }
++    return error;
++}
++
++static int
++sysctl_sweet_launch_boost_hold SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    return sysctl_handle_int(oidp, &sweet_launch_boost_hold_ms, 0, req);
++}
++
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_boost, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
 +    0, 0, sysctl_sweet_touch_boost, "A", "touch boost status: enabled/active/hold/last_boost");
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_boost_enabled, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
 +    0, 0, sysctl_sweet_touch_boost_enabled, "I", "enable instant touch boost (0/1)");
 +SYSCTL_PROC(_kern, OID_AUTO, sweet_touch_boost_hold_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-+    0, 0, sysctl_sweet_touch_boost_hold, "I", "hold max freq after last touch (ms, default 150)");
++    0, 0, sysctl_sweet_touch_boost_hold, "I", "hold max freq after last touch (ms, default 300)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_launch_boost, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_launch_boost, "A", "launch boost status: enabled/active/hold/last_boost");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_launch_boost_enabled, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_launch_boost_enabled, "I", "enable app launch boost (0/1)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_launch_boost_hold_ms, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_launch_boost_hold, "I", "hold max freq after app launch (ms, default 2000)");
 +#endif /* ARM64_BOARD_CONFIG_SWEET */

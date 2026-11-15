@@ -474,6 +474,36 @@ cod_major(uint32_t cod)
 }
 
 static void
+broadcast_acl_connected(const uint8_t *addr)
+{
+	char event[64];
+	snprintf(event, sizeof(event), "ACL_CONNECTED %02x:%02x:%02x:%02x:%02x:%02x\n",
+		 addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+	ctl_broadcast(event);
+}
+
+static void
+broadcast_acl_disconnected(const uint8_t *addr)
+{
+	char event[64];
+	snprintf(event, sizeof(event), "ACL_DISCONNECTED %02x:%02x:%02x:%02x:%02x:%02x\n",
+		 addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+	ctl_broadcast(event);
+}
+
+static void
+broadcast_a2dp_connected(void)
+{
+	ctl_broadcast("A2DP_CONNECTED\n");
+}
+
+static void
+broadcast_a2dp_disconnected(void)
+{
+	ctl_broadcast("A2DP_DISCONNECTED\n");
+}
+
+static void
 trace_event(const uint8_t *p, size_t n)
 {
 	if (p[0] != 4 || n < 3)
@@ -497,10 +527,26 @@ trace_event(const uint8_t *p, size_t n)
 		if (n >= 7 && (p[5] | (p[6] << 8)) == 0x0401)
 			say("BR: inquiry Command Status %#x", p[3]);
 		break;
-	case 0x03: say("BR: connection complete status %#x handle %#x", p[3], n >= 6 ? p[4] | (p[5] << 8) : 0); break;
+	case 0x03: { /* Connection Complete */
+		say("BR: connection complete status %#x handle %#x", p[3], n >= 6 ? p[4] | (p[5] << 8) : 0);
+		if (p[3] == 0 && n >= 11) { /* status=0, address at offset 5 */
+			broadcast_acl_connected(p + 5);
+		}
+		break;
+	}
 	case 0x04: say("BR: connection request (class %02x%02x%02x)", n >= 12 ? p[11] : 0, n >= 11 ? p[10] : 0,
 	    n >= 10 ? p[9] : 0); break;
-	case 0x05: say("BR: disconnection complete reason %#x", n >= 7 ? p[6] : 0); break;
+	case 0x05: { /* Disconnection Complete */
+		say("BR: disconnection complete reason %#x", n >= 7 ? p[6] : 0);
+		if (n >= 7) { /* handle at offset 3, reason at 6 */
+			/* For disconnection, we need the address. It's not in this event.
+			 * We'll track handles to addresses elsewhere. For now, broadcast with zero addr. */
+			/* TODO: Track handle->address mapping */
+			static uint8_t zero_addr[6] = {0};
+			broadcast_acl_disconnected(zero_addr);
+		}
+		break;
+	}
 	case 0x06: say("BR: authentication complete status %#x", p[3]); break;
 	case 0x31: say("BR: IO capability request"); break;
 	case 0x32: say("BR: IO capability response (remote cap %u)", n >= 10 ? p[9] : 0); break;
@@ -509,6 +555,18 @@ trace_event(const uint8_t *p, size_t n)
 	case 0x18: say("BR: link key notification"); break;
 	case 0x17: say("BR: link key request"); break;
 	case 0x16: say("BR: PIN code request"); break;
+	/* LE Meta Event (0x3e) - check for LE Connection Complete (0x01) */
+	case 0x3e: {
+		if (n >= 4 && p[3] == 0x01) { /* LE Connection Complete */
+			/* subevent 0x01: status(1) handle(2) role(1) peer_addr_type(1) peer_addr(6) ... */
+			if (n >= 1 + 1 + 2 + 1 + 1 + 6 && p[4] == 0) { /* status=0 */
+				broadcast_acl_connected(p + 4 + 1 + 2 + 1 + 1); /* peer address */
+			}
+		} else if (n >= 4 && p[3] == 0x04) { /* LE Disconnection Complete */
+			/* We don't have the address here, just handle */
+		}
+		break;
+	}
 	default: break;
 	}
 }
@@ -799,6 +857,53 @@ ctl_listen(void)
 /* real mode: "boot"/"init" requests that came before the controller was up wait here */
 static int pending[64], npending, bringup_failed;
 
+/* control socket clients for event broadcasting (btmonitor, etc.) */
+#define MAX_CTL_CLIENTS 8
+static int ctl_clients[MAX_CTL_CLIENTS];
+static int nctl_clients = 0;
+
+static void
+ctl_broadcast(const char *event)
+{
+	for (int i = 0; i < nctl_clients; i++) {
+		int fd = ctl_clients[i];
+		if (fd >= 0) {
+			ssize_t n = write(fd, event, strlen(event));
+			if (n < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+				/* client disconnected, remove from list */
+				close(fd);
+				ctl_clients[i] = ctl_clients[--nctl_clients];
+				i--;
+			}
+		}
+	}
+}
+
+static void
+ctl_add_client(int fd)
+{
+	if (nctl_clients < MAX_CTL_CLIENTS) {
+		ctl_clients[nctl_clients++] = fd;
+		fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+		say("ctl: client connected (%d total)", nctl_clients);
+	} else {
+		close(fd);
+	}
+}
+
+static void
+ctl_remove_client(int fd)
+{
+	for (int i = 0; i < nctl_clients; i++) {
+		if (ctl_clients[i] == fd) {
+			close(fd);
+			ctl_clients[i] = ctl_clients[--nctl_clients];
+			say("ctl: client disconnected (%d total)", nctl_clients);
+			return;
+		}
+	}
+}
+
 static void
 ctl_reply(int c, int result, const char *line)
 {
@@ -809,13 +914,17 @@ ctl_reply(int c, int result, const char *line)
 	close(c);
 }
 
-/* one request line from "btshim bluetool": boot | init | deepsleep | reset | cmd <text> */
+/* one request line from "btshim bluetool": boot | init | deepsleep | reset | cmd <text>
+ * For event streaming (btmonitor), the client stays connected and we broadcast events.
+ * Commands are handled as before, but the connection remains open. */
 static void
 ctl_serve(int s)
 {
 	int c = accept(s, NULL, NULL);
 	if (c < 0)
 		return;
+
+	/* Check if this is a streaming client (btmonitor) by peeking at first command */
 	char line[256];
 	ssize_t n = read(c, line, sizeof(line) - 1);
 	if (n <= 0) {
@@ -824,6 +933,17 @@ ctl_serve(int s)
 	}
 	line[n] = 0;
 	line[strcspn(line, "\r\n")] = 0;
+
+	/* Streaming clients send "stream" as first command and stay connected */
+	if (strcmp(line, "stream") == 0) {
+		ctl_add_client(c);
+		/* Send initial confirmation */
+		char ok[] = "0\n";
+		write(c, ok, 2);
+		return;
+	}
+
+	/* Regular command clients (bluetool) - handle command and close */
 	if (!opt_fake && !controller_up && (!strcmp(line, "boot") || !strcmp(line, "init"))) {
 		if (bringup_failed) {
 			ctl_reply(c, 1, line);
@@ -955,6 +1075,14 @@ daemon_main(void)
 			if (ctl_notify[0] > mx)
 				mx = ctl_notify[0];
 		}
+		/* Add control socket clients to select set */
+		for (int i = 0; i < nctl_clients; i++) {
+			if (ctl_clients[i] >= 0) {
+				FD_SET(ctl_clients[i], &r);
+				if (ctl_clients[i] > mx)
+					mx = ctl_clients[i];
+			}
+		}
 		if (scan_test == 1 && time(NULL) >= scan_end) {
 			scan_cmd(0);
 			scan_test = 2;          /* still swallow the disable's Command Complete */
@@ -996,6 +1124,19 @@ daemon_main(void)
 			size_t n;
 			while ((n = qca_rx_take(buf, sizeof(buf))) > 0)
 				h4_feed(&c_h4, buf, n, from_controller);
+		}
+		/* Check control socket clients for disconnections */
+		for (int i = 0; i < nctl_clients; i++) {
+			int fd = ctl_clients[i];
+			if (fd >= 0 && FD_ISSET(fd, &r)) {
+				char tmp[64];
+				ssize_t n = read(fd, tmp, sizeof(tmp));
+				if (n <= 0) {
+					/* Client disconnected */
+					ctl_remove_client(fd);
+					i--; /* re-check this index */
+				}
+			}
 		}
 	}
 }

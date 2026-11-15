@@ -1,0 +1,89 @@
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 18:00:00 +0700
+Subject: [PATCH] sapphire-0345: DSI command sysctl for brightness and deep sleep
+
+Brightness bridge (dsi-brightness-bridge.sh) and thermald need to send
+DSI DCS commands to the panel via kernel. This patch adds
+kern.sweet_dsi_cmd sysctl that accepts a binary payload:
+  [cmd][param_count][param1][param2]...
+
+Commands used:
+  0x51 (Write Display Brightness): 2 params (DBV high, DBV low) - brightness bridge
+  0x28 (Display Off) + 0x10 (Sleep In): 0 params - thermald deep sleep
+  0x11 (Sleep Out) + 0x29 (Display On): 0 params - thermald wake
+
+---
+ bsd/conf/files                  |   1 +
+ bsd/dev/sweet_dsi_cmd.c         | 120 ++++++++++++++++++++++++++++++++
+ 2 files changed, 121 insertions(+)
+ create mode 100644 bsd/dev/sweet_dsi_cmd.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index cd110c2..c29da8d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_dsi_cmd.c			standard
+ bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_audio_dev.c		standard
+ bsd/dev/sweet_qmi_dev.c			standard
+diff --git a/bsd/dev/sweet_dsi_cmd.c b/bsd/dev/sweet_dsi_cmd.c
+new file mode 100644
+index 0000000..6e46e20
+--- /dev/null
++++ b/bsd/dev/sweet_dsi_cmd.c
+@@ -0,0 +1,120 @@
++/*
++ * sapphire-0345: DSI command sysctl for brightness and deep sleep
++ * Provides kern.sweet_dsi_cmd sysctl for userspace to send DCS commands
++ * to the MIPI DSI panel via the display controller (AppleCLCD).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/malloc.h>
++#include <IOKit/IOService.h>
++
++extern "C" {
++    /* Forward declaration from AppleCLCD */
++    int sweet_dsi_send_dcs(const uint8_t *payload, uint32_t len);
++}
++
++static LCK_GRP_DECLARE(sweet_dsi_grp, "sweet_dsi_cmd");
++static LCK_MTX_DECLARE(sweet_dsi_mtx, &sweet_dsi_grp);
++
++static int
++sysctl_sweet_dsi_cmd SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    if (req->newptr == USER_ADDR_NULL) {
++        return EINVAL;  /* write-only */
++    }
++    if (req->newlen == 0 || req->newlen > 64) {
++        return EINVAL;  /* max 64 bytes payload */
++    }
++
++    uint8_t *payload = (uint8_t *)kalloc(req->newlen);
++    if (payload == NULL) {
++        return ENOMEM;
++    }
++
++    int error = SYSCTL_IN(req, payload, req->newlen);
++    if (error == 0) {
++        lck_mtx_lock(&sweet_dsi_mtx);
++        error = sweet_dsi_send_dcs(payload, req->newlen);
++        lck_mtx_unlock(&sweet_dsi_mtx);
++    }
++    kfree(payload, req->newlen);
++    return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_dsi_cmd, CTLTYPE_OPAQUE | CTLFLAG_WR | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_dsi_cmd, "S", "Send DSI DCS command: [cmd][param_count][params...]");
++#endif /* ARM64_BOARD_CONFIG_SWEET */

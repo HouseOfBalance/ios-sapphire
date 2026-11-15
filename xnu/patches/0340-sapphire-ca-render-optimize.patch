@@ -1,157 +1,199 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sapphire <sapphire@local>
-Date: Sat, 14 Nov 2026 16:15:00 +0700
-Subject: [PATCH] sapphire-0340: CoreAnimation: blur reduction, dirty region enforcement, half-res backdrop
+Date: Sat, 14 Nov 2026 16:30:00 +0700
+Subject: [PATCH] sapphire-0340: CoreAnimation: CA_COLOR_OPAQUE, shadow disable, dirty rect telemetry
 
-Adreno 610 fillrate cannot sustain full-res Gaussian blur on 1080x2400.
-Optimizations applied via QuartzCore environment variables and CA flags:
-- CA_DISABLE_BLUR=1: disable expensive CIFilter Gaussian blur
-- CA_HALFRES_BACKDROP=1: render backdrop filters at 1/2 resolution
-- CA_FORCE_DIRTY_RECTS=1: enforce partial updates, no full-screen redraw
-- CA_COLOR_OPAQUE=1: hint opaque layers to skip blending
-- CA_DEBUG_TRANSPARENT=0: disable transparent debugging overlay
+CoreAnimation (QuartzCore) render server drives all UI composition. On Adreno 610
+(256 KB GMEM, 1080x2400 @ 120Hz), blur/shadow/backdrop layers dominate frame time.
+Existing mitigations: vblur=0 (eagl.c), ReduceTransparency/ReduceMotion (Accessibility),
+CA boot args (0335). Gaps: CA_COLOR_OPAQUE not enforced, shadows still render,
+no dirty rect verification, backdrop layer limit not enforced at runtime.
 
-Also adds sysctl kern.sapphire_ca_render for runtime tuning.
+Changes:
+- CA_COLOR_OPAQUE=1 boot arg: forces opaque layer path, skips blend
+- sapphire_ca_shadow_quality=0: disables shadow rendering entirely
+- sapphire_ca_max_backdrop_layers=2: hard limit on stacked backdrop blur layers
+- sapphire_ca_force_dirty_rects=1: already in 0335, add verification sysctl
+- Dirty rect telemetry: sysctl kern.sapphire_ca_dirty_rects shows full vs partial updates
+- Backdrop layer telemetry: sysctl kern.sapphire_ca_backdrops shows active backdrop count
 ---
- bsd/kern/sapphire_ca_render.c | 240 ++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 240 insertions(+)
+ bsd/kern/sweet_ca_render.c | 180 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 180 insertions(+)
 
-diff --git a/bsd/kern/sapphire_ca_render.c b/bsd/kern/sapphire_ca_render.c
-index 0000000..d5e6f7a 100644
+diff --git a/bsd/kern/sweet_ca_render.c b/bsd/kern/sweet_ca_render.c
+index 0000000..c3d4e5f 100644
 --- /dev/null
-+++ b/bsd/kern/sapphire_ca_render.c
-@@ -0,0 +1,240 @@
++++ b/bsd/kern/sweet_ca_render.c
+@@ -0,0 +1,180 @@
 +/*
-+ * sapphire-0340: CoreAnimation Render Optimizations for Adreno 610
-+ * Applies via environment variables read by QuartzCore at process start.
-+ * Also provides sysctl for runtime override.
++ * sapphire-0340: CoreAnimation render optimizations
++ * Enforces CA_COLOR_OPAQUE, disables shadows, limits backdrop layers,
++ * provides dirty rect and backdrop telemetry.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
 +#include <sys/systm.h>
-+#include <sys/sysctl.h>
-+#include <sys/proc.h>
 +#include <sys/kernel.h>
-+#include <kern/task.h>
++#include <sys/sysctl.h>
++#include <sys/lock.h>
++#include <sys/malloc.h>
 +
-+static uint32_t sapphire_ca_disable_blur = 1;
-+static uint32_t sapphire_ca_halfres_backdrop = 1;
-+static uint32_t sapphire_ca_force_dirty_rects = 1;
-+static uint32_t sapphire_ca_color_opaque = 1;
-+static uint32_t sapphire_ca_debug_transparent = 0;
-+static uint32_t sapphire_ca_max_backdrop_layers = 2;  /* limit stacked backdrops */
-+static uint32_t sapphire_ca_shadow_quality = 1;     /* 0=off, 1=low, 2=medium, 3=high */
++/* Boot-time configuration (parsed early from boot args) */
++static uint32_t sweet_ca_color_opaque = 1;           /* CA_COLOR_OPAQUE=1 */
++static uint32_t sweet_ca_shadow_quality = 0;         /* 0=off, 1=low, 2=medium, 3=high */
++static uint32_t sweet_ca_max_backdrop_layers = 2;    /* hard limit */
++static uint32_t sweet_ca_force_dirty_rects = 1;      /* from 0335 */
 +
-+/* 0340: Apply CA environment to a process at exec/execve */
++/* Runtime state (updated by QuartzCore via sysctl hooks) */
++static volatile uint32_t sweet_ca_active_backdrops = 0;
++static volatile uint64_t sweet_ca_fullscreen_updates = 0;
++static volatile uint64_t sweet_ca_partial_updates = 0;
++static volatile uint64_t sweet_ca_shadow_draws = 0;
++static volatile uint64_t sweet_ca_opaque_layer_hits = 0;
++static volatile uint64_t sweet_ca_blend_layer_hits = 0;
++
++/* Called from boot arg parsing (in sweet_init or similar) */
 +void
-+sapphire_ca_apply_env(proc_t p)
++sweet_ca_parse_boot_args(void)
 +{
-+    const char *pname = proc_name_address(p);
-+    if (!pname) return;
++    PE_parse_boot_argn("sapphire_ca_color_opaque", &sweet_ca_color_opaque, sizeof(sweet_ca_color_opaque));
++    PE_parse_boot_argn("sapphire_ca_shadow_quality", &sweet_ca_shadow_quality, sizeof(sweet_ca_shadow_quality));
++    PE_parse_boot_argn("sapphire_ca_max_backdrop_layers", &sweet_ca_max_backdrop_layers, sizeof(sweet_ca_max_backdrop_layers));
++    PE_parse_boot_argn("sapphire_ca_force_dirty_rects", &sweet_ca_force_dirty_rects, sizeof(sweet_ca_force_dirty_rects));
 +
-+    /* Only apply to UI processes that use CoreAnimation heavily */
-+    boolean_t is_ui = FALSE;
-+    if (strcmp(pname, "SpringBoard") == 0 ||
-+        strcmp(pname, "backboardd") == 0 ||
-+        strcmp(pname, "WindowServer") == 0 ||
-+        strcmp(pname, "UIKit") == 0 ||
-+        strstr(pname, "UI") != NULL) {
-+        is_ui = TRUE;
-+    }
++    if (sweet_ca_max_backdrop_layers > 4) sweet_ca_max_backdrop_layers = 4;
++    if (sweet_ca_shadow_quality > 3) sweet_ca_shadow_quality = 3;
 +
-+    if (!is_ui) return;
-+
-+    /* Set environment variables for QuartzCore */
-+    char *envp[] = {
-+        sapphire_ca_disable_blur ? "CA_DISABLE_BLUR=1" : "CA_DISABLE_BLUR=0",
-+        sapphire_ca_halfres_backdrop ? "CA_HALFRES_BACKDROP=1" : "CA_HALFRES_BACKDROP=0",
-+        sapphire_ca_force_dirty_rects ? "CA_FORCE_DIRTY_RECTS=1" : "CA_FORCE_DIRTY_RECTS=0",
-+        sapphire_ca_color_opaque ? "CA_COLOR_OPAQUE=1" : "CA_COLOR_OPAQUE=0",
-+        sapphire_ca_debug_transparent ? "CA_DEBUG_TRANSPARENT=1" : "CA_DEBUG_TRANSPARENT=0",
-+        "CA_MAX_BACKDROP_LAYERS=2",
-+        "CA_SHADOW_QUALITY=1",
-+        "CA_OPTIMIZE_FOR_TILE=1",
-+        "CA_DISABLE_DEPTH_SORT=1",
-+        NULL
-+    };
-+
-+    /* Apply to process environment */
-+    for (int i = 0; envp[i]; i++) {
-+        char *eq = strchr(envp[i], '=');
-+        if (eq) {
-+            *eq = '\0';
-+            setenv(envp[i], eq + 1, 1);
-+            *eq = '=';
-+        }
-+    }
-+
-+    printf("SAPPHIRE_CA: applied render optimizations to %s\n", pname);
++    printf("SWEET_CA: color_opaque=%u shadow_quality=%u max_backdrops=%u force_dirty=%u\n",
++           sweet_ca_color_opaque, sweet_ca_shadow_quality, sweet_ca_max_backdrop_layers, sweet_ca_force_dirty_rects);
 +}
 +
-+/* 0340: Hook into proc_exec to apply CA env */
-+static int
-+sapphire_ca_exec_hook(struct proc *p, struct image_params *imgp)
++/* 0340: Called by QuartzCore when processing layer tree - enforce opaque hint */
++boolean_t
++sweet_ca_layer_should_be_opaque(void *layer)
 +{
-+    sapphire_ca_apply_env(p);
-+    return 0;
++    if (!sweet_ca_color_opaque) return FALSE;
++    /* QuartzCore internal: if layer has no opacity/blend, mark opaque */
++    return TRUE;  /* aggressive: assume opaque unless proven otherwise */
 +}
 +
-+/* 0340: Sysctl for runtime tuning */
++/* 0340: Called by QuartzCore before drawing shadow - enforce quality limit */
++boolean_t
++sweet_ca_should_draw_shadow(void *layer)
++{
++    if (sweet_ca_shadow_quality == 0) {
++        sweet_ca_shadow_draws++;
++        return FALSE;  /* shadows completely disabled */
++    }
++    return TRUE;
++}
++
++/* 0340: Called by QuartzCore when adding backdrop layer - enforce limit */
++boolean_t
++sweet_ca_can_add_backdrop(void)
++{
++    if (sweet_ca_active_backdrops >= sweet_ca_max_backdrop_layers) {
++        return FALSE;  /* reject additional backdrop layers */
++    }
++    sweet_ca_active_backdrops++;
++    return TRUE;
++}
++
++/* 0340: Called by QuartzCore when backdrop layer removed */
++void
++sweet_ca_remove_backdrop(void)
++{
++    if (sweet_ca_active_backdrops > 0) {
++        sweet_ca_active_backdrops--;
++    }
++}
++
++/* 0340: Called by QuartzCore on layer update - track dirty rect vs full */
++void
++sweet_ca_record_update(boolean_t is_fullscreen)
++{
++    if (is_fullscreen) {
++        sweet_ca_fullscreen_updates++;
++    } else {
++        sweet_ca_partial_updates++;
++    }
++}
++
++/* 0340: Called by QuartzCore on layer draw - track opaque vs blend */
++void
++sweet_ca_record_layer_draw(boolean_t is_opaque)
++{
++    if (is_opaque) {
++        sweet_ca_opaque_layer_hits++;
++    } else {
++        sweet_ca_blend_layer_hits++;
++    }
++}
++
++/* 0340: Sysctl for dirty rect telemetry */
 +static int
-+sysctl_sapphire_ca_render SYSCTL_HANDLER_ARGS
++sysctl_sweet_ca_dirty_rects SYSCTL_HANDLER_ARGS
 +{
 +#pragma unused(oidp, arg1, arg2)
 +    char out[256];
 +    int error = 0;
 +    size_t off = 0;
++    uint64_t total = sweet_ca_fullscreen_updates + sweet_ca_partial_updates;
++    uint32_t partial_pct = total ? (uint32_t)((sweet_ca_partial_updates * 100) / total) : 0;
 +
 +    off += snprintf(out + off, sizeof(out) - off,
-+        "blur:%u halfres:%u dirty:%u opaque:%u transparent:%u max_backdrop:%u shadow:%u",
-+        sapphire_ca_disable_blur, sapphire_ca_halfres_backdrop,
-+        sapphire_ca_force_dirty_rects, sapphire_ca_color_opaque,
-+        sapphire_ca_debug_transparent, sapphire_ca_max_backdrop_layers,
-+        sapphire_ca_shadow_quality);
++        "fullscreen:%llu partial:%llu partial_pct:%u%% force_dirty:%u",
++        (unsigned long long)sweet_ca_fullscreen_updates,
++        (unsigned long long)sweet_ca_partial_updates,
++        partial_pct, sweet_ca_force_dirty_rects);
 +
 +    if (!error) error = SYSCTL_OUT(req, out, off + 1);
 +    return error;
 +}
 +
++/* 0340: Sysctl for backdrop telemetry */
 +static int
-+sysctl_sapphire_ca_blur SYSCTL_HANDLER_ARGS
++sysctl_sweet_ca_backdrops SYSCTL_HANDLER_ARGS
 +{
 +#pragma unused(oidp, arg1, arg2)
-+    return sysctl_handle_int(oidp, &sapphire_ca_disable_blur, 0, req);
++    char out[128];
++    int error = 0;
++    size_t off = 0;
++
++    off += snprintf(out + off, sizeof(out) - off,
++        "active:%u max:%u shadows_drawn:%llu shadow_quality:%u",
++        sweet_ca_active_backdrops, sweet_ca_max_backdrop_layers,
++        (unsigned long long)sweet_ca_shadow_draws, sweet_ca_shadow_quality);
++
++    if (!error) error = SYSCTL_OUT(req, out, off + 1);
++    return error;
 +}
 +
++/* 0340: Sysctl for layer opacity telemetry */
 +static int
-+sysctl_sapphire_ca_halfres SYSCTL_HANDLER_ARGS
++sysctl_sweet_ca_layers SYSCTL_HANDLER_ARGS
 +{
 +#pragma unused(oidp, arg1, arg2)
-+    return sysctl_handle_int(oidp, &sapphire_ca_halfres_backdrop, 0, req);
++    char out[128];
++    int error = 0;
++    size_t off = 0;
++    uint64_t total = sweet_ca_opaque_layer_hits + sweet_ca_blend_layer_hits;
++    uint32_t opaque_pct = total ? (uint32_t)((sweet_ca_opaque_layer_hits * 100) / total) : 0;
++
++    off += snprintf(out + off, sizeof(out) - off,
++        "opaque:%llu blend:%llu opaque_pct:%u%% color_opaque:%u",
++        (unsigned long long)sweet_ca_opaque_layer_hits,
++        (unsigned long long)sweet_ca_blend_layer_hits,
++        opaque_pct, sweet_ca_color_opaque);
++
++    if (!error) error = SYSCTL_OUT(req, out, off + 1);
++    return error;
 +}
 +
-+static int
-+sysctl_sapphire_ca_dirty SYSCTL_HANDLER_ARGS
-+{
-+#pragma unused(oidp, arg1, arg2)
-+    return sysctl_handle_int(oidp, &sapphire_ca_force_dirty_rects, 0, req);
-+}
-+
-+static int
-+sysctl_sapphire_ca_shadow SYSCTL_HANDLER_ARGS
-+{
-+#pragma unused(oidp, arg1, arg2)
-+    return sysctl_handle_int(oidp, &sapphire_ca_shadow_quality, 0, req);
-+}
-+
-+SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_render, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
-+    0, 0, sysctl_sapphire_ca_render, "A", "CoreAnimation render optimization status");
-+SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_disable_blur, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-+    0, 0, sysctl_sapphire_ca_blur, "I", "disable Gaussian blur (0/1)");
-+SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_halfres_backdrop, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-+    0, 0, sysctl_sapphire_ca_halfres, "I", "half-res backdrop filters (0/1)");
-+SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_force_dirty_rects, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-+    0, 0, sysctl_sapphire_ca_dirty, "I", "enforce dirty region partial updates (0/1)");
-+SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_shadow_quality, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
-+    0, 0, sysctl_sapphire_ca_shadow, "I", "shadow quality 0=off 1=low 2=med 3=high");
++SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_dirty_rects, CTLTYPE_STRING | CTLTFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ca_dirty_rects, "A", "CA dirty rect stats: fullscreen/partial/percentage/force_dirty");
++SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_backdrops, CTLTYPE_STRING | CTLTFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ca_backdrops, "A", "CA backdrop stats: active/max/shadows/shadow_quality");
++SYSCTL_PROC(_kern, OID_AUTO, sapphire_ca_layers, CTLTYPE_STRING | CTLTFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_ca_layers, "A", "CA layer opacity stats: opaque/blend/percentage/color_opaque");
 +#endif /* ARM64_BOARD_CONFIG_SWEET */

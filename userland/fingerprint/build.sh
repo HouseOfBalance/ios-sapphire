@@ -8,7 +8,14 @@ set -e
 cd "$(dirname "$0")"
 SDK=${SDK:-$HOME/sdks/theos-sdks/iPhoneOS16.5.sdk}
 LDID=${LDID:-$HOME/tools-dl/ldid/ldid}
-CC="/usr/lib/llvm-18/bin/clang -target arm64-apple-ios15.0 -isysroot $SDK -fuse-ld=lld -O2 -Wall"
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    CC_BIN="${CC:-$(xcrun -find clang)}"
+    LDFLAGS=""
+else
+    CC_BIN="${CC:-/usr/lib/llvm-18/bin/clang}"
+    LDFLAGS="-fuse-ld=lld"
+fi
+CC="$CC_BIN -target arm64-apple-ios15.0 -isysroot $SDK $LDFLAGS -O2 -Wall"
 out=${1:-/tmp}
 $CC -framework CoreFoundation -o "$out/fpd" fpd.c
 $CC -o "$out/fpload" fpload.c

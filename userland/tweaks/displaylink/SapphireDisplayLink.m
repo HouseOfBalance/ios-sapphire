@@ -107,6 +107,16 @@ typedef struct {
     uint32_t consecutive_misses;     /* frames missing deadline */
     uint32_t quality_level;          /* 0=full, 1=half-res, 2=minimal */
     uint64_t frame_start_ts;         /* frame render start timestamp */
+
+    /* 0348: Cached sysctl values - updated every 4 frames */
+    uint32_t cached_gpu_util;
+    uint64_t cached_vsync_ts;
+    uint32_t frame_counter;
+    uint32_t sysctl_read_interval;   /* read sysctl every N frames */
+
+    /* 0348: Adaptive phase prediction (EMA) */
+    int64_t phase_error_ema;         /* exponential moving average of phase error */
+    uint32_t adaptive_phase_offset_us; /* dynamically adjusted phase offset */
 } dl_frame_pacing_t;
 
 static dl_frame_pacing_t dl_pacing = {
@@ -114,6 +124,9 @@ static dl_frame_pacing_t dl_pacing = {
     .render_budget_ns = 5833333,     /* 70% of frame */
     .phase_offset_us = 500,          /* 500 µs before vsync */
     .quality_level = 0,
+    .sysctl_read_interval = 4,       /* read sysctl every 4 frames */
+    .adaptive_phase_offset_us = 500,
+    .phase_error_ema = 0,
 };
 
 static bool
@@ -307,20 +320,33 @@ dl_predictive_boost(id link)
 	dl_last_frame_time = now;
 }
 
-/* 0342: Read hardware VSYNC timestamp from kernel */
+/* 0348: Read hardware VSYNC timestamp from kernel (CACHED - reads every N frames) */
 static uint64_t
 dl_read_hw_vsync_ts(void)
 {
+    /* Return cached value most of the time */
+    if (dl_pacing.frame_counter % dl_pacing.sysctl_read_interval != 0) {
+        return dl_pacing.cached_vsync_ts;
+    }
+
     size_t len = sizeof(uint64_t);
     uint64_t ts = 0;
     sysctlbyname("kern.sweet_fb_vsync_ts", &ts, &len, NULL, 0);
+    if (ts != 0) {
+        dl_pacing.cached_vsync_ts = ts;
+    }
     return ts;
 }
 
-/* 0342: Read current GPU utilization for budget adjustment */
+/* 0348: Read current GPU utilization for budget adjustment (CACHED - reads every N frames) */
 static uint32_t
 dl_read_gpu_util(void)
 {
+    /* Return cached value most of the time */
+    if (dl_pacing.frame_counter % dl_pacing.sysctl_read_interval != 0) {
+        return dl_pacing.cached_gpu_util;
+    }
+
     size_t len = 0;
     sysctlbyname("kern.sweet_fb_dynamic_rscale", NULL, &len, NULL, 0);
     if (len > 0) {
@@ -331,13 +357,16 @@ dl_read_gpu_util(void)
             uint32_t util = 0;
             if (p) sscanf(p, "gpu_util:%u", &util);
             free(buf);
-            return util;
+            if (util > 0) {
+                dl_pacing.cached_gpu_util = util;
+                return util;
+            }
         }
     }
-    return 500;  /* default 50% */
+    return dl_pacing.cached_gpu_util > 0 ? dl_pacing.cached_gpu_util : 500;
 }
 
-/* 0342: Update frame pacing parameters based on vsync phase */
+/* 0348: Update frame pacing parameters based on vsync phase with adaptive prediction */
 static void
 dl_update_frame_pacing(void)
 {
@@ -346,39 +375,74 @@ dl_update_frame_pacing(void)
 
     if (hw_vsync == 0) return;  /* not available yet */
 
+    dl_pacing.frame_counter++;
+
     if (!dl_pacing.vsync_aligned) {
         /* First sync - align to next vsync boundary */
         uint64_t phase = (now - hw_vsync) % dl_pacing.vsync_period_ns;
         dl_pacing.next_frame_target_ts = hw_vsync + dl_pacing.vsync_period_ns - dl_pacing.phase_offset_us * 1000;
         dl_pacing.vsync_aligned = TRUE;
+        dl_pacing.adaptive_phase_offset_us = dl_pacing.phase_offset_us;
         printf("SapphireDL: VSYNC aligned, phase=%llu ns\n", phase);
         return;
     }
 
-    /* Check if we missed the deadline */
-    if (now > dl_pacing.next_frame_target_ts) {
-        dl_pacing.consecutive_misses++;
-        uint64_t late_ns = now - dl_pacing.next_frame_target_ts;
+    /* 0348: Calculate phase error for adaptive prediction */
+    int64_t phase_error_ns = (int64_t)(dl_pacing.next_frame_target_ts - now);
 
-        if (dl_pacing.consecutive_misses >= 3 && dl_pacing.quality_level < 2) {
+    /* Check if we missed the deadline */
+    if (phase_error_ns < 0) {
+        dl_pacing.consecutive_misses++;
+        uint64_t late_ns = -phase_error_ns;
+
+        /* 0348: Quality reduction with HYSTERESIS - need 5 consecutive misses before downgrade */
+        if (dl_pacing.consecutive_misses >= 5 && dl_pacing.quality_level < 2) {
             dl_pacing.quality_level++;
             dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * (70 - dl_pacing.quality_level * 15) / 100;
             printf("SapphireDL: quality reduced to level %u, budget=%llu ns\n",
                    dl_pacing.quality_level, dl_pacing.render_budget_ns);
         }
     } else {
-        dl_pacing.consecutive_misses = 0;
+        /* 0348: Hysteresis - need 5 consecutive GOOD frames before upgrade */
+        if (dl_pacing.consecutive_misses > 0) {
+            dl_pacing.consecutive_misses = 0;
+        }
         if (dl_pacing.quality_level > 0) {
-            dl_pacing.quality_level--;
-            dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * (70 + dl_pacing.quality_level * 15) / 100;
+            /* Count good frames for upgrade */
+            static uint32_t good_frames = 0;
+            good_frames++;
+            if (good_frames >= 5) {
+                dl_pacing.quality_level--;
+                dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * (70 + dl_pacing.quality_level * 15) / 100;
+                good_frames = 0;
+                printf("SapphireDL: quality increased to level %u, budget=%llu ns\n",
+                       dl_pacing.quality_level, dl_pacing.render_budget_ns);
+            }
+        } else {
+            static uint32_t good_frames = 0;
+            good_frames = 0;
         }
     }
 
-    /* Schedule next frame at vsync - render_budget */
-    uint64_t next_vsync = hw_vsync + dl_pacing.vsync_period_ns;
-    dl_pacing.next_frame_target_ts = next_vsync - dl_pacing.render_budget_ns;
+    /* 0348: Adaptive phase offset using EMA (alpha = 0.25) */
+    if (phase_error_ns != 0) {
+        /* EMA: new_ema = old_ema * 0.75 + new_value * 0.25 */
+        dl_pacing.phase_error_ema = (dl_pacing.phase_error_ema * 3 + phase_error_ns) / 4;
 
-    /* Adjust for GPU utilization */
+        /* Adjust phase offset based on EMA (clamp to reasonable range) */
+        int64_t adjustment_us = dl_pacing.phase_error_ema / 4000; /* scale down */
+        int64_t new_offset = dl_pacing.adaptive_phase_offset_us + adjustment_us;
+
+        if (new_offset < 200) new_offset = 200;      /* min 200µs */
+        if (new_offset > 2000) new_offset = 2000;    /* max 2000µs */
+        dl_pacing.adaptive_phase_offset_us = (uint32_t)new_offset;
+    }
+
+    /* Schedule next frame at vsync - render_budget using ADAPTIVE phase offset */
+    uint64_t next_vsync = hw_vsync + dl_pacing.vsync_period_ns;
+    dl_pacing.next_frame_target_ts = next_vsync - (uint64_t)dl_pacing.adaptive_phase_offset_us * 1000;
+
+    /* Adjust for GPU utilization (using cached value) */
     uint32_t gpu_util = dl_read_gpu_util();
     if (gpu_util > 800) {
         dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * 60 / 100;  /* reduce to 60% */

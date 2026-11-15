@@ -38,9 +38,44 @@ for c in "$mnt"/private/var/mobile/Containers/Data/Application/*/; do
 	fi
 done
 conf="$mnt/private/var/jb/etc/apt/apt.conf.d/20sapphire-sandbox.conf"
-echo 'APT::Sandbox::User "root";' > "$conf"
+cat > "$conf" <<'APTEOF'
+APT::Sandbox::User "root";
+Dir::Bin::methods "/var/jb/usr/lib/apt/methods";
+Dir::Bin::solvers "/var/jb/usr/lib/apt/solvers";
+APT::Sandbox::Seccomp "false";
+DPkg::Pre-Install-Pkgs {"/var/jb/usr/libexec/dpkg-pre-install";};
+APTEOF
 chmod 644 "$conf"
 files="$files $conf"
+
+# Ensure CaInfo is set for HTTPS (libgnutls needs this)
+ca_conf="$mnt/private/var/jb/etc/apt/apt.conf.d/10sapphire.conf"
+if [ ! -f "$ca_conf" ]; then
+    echo 'Acquire::https::CaInfo "/var/jb/etc/ssl/certs/cacert.pem";' > "$ca_conf"
+    chmod 644 "$ca_conf"
+    files="$files $ca_conf"
+fi
+
+# Fix apt-get wrapper if it exists (redirect log to /tmp)
+apt_get_wrapper="$mnt/private/var/jb/usr/bin/apt-get"
+if [ -f "$apt_get_wrapper" ]; then
+    sed -i 's|/var/jb/var/log/aptwrap.log|/tmp/aptwrap.log|g' "$apt_get_wrapper" 2>/dev/null || true
+fi
+
+# Ensure https method symlink exists
+methods_dir="$mnt/private/var/jb/usr/lib/apt/methods"
+if [ -f "$methods_dir/http" ] && [ ! -L "$methods_dir/https" ]; then
+    ln -sf http "$methods_dir/https"
+    chmod 755 "$methods_dir/https"
+fi
+
+# Fix log permissions
+log_dir="$mnt/private/var/jb/var/log"
+mkdir -p "$log_dir"
+chmod 777 "$log_dir"
+touch "$log_dir/aptwrap.log"
+chmod 666 "$log_dir/aptwrap.log"
+chown 501:501 "$log_dir/aptwrap.log"
 sync
 python3 -I - $files > "$out/files.runs" <<'PY'
 import fcntl, os, struct, sys

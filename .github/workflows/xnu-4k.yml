@@ -6,6 +6,11 @@ name: xnu-4k
 
 on:
   workflow_dispatch:
+  push:
+    branches: [sapphire, main]
+    paths:
+      - "xnu/patches/**"
+      - ".github/workflows/xnu-4k.yml"
 
 concurrency:
   group: xnu-4k-${{ github.ref }}

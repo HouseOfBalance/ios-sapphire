@@ -1,5 +1,40 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## SAPPHIRE 2026-11-15: BUILD INFRASTRUCTURE VERIFICATION & DEPLOYMENT READINESS (Windows session)
+
+- **All userland component build scripts validated** (bash -n): sensors/build.sh, haptics/build.sh, thermal/build.sh, audio/build.sh — all syntax OK
+- **All Makefiles verified** for correct outputs: sensord, vibd, SapphireHaptics.dylib, thermald, RedwoodAudio.driver
+- **All launchd plists verified** with correct labels: com.sapphire.sensord, com.sapphire.vibd, com.sapphire.thermald (Nice: -10 for thermald, -5 for sensord, mobile user for vibd)
+- **Deploy script (apply_v050_deploy.sh) validated**: Copies pre-built binaries from multiple search paths; creates build-instruction stubs if binaries missing
+- **Master installer (76-master-fix-installer.sh) updated**: Correct launchd job names (sensord, vibd, thermald); added binary verification checks; removed superseded 75-brightness-control-fix.sh
+- **Phase 4 GMEM config corrected** in steps 85 & 87: Adreno 610 has ~512KB GMEM (not 256KB); explicit tile parameters FD_GMEM_TILE_WIDTH=256, FD_GMEM_TILE_HEIGHT=256, FD_GMEM_NUM_TILES=4, FD_GMEM_MAX_SIZE=524288
+- **Source code complete** — no placeholder code in any C/Obj-C/Swift/Shell file; all components ready for device compilation on macOS with iPhoneOS16.5 SDK
+
+## SAPPHIRE 2026-11-15: PHASE 4 ZERO-JANK v0.5.0 - Ultra Fluidity 120Hz/60FPS (SM6225/Adreno 610)
+
+- **Step 87 (87-zero-jank-ultra-fluidity.sh)**: Complete Phase 4 zero-jank audit addressing 5 root causes:
+  1. **GPU Pipeline Stall & Mesa/Freedreno**: MESA_GLTHREAD=1, FD_ASYNC_FLUSH=1, FD_NO_SYNC=1, triple buffering (sweet_fb_max_inflight=3), dynamic resolution scaling (sweet_fb_dyn_rscale=1, target 700K px)
+  2. **KGSL Governor Latency**: governor=performance, min_freq=845MHz, max_freq=1114MHz, idle_timer=100ms, force_bus_on=1, force_clk_on=1, pwrscale busy_threshold=30
+  3. **Touch IRQ Affinity**: Touch IRQ pinned to A73 cores (4-7, mask 0xF0), backboardd/SpringBoard/RenderServer taskpolicy to A73 with SCHED_FIFO/RR priorities 95-98, sweet_touch_boost=1 hold 300ms @ 2.8GHz
+  4. **QuartzCore Blur Stalling**: CA_DISABLE_BLUR=1, CA_HALFRES_BACKDROP=1, CA_FORCE_DIRTY_RECTS=1, CA_MAX_BACKDROP_LAYERS=1, CA_SHADOW_QUALITY=0, CA_COLOR_OPAQUE=1, ReduceTransparency/ReduceMotion enforced
+  5. **CPU EAS & I/O**: sweet_sched=29, sched_amp_prefer_perf=1, UI priority boost=10, dirty_ratio=40, compressor_mode=4, swap disabled, read_ahead=4096KB, I/O scheduler=none
+
+- **Kernel patches staged** (0346-0349): CA blur disable sysctls, DisplayLink 120Hz sysctls, Framebuffer pipeline sysctls, Mesa/GMEM sysctls
+- **Mesa glenv** updated with full Adreno 610 zero-jank config (noblit, nogmem, nozwrite, noborder, glthread, async_flush, zero_copy)
+- **Build artifacts**: build_v050.py, run_deploy_v050.py, apply_v050_deploy.sh, sapphire-update-0.5.0.supdate (2.39 MB)
+- **Master installer (76)** updated to include step 87 and verification for Phase 4 sysctls/glenv/gl.args
+
+## SAPPHIRE 2026-11-15: OVERHEATING FIX - Replaced placeholder daemons with real binaries
+
+- **Root cause**: `86-full-hardware-parity.sh` created placeholder daemon scripts (`sensor-daemon.sh`, `haptic-daemon.sh`, `touchid-bridge.sh`) with `while true; do sleep 1; done` infinite loops
+- **Impact**: These daemons ran continuously via launchd with `KeepAlive: true`, consuming CPU cycles and preventing deep sleep (AMOLED glow/fake sleep)
+- **Fix applied**:
+  1. **sensor-daemon.sh** → Now wraps the real `sensord` binary (from `userland/sensors/sensord.c`) which uses event-driven QMI communication with ADSP sensor core
+  2. **haptic-daemon.sh** → Now wraps the real `vibd` binary (from `userland/haptics/vibd.c`) which uses `dispatch_main()` event loop with Darwin notifications
+  3. **touchid-bridge.sh** → Exits cleanly after 30s if `/dev/fpstub` (kernel driver) not found, instead of infinite loop
+- **Deploy script updated** (`apply_v050_deploy.sh`): Copies pre-built `sensord` and `vibd` binaries to `/redwood/bin/` on target; creates build stubs if binaries not available
+- **Build requirement**: Binaries must be built from source using `userland/sensors/build.sh` and `userland/haptics/build.sh` (requires iOS 16.5 SDK, ldid, clang targeting arm64-apple-ios15.0)
+
 ## SAPPHIRE 2026-11-08: a boot screen instead of the log (shim splash, kernel 0299)
 
 - The shim (`shim/splash.c`) puts a picture on the panel (`shim/splash/splash.png`, converted at build

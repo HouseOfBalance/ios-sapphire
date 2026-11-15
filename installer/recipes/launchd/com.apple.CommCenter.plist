@@ -47,7 +47,7 @@
 		<string>Interactive</string>
 		<key>ProgramArguments</key>
 		<array>
-			<string>/System/Library/Frameworks/CoreTelephony.framework/Support/CommCenter</string>
+			<string>/redwood/bin/ccstart</string>
 		</array>
 		<key>UserName</key>
 		<string>_wireless</string>

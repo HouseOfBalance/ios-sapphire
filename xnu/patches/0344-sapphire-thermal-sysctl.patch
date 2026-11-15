@@ -1,0 +1,186 @@
+From: Sapphire <sapphire@local>
+Date: Sat, 14 Nov 2026 18:00:00 +0700
+Subject: [PATCH] sapphire-0344: Thermal sysctls for thermald daemon
+
+Thermald daemon (userland/thermal/thermald.c) needs kernel sysctls to:
+- Read per-zone temperatures (millicelsius)
+- Report thermal state (0=Normal, 1=Warm, 2=Hot, 3=Critical)
+- Report active thermal policy bitmask
+- Track deep sleep state (screen off + panel asleep)
+
+These are exposed via kern.sweet_thermal_zone[N], kern.sweet_thermal_state,
+kern.sweet_thermal_policy, kern.sweet_deep_sleep.
+---
+ bsd/conf/files                  |   1 +
+ bsd/dev/sweet_thermal.c         | 180 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 181 insertions(+)
+ create mode 100644 bsd/dev/sweet_thermal.c
+
+diff --git a/bsd/conf/files b/bsd/conf/files
+index cd110c2..c29da8d 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_i2c1.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_thermal.c			standard
+ bsd/dev/sweet_audio_ctl.c		standard
+ bsd/dev/sweet_audio_dev.c		standard
+ bsd/dev/sweet_qmi_dev.c			standard
+diff --git a/bsd/dev/sweet_thermal.c b/bsd/dev/sweet_thermal.c
+new file mode 100644
+index 0000000..6e46e20
+--- /dev/null
++++ b/bsd/dev/sweet_thermal.c
+@@ -0,0 +1,180 @@
++/*
++ * sapphire-0344: Thermal sysctls for thermald daemon
++ * Provides kern.sweet_thermal_zone[N], kern.sweet_thermal_state,
++ * kern.sweet_thermal_policy, kern.sweet_deep_sleep
++ * Zone mapping for SM6225:
++ *   Zone 0: SoC / CPU cluster (A73/A53)
++ *   Zone 1: GPU (Adreno 610)
++ *   Zone 2: Battery PMIC (PM6225)
++ *   Zone 3: Skin temperature (if available)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/malloc.h>
++#include <machine/machine_routines.h>
++
++#define SWEET_THERMAL_ZONES    4
++
++/* Thermal states (match thermald.c) */
++#define THERMAL_NORMAL     0
++#define THERMAL_WARM       1
++#define THERMAL_HOT        2
++#define THERMAL_CRITICAL   3
++
++/* Policy bitmask (match thermald.c) */
++#define POLICY_A73_LIMIT_2400   (1u << 0)
++#define POLICY_A73_LIMIT_1900   (1u << 1)
++#define POLICY_A73_MIN_FREQ     (1u << 2)
++#define POLICY_GPU_LIMIT_900    (1u << 3)
++#define POLICY_GPU_LIMIT_610    (1u << 4)
++#define POLICY_GPU_MIN_FREQ     (1u << 5)
++#define POLICY_DISABLE_BOOST    (1u << 6)
++#define POLICY_DEEP_SLEEP       (1u << 7)
++
++static LCK_GRP_DECLARE(sweet_thermal_grp, "sweet_thermal");
++static LCK_MTX_DECLARE(sweet_thermal_mtx, &sweet_thermal_grp);
++
++static int32_t sweet_thermal_zone_temp[SWEET_THERMAL_ZONES] = { 25000, 25000, 25000, 25000 };
++static uint32_t sweet_thermal_state = THERMAL_NORMAL;
++static uint32_t sweet_thermal_policy = 0;
++static uint32_t sweet_deep_sleep = 0;
++
++/* Called by platform code (e.g., RPMh, PMIC drivers) to update zone temperature */
++int
++sweet_thermal_zone_update(int zone, int32_t temp_millicelsius)
++{
++    if (zone < 0 || zone >= SWEET_THERMAL_ZONES) {
++        return EINVAL;
++    }
++    lck_mtx_lock(&sweet_thermal_mtx);
++    sweet_thermal_zone_temp[zone] = temp_millicelsius;
++    lck_mtx_unlock(&sweet_thermal_mtx);
++    return 0;
++}
++
++/* Called by thermald or platform to update thermal state */
++int
++sweet_thermal_state_update(uint32_t state, uint32_t policy)
++{
++    if (state > THERMAL_CRITICAL) {
++        return EINVAL;
++    }
++    lck_mtx_lock(&sweet_thermal_mtx);
++    sweet_thermal_state = state;
++    sweet_thermal_policy = policy;
++    lck_mtx_unlock(&sweet_thermal_mtx);
++    return 0;
++}
++
++/* Called by display driver on screen blank/unblank */
++int
++sweet_thermal_deep_sleep_set(uint32_t deep_sleep)
++{
++    lck_mtx_lock(&sweet_thermal_mtx);
++    sweet_deep_sleep = deep_sleep ? 1 : 0;
++    if (deep_sleep) {
++        sweet_thermal_policy |= POLICY_DEEP_SLEEP;
++    } else {
++        sweet_thermal_policy &= ~POLICY_DEEP_SLEEP;
++    }
++    lck_mtx_unlock(&sweet_thermal_mtx);
++    return 0;
++}
++
++static int
++sysctl_sweet_thermal_zone SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    int zone = *(int *)arg1;
++    if (zone < 0 || zone >= SWEET_THERMAL_ZONES) {
++        return EINVAL;
++    }
++    int32_t temp;
++    lck_mtx_lock(&sweet_thermal_mtx);
++    temp = sweet_thermal_zone_temp[zone];
++    lck_mtx_unlock(&sweet_thermal_mtx);
++    return sysctl_io_number(req, temp, sizeof(temp), &temp, NULL);
++}
++
++static int
++sysctl_sweet_thermal_state SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    uint32_t state;
++    lck_mtx_lock(&sweet_thermal_mtx);
++    state = sweet_thermal_state;
++    lck_mtx_unlock(&sweet_thermal_mtx);
++    return sysctl_io_number(req, state, sizeof(state), &state, NULL);
++}
++
++static int
++sysctl_sweet_thermal_policy SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    uint32_t policy;
++    lck_mtx_lock(&sweet_thermal_mtx);
++    policy = sweet_thermal_policy;
++    lck_mtx_unlock(&sweet_thermal_mtx);
++    return sysctl_io_number(req, policy, sizeof(policy), &policy, NULL);
++}
++
++static int
++sysctl_sweet_deep_sleep SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    uint32_t ds;
++    lck_mtx_lock(&sweet_thermal_mtx);
++    ds = sweet_deep_sleep;
++    lck_mtx_unlock(&sweet_thermal_mtx);
++    return sysctl_io_number(req, ds, sizeof(ds), &ds, NULL);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal_zone0, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    (int[]){0}, 0, sysctl_sweet_thermal_zone, "I", "Zone 0 temperature (SoC/CPU) in millicelsius");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal_zone1, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    (int[]){1}, 0, sysctl_sweet_thermal_zone, "I", "Zone 1 temperature (GPU) in millicelsius");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal_zone2, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    (int[]){2}, 0, sysctl_sweet_thermal_zone, "I", "Zone 2 temperature (Battery PMIC) in millicelsius");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal_zone3, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    (int[]){3}, 0, sysctl_sweet_thermal_zone, "I", "Zone 3 temperature (Skin) in millicelsius");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal_state, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_thermal_state, "I", "Thermal state: 0=Normal, 1=Warm, 2=Hot, 3=Critical");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_thermal_policy, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_thermal_policy, "I", "Active thermal policy bitmask");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_deep_sleep, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_deep_sleep, "I", "Deep sleep active: 1=screen off + panel asleep, 0=awake");
++#endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -1,185 +1,177 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sapphire <sapphire@local>
-Date: Sat, 14 Nov 2026 16:45:00 +0700
-Subject: [PATCH] sapphire-0342: DisplayLink: hardware VSYNC alignment, predictive frame pacing
+Date: Sat, 14 Nov 2026 17:30:00 +0700
+Subject: [PATCH] sapphire-0342: DisplayLink: cached sysctl, adaptive phase EMA, quality hysteresis
 
-SapphireDisplayLink.m (0339) promotes rates but doesn't align to hardware vsync.
-Frame cadence mismatch causes judder: render completes at t=8.2ms but vsync at t=8.33ms,
-next frame starts late, accumulates phase drift.
+SapphireDisplayLink.m (userland) polls sysctl every frame: kern.sweet_fb_vsync_ts,
+kern.sapphire_gpu_util. Each sysctlbyname() + malloc + parse = 50-100 µs.
+At 120 Hz = 6-12 ms/s CPU burned. Also fixed 500 µs phase offset doesn't adapt.
 
-Solution:
-- Kernel exposes VSYNC timestamp via sysctl (kern.sweet_fb_vsync_ts)
-- DisplayLink reads vsync phase, schedules next frame at vsync - render_budget
-- Predictive frame budget from dynamic rscale (0337) GPU util
-- Frame deadline monitoring with adaptive quality reduction
+Changes in kernel (this patch):
+- Cached VSYNC timestamp: kernel exports latest vsync_ts via single sysctl read
+- GPU util cached: updated from flip completion, not string-parsed
+- sysctl kern.sapphire_dl_vsync exports struct with ts, gpu_util, frame_count
+- Adaptive phase prediction: kernel provides EMA filter coefficients
+- Quality reduction hysteresis: requires 5 consecutive misses/good frames
+
+Userland (SapphireDisplayLink.m) changes in separate commit.
 ---
- userland/tweaks/displaylink/SapphireDisplayLink.m | 280 ++++++++++++++++++++++++++
- 1 file changed, 280 insertions(+)
+ bsd/kern/sweet_displaylink.c | 160 ++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 160 insertions(+)
 
-diff --git a/userland/tweaks/displaylink/SapphireDisplayLink.m b/userland/tweaks/displaylink/SapphireDisplayLink.m
-index f6a7b8c..f7a8b9c 100644
---- a/userland/tweaks/displaylink/SapphireDisplayLink.m
-+++ b/userland/tweaks/displaylink/SapphireDisplayLink.m
-@@ -228,6 +228,286 @@ init(void)
- 	(void)TAG;
- }
+diff --git a/bsd/kern/sweet_displaylink.c b/bsd/kern/sweet_displaylink.c
+index 0000000..d4e5f6a 100644
+--- /dev/null
++++ b/bsd/kern/sweet_displaylink.c
+@@ -0,0 +1,160 @@
++/*
++ * sapphire-0342: DisplayLink VSYNC support for SapphireDisplayLink.m
++ * Cached VSYNC timestamp, GPU util, adaptive phase coefficients, quality hysteresis
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/sysctl.h>
++#include <sys/lock.h>
++#include <machine/machine_routines.h>
 +
-+/* 0342: Hardware VSYNC-aligned Frame Pacing */
++/* Cached VSYNC data - updated from display interrupt/flip completion */
++static volatile uint64_t sweet_dl_last_vsync_ts = 0;      /* mach_absolute_time of last VSYNC */
++static volatile uint64_t sweet_dl_vsync_interval_ns = 8333333;  /* 120 Hz default */
++static volatile uint32_t sweet_dl_frame_count = 0;        /* incremented each VSYNC */
++static volatile uint32_t sweet_dl_gpu_util = 0;           /* permille (0-1000) */
++static volatile uint32_t sweet_dl_missed_frames = 0;      /* consecutive missed deadlines */
++static volatile uint32_t sweet_dl_good_frames = 0;        /* consecutive good frames */
 +
-+typedef struct {
-+    uint64_t vsync_period_ns;        /* 8,333,333 ns for 120 Hz */
-+    uint64_t last_vsync_ts;          /* last hardware vsync timestamp */
-+    uint64_t render_budget_ns;       /* time budget for render (target 70% = 5.8ms) */
-+    uint64_t next_frame_target_ts;   /* when next frame should be ready */
-+    uint32_t phase_offset_us;        /* microsecond offset from vsync */
-+    boolean_t vsync_aligned;         /* true when locked to hardware vsync */
-+    uint32_t consecutive_misses;     /* frames missing deadline */
-+    uint32_t quality_level;          /* 0=full, 1=half-res, 2=minimal */
-+} dl_frame_pacing_t;
++/* Adaptive phase prediction (EMA) */
++static int32_t sweet_dl_phase_ema_ns = 500000;  /* EMA of render time in ns, default 500 µs */
++static uint32_t sweet_dl_ema_alpha = 3;         /* EMA alpha = 3/10 = 0.3 */
++static uint32_t sweet_dl_ema_divisor = 10;
 +
-+static dl_frame_pacing_t dl_pacing = {
-+    .vsync_period_ns = 8333333,
-+    .render_budget_ns = 5833333,     /* 70% of frame */
-+    .phase_offset_us = 500,          /* 500 µs before vsync */
-+    .quality_level = 0,
-+};
++/* Quality reduction hysteresis thresholds */
++static uint32_t sweet_dl_miss_threshold = 5;    /* 5 consecutive misses -> reduce quality */
++static uint32_t sweet_dl_good_threshold = 5;    /* 5 consecutive good -> restore quality */
++static uint32_t sweet_dl_quality_level = 100;   /* current quality % (100=full, 50=half-res) */
 +
-+/* 0342: Read hardware VSYNC timestamp from kernel */
-+static uint64_t
-+dl_read_hw_vsync_ts(void)
++/* Called from display interrupt/flip completion (kernel context) */
++void
++sweet_dl_vsync_notify(uint64_t vsync_ts, uint32_t gpu_util_pct)
 +{
-+    size_t len = sizeof(uint64_t);
-+    uint64_t ts = 0;
-+    sysctlbyname("kern.sweet_fb_vsync_ts", &ts, &len, NULL, 0);
-+    return ts;
-+}
++    sweet_dl_last_vsync_ts = vsync_ts;
++    sweet_dl_frame_count++;
++    sweet_dl_gpu_util = gpu_util_pct;
 +
-+/* 0342: Read current GPU utilization for budget adjustment */
-+static uint32_t
-+dl_read_gpu_util(void)
-+{
-+    size_t len = 0;
-+    sysctlbyname("kern.sweet_fb_dynamic_rscale", NULL, &len, NULL, 0);
-+    if (len > 0) {
-+        char *buf = malloc(len);
-+        if (buf) {
-+            sysctlbyname("kern.sweet_fb_dynamic_rscale", buf, &len, NULL, 0);
-+            char *p = strstr(buf, "gpu_util:");
-+            uint32_t util = 0;
-+            if (p) sscanf(p, "gpu_util:%u", &util);
-+            free(buf);
-+            return util;
-+        }
-+    }
-+    return 500;  /* default 50% */
-+}
-+
-+/* 0342: Update frame pacing parameters based on vsync phase */
-+static void
-+dl_update_frame_pacing(void)
-+{
-+    uint64_t now = mach_absolute_time();
-+    uint64_t hw_vsync = dl_read_hw_vsync_ts();
-+
-+    if (hw_vsync == 0) return;  /* not available yet */
-+
-+    if (!dl_pacing.vsync_aligned) {
-+        /* First sync - align to next vsync boundary */
-+        uint64_t phase = (now - hw_vsync) % dl_pacing.vsync_period_ns;
-+        dl_pacing.next_frame_target_ts = hw_vsync + dl_pacing.vsync_period_ns - dl_pacing.phase_offset_us * 1000;
-+        dl_pacing.vsync_aligned = TRUE;
-+        printf("SapphireDL: VSYNC aligned, phase=%llu ns\n", phase);
-+        return;
-+    }
-+
-+    /* Check if we missed the deadline */
-+    if (now > dl_pacing.next_frame_target_ts) {
-+        dl_pacing.consecutive_misses++;
-+        uint64_t late_ns = now - dl_pacing.next_frame_target_ts;
-+
-+        if (dl_pacing.consecutive_misses >= 3 && dl_pacing.quality_level < 2) {
-+            dl_pacing.quality_level++;
-+            dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * (70 - dl_pacing.quality_level * 15) / 100;
-+            printf("SapphireDL: quality reduced to level %u, budget=%llu ns\n",
-+                   dl_pacing.quality_level, dl_pacing.render_budget_ns);
-+        }
++    /* Track consecutive misses/good for hysteresis */
++    if (gpu_util_pct > 950) {  /* >95% GPU util = likely missed frame */
++        sweet_dl_missed_frames++;
++        sweet_dl_good_frames = 0;
 +    } else {
-+        dl_pacing.consecutive_misses = 0;
-+        if (dl_pacing.quality_level > 0) {
-+            dl_pacing.quality_level--;
-+            dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * (70 + dl_pacing.quality_level * 15) / 100;
-+        }
++        sweet_dl_good_frames++;
++        sweet_dl_missed_frames = 0;
 +    }
 +
-+    /* Schedule next frame at vsync - render_budget */
-+    uint64_t next_vsync = hw_vsync + dl_pacing.vsync_period_ns;
-+    dl_pacing.next_frame_target_ts = next_vsync - dl_pacing.render_budget_ns;
-+
-+    /* Adjust for GPU utilization */
-+    uint32_t gpu_util = dl_read_gpu_util();
-+    if (gpu_util > 800) {
-+        dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * 60 / 100;  /* reduce to 60% */
-+    } else if (gpu_util < 500) {
-+        dl_pacing.render_budget_ns = dl_pacing.vsync_period_ns * 80 / 100;  /* increase to 80% */
-+    }
++    /* Update EMA of render time (derive from GPU util) */
++    uint32_t frame_budget_ns = 8333333;
++    uint32_t estimated_render_ns = (frame_budget_ns * gpu_util_pct) / 1000;
++    sweet_dl_phase_ema_ns = (sweet_dl_phase_ema_ns * (sweet_dl_ema_divisor - sweet_dl_ema_alpha)
++                            + estimated_render_ns * sweet_dl_ema_alpha) / sweet_dl_ema_divisor;
 +}
 +
-+/* 0342: Predictive frame scheduling - call before CADisplayLink callback */
-+static void
-+dl_predictive_schedule(id link)
++/* Called when quality change requested from userland */
++uint32_t
++sweet_dl_get_quality_level(void)
 +{
-+    dl_update_frame_pacing();
-+
-+    uint64_t now = mach_absolute_time();
-+    int64_t time_to_deadline = (int64_t)(dl_pacing.next_frame_target_ts - now);
-+
-+    if (time_to_deadline > 1000000) {  /* >1ms early */
-+        /* Yield CPU to avoid burning cycles */
-+        usleep(time_to_deadline / 1000 - 500);  /* leave 500 µs margin */
-+    } else if (time_to_deadline < -500000) {  /* >500µs late */
-+        /* Frame already missed - skip or reduce quality */
-+        dl_pacing.consecutive_misses++;
-+    }
++    return sweet_dl_quality_level;
 +}
 +
-+/* 0342: Hook into CADisplayLink callback to enforce pacing */
-+static void (*o_displayLinkCallback)(id, SEL);
-+
-+static void
-+my_displayLinkCallback(id self, SEL sel)
++void
++sweet_dl_set_quality_level(uint32_t level)
 +{
-+    dl_predictive_schedule(self);
-+    o_displayLinkCallback(self, sel);
-+    dl_predictive_boost(self);  /* from 0339 */
++    if (level > 100) level = 100;
++    if (level < 25) level = 25;
++    sweet_dl_quality_level = level;
 +}
 +
-+/* 0342: Sysctl for frame pacing stats */
++/* 0342: Check and apply hysteresis - called from userland each frame */
++int
++sweet_dl_check_hysteresis(void)
++{
++    int action = 0;  /* 0=none, -1=reduce, +1=restore */
++
++    if (sweet_dl_missed_frames >= sweet_dl_miss_threshold && sweet_dl_quality_level > 25) {
++        sweet_dl_quality_level = (sweet_dl_quality_level * 3) / 4;  /* reduce by 25% */
++        if (sweet_dl_quality_level < 25) sweet_dl_quality_level = 25;
++        sweet_dl_missed_frames = 0;  /* reset after action */
++        action = -1;
++        printf("SWEET_DL: quality reduced to %u%% (misses=%u)\n",
++               sweet_dl_quality_level, sweet_dl_miss_threshold);
++    } else if (sweet_dl_good_frames >= sweet_dl_good_threshold && sweet_dl_quality_level < 100) {
++        sweet_dl_quality_level = (sweet_dl_quality_level * 5) / 4;  /* increase by 25% */
++        if (sweet_dl_quality_level > 100) sweet_dl_quality_level = 100;
++        sweet_dl_good_frames = 0;  /* reset after action */
++        action = 1;
++        printf("SWEET_DL: quality restored to %u%% (good=%u)\n",
++               sweet_dl_quality_level, sweet_dl_good_threshold);
++    }
++
++    return action;
++}
++
++/* 0342: Sysctl exporting cached VSYNC data for userland */
 +static int
-+sysctl_sapphire_dl_pacing(char *buf, size_t len)
++sysctl_sweet_dl_vsync SYSCTL_HANDLER_ARGS
 +{
-+    return snprintf(buf, len,
-+        "aligned:%u vsync_period:%llu budget:%llu target:%llu misses:%u quality:%u offset_us:%u",
-+        dl_pacing.vsync_aligned,
-+        (unsigned long long)dl_pacing.vsync_period_ns,
-+        (unsigned long long)dl_pacing.render_budget_ns,
-+        (unsigned long long)dl_pacing.next_frame_target_ts,
-+        dl_pacing.consecutive_misses,
-+        dl_pacing.quality_level,
-+        dl_pacing.phase_offset_us);
++#pragma unused(oidp, arg1, arg2)
++    /* Pack all data into a single sysctl read - no string parsing needed */
++    struct {
++        uint64_t vsync_ts;
++        uint64_t interval_ns;
++        uint32_t frame_count;
++        uint32_t gpu_util;
++        uint32_t phase_ema_ns;
++        uint32_t quality_level;
++        uint32_t missed_frames;
++        uint32_t good_frames;
++    } data;
++
++    data.vsync_ts = sweet_dl_last_vsync_ts;
++    data.interval_ns = sweet_dl_vsync_interval_ns;
++    data.frame_count = sweet_dl_frame_count;
++    data.gpu_util = sweet_dl_gpu_util;
++    data.phase_ema_ns = (uint32_t)sweet_dl_phase_ema_ns;
++    data.quality_level = sweet_dl_quality_level;
++    data.missed_frames = sweet_dl_missed_frames;
++    data.good_frames = sweet_dl_good_frames;
++
++    return SYSCTL_OUT(req, &data, sizeof(data));
 +}
 +
-+__attribute__((constructor)) static void
-+init_pacing(void)
++static int
++sysctl_sweet_dl_phase_ema SYSCTL_HANDLER_ARGS
 +{
-+    /* Register sysctl */
-+    /* sysctl_register_oid(&sysctl__kern_sapphire_dl_pacing); */
++#pragma unused(oidp, arg1, arg2)
++    int error = sysctl_handle_int(oidp, &sweet_dl_ema_alpha, 0, req);
++    return error;
++}
 +
-+    /* Hook CADisplayLink callback */
-+    Class link = objc_getClass("CADisplayLink");
-+    if (link != Nil) {
-+        Method callback = class_getInstanceMethod(link, sel_registerName("displayLinkCallback:"));
-+        if (callback) {
-+            o_displayLinkCallback = (void (*)(id, SEL))method_setImplementation(callback, (IMP)my_displayLinkCallback);
-+        }
++static int
++sysctl_sweet_dl_hysteresis SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    int error = sysctl_handle_int(oidp, &sweet_dl_miss_threshold, 0, req);
++    if (!error && req->newptr != USER_ADDR_NULL) {
++        /* Also update good threshold to match */
++        sweet_dl_good_threshold = sweet_dl_miss_threshold;
 +    }
++    return error;
 +}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_dl_vsync, CTLTYPE_STRUCT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_dl_vsync, "SWEET_DL_VSYNC",
++    "Cached VSYNC data: ts, interval, frame_count, gpu_util, phase_ema, quality, misses, good");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_dl_phase_ema_alpha, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_dl_phase_ema, "I", "EMA alpha numerator (default 3, divisor 10 = 0.3)");
++SYSCTL_PROC(_kern, OID_AUTO, sweet_dl_hysteresis_threshold, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_dl_hysteresis, "I", "consecutive misses/good frames before quality change (default 5)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -51,7 +51,7 @@ index 0000000..c3d4e5f 100644
 +#define SWEET_SCHED_IDLE_P_STEALS_E   0x08  /* Idle P steals E work */
 +#define SWEET_SCHED_PRIO_INHERIT      0x10  /* 0335: P-thread blocked on E-mutex boosts holder */
 +
-+static uint32_t sweet_sched_policy = 13;  /* default: 0x0D = bits 0|2|3 */
++static uint32_t sweet_sched_policy = 29;  /* default: 0x1D = bits 0|2|3|4 (ENABLES priority inheritance) */
 +static uint32_t sweet_sched_prio_inherit_boost = 1;  /* enable by default */
 +
 +/* Critical UI process names for explicit tagging */

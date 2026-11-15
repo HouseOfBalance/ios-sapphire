@@ -1,0 +1,68 @@
+name: userland
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [sapphire, main]
+    paths:
+      - "userland/**"
+      - ".github/workflows/userland.yml"
+
+concurrency:
+  group: userland-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies & SDK
+        run: |
+          brew install ldid
+          mkdir -p $HOME/sdks
+          git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks/theos-sdks
+          ls -la $HOME/sdks/theos-sdks/
+
+      - name: Build userland components
+        run: |
+          SDK_PATH="$HOME/sdks/theos-sdks/iPhoneOS16.5.sdk"
+          if [ ! -d "$SDK_PATH" ]; then
+            SDK_PATH=$(find $HOME/sdks/theos-sdks -maxdepth 1 -name "iPhoneOS*.sdk" | sort -V | tail -1)
+          fi
+          echo "Using SDK: $SDK_PATH"
+          LDID_BIN=$(which ldid)
+          cd userland
+          mkdir -p obj
+
+          # 1. Build btcapability tweak
+          echo "Building SapphireBTCapability..."
+          cd tweaks/btcapability
+          SDK="$SDK_PATH" LDID="$LDID_BIN" bash build.sh ../../obj
+          cd ../..
+
+          # 2. Build btmonitor
+          echo "Building btmonitor..."
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/btmonitor bluetooth/btmonitor.c
+          $LDID_BIN -S obj/btmonitor
+
+          # 3. Build eagl.dylib
+          echo "Building eagl.dylib..."
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -dynamiclib -o obj/eagl.dylib src/eagl.c \
+            -framework Foundation -framework IOKit -framework CoreFoundation -framework CoreGraphics -framework QuartzCore -framework AudioToolbox -ldl -lpthread
+          $LDID_BIN -S obj/eagl.dylib
+
+          # 4. Build fingerprint components
+          echo "Building fingerprint..."
+          cd fingerprint
+          SDK="$SDK_PATH" LDID="$LDID_BIN" bash build.sh ../obj || true
+          cd ..
+
+          ls -la obj/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: userland-binaries
+          path: userland/obj/
+          if-no-files-found: warn
