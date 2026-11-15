@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire Port <sapphire@xiaomi>
+Date: Sun, 15 Nov 2026 18:11:00 +0700
+Subject: [PATCH 0354] sapphire: fix multi-layer frame drop + GPU fence sync in scale2 path
+
+When fScale2=1 and nlayers > 1 (Control Center, Spotlight keyboard), gpu_frame=false
+and the old code did 'continue' which dropped the frame entirely, freezing the
+display on the last composited frame stack.
+
+Fix: When GPU path unavailable, fall through to CPU copy path for ALL layers.
+The CPU copies 1:1 (surface 750x1624 onto panel 1080x2400) which appears in
+the top-left - correct for multi-layer compositing done by CoreAnimation.
+
+Also add GPU fence wait for scale2 GPU path to prevent buffer leaks.
+The CPU copy path below already releases 's' at the end of the loop.
+
+Signed-off-by: Sapphire Port <sapphire@xiaomi>
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 52 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 46 insertions(+), 6 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index d84bcd0..e5f6a7b 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1444,18 +1444,58 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+-		if (fScale2) {
++		bool scale2_path = fScale2;
++		if (scale2_path) {
+ 			/*
+-			 * 0239: a 2x frame (one full-screen layer, as CoreAnimation sends them) goes onto the
+-			 * panel scaled by the GPU: the panel's window of the 3x picture, at 2/3 of its place
+-			 * and size. Anything else is not shown (the CPU copies 1:1 and would put it small).
++			 * 0239/0240: a 2x frame (one full-screen layer) goes onto the panel
++			 * scaled by the GPU. Multi-layer frames (nlayers > 1) fall through
++			 * to CPU copy which composites correctly.
+ 			 */
+-			static uint32_t scale_told;
+-			bool shown = false;
+-			if (gpu_frame && bpe == 4 && src != 0 && s->width >= fLogicalW && s->height >= fLogicalH &&
+-			    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL) {
+-				uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[fFlipIdx ^ 1] : fPhys;
+-				uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
+-				if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
+-					sweet_dcache_clean((vm_offset_t)(src + s->offset), (unsigned)((uint64_t)s->height * s->bytesPerRow));
+-				}
+-				shown = sapphire_gpu_copy_scaled(s->memory, s->offset, s->bytesPerRow,
+-				    (uint32_t)((uint64_t)fOffX * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fOffY * ky / SWEET_FB_LOGICAL_H),
+-				    (uint32_t)((uint64_t)fWidth * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fHeight * ky / SWEET_FB_LOGICAL_H),
+-				    dbase, fRowBytes, fWidth, fHeight, dbase, (uint64_t)fRowBytes * fHeight);
+-				if (shown) {
+-					if (fFlip[0] != NULL) {
+-						sweet_dcache_flush((vm_offset_t)dst, (unsigned)((uint64_t)fHeight * fRowBytes));
+-					}
+-					gpu_used = true;
+-				}
+-			}
+-			if (!shown && scale_told++ < 8) {
+-				IOLog("SWEET FB: 2x frame not shown (layers %u, gpu %d, surface %ux%u bpe %u)\n", nlayers, gpu_frame,
+-				    s->width, s->height, bpe);
+-			}
+-			s->release();
+-			continue;
++			if (gpu_frame && bpe == 4 && src != 0 && s->width >= fLogicalW && s->height >= fLogicalH &&
++			    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL) {
++				uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[fFlipIdx ^ 1] : fPhys;
++				uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
++				if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
++					sweet_dcache_clean((vm_offset_t)(src + s->offset), (unsigned)((uint64_t)s->height * s->bytesPerRow));
++				}
++				bool shown = sapphire_gpu_copy_scaled(s->memory, s->offset, s->bytesPerRow,
++				    (uint32_t)((uint64_t)fOffX * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fOffY * ky / SWEET_FB_LOGICAL_H),
++				    (uint32_t)((uint64_t)fWidth * kx / SWEET_FB_LOGICAL_W), (uint32_t)((uint64_t)fHeight * ky / SWEET_FB_LOGICAL_H),
++				    dbase, fRowBytes, fWidth, fHeight, dbase, (uint64_t)fRowBytes * fHeight);
++				if (shown) {
++					if (fFlip[0] != NULL) {
++						sweet_dcache_flush((vm_offset_t)dst, (unsigned)((uint64_t)fHeight * fRowBytes));
++					}
++					/*
++					 * Wait for GPU fence to complete before flipping.
++					 * This ensures the GPU is done reading the source buffer before
++					 * we hand it back to the pool (via drop/reap).
++					 */
++					if (s->gpuDrawn && s->gpuSeed != 0) {
++						extern bool msm_wait_fence(uint32_t fence, uint64_t ms);
++						if (!msm_wait_fence(s->gpuSeed, 200)) {
++							IOLog("SWEET FB: GPU fence %u wait failed (scale2)\n", s->gpuSeed);
++						}
++					}
++					gpu_used = true;
++					s->release();
++					continue;
++				}
++			}
++			/* Fall through to CPU copy for multi-layer or GPU failure */
++			if (scale_told++ < 8) {
++				IOLog("SWEET FB: 2x frame CPU fallback (layers %u, gpu %d, surface %ux%u bpe %u)\n", nlayers, gpu_frame,
++				    s->width, s->height, bpe);
++			}
+ 		}
+ 		if (w <= 0 || h <= 0) {
++		/*
++		 * For GPU copy path (sweetfb_gpucopy=1), wait on fence before CPU touches the buffer.
++		 * The gpuDrawn/gpuSeed was set in SapphireGpuClient::submitIt().
++		 */
++		if (gpu_used && s->gpuDrawn && s->gpuSeed != 0) {
++			extern bool msm_wait_fence(uint32_t fence, uint64_t ms);
++			if (!msm_wait_fence(s->gpuSeed, 200)) {
++				IOLog("SWEET FB: GPU fence %u wait failed (non-scale2)\n", s->gpuSeed);
++			}
++		}
+ 		w = (int32_t)s->width;
+ 		h = (int32_t)s->height;
+ 	}

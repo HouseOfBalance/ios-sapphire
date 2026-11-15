@@ -60,7 +60,7 @@ extra=${3:-}
 mkdir -p shim/out
 python3 tools/mkadt.py shim/out/sapphire.adt --highmem ${gpufw[@]+"${gpufw[@]}"} ${amp[@]+"${amp[@]}"}
 python3 tools/mkpayload.py "$kernel" shim/out/sapphire.adt shim/out/payload.bin \
-	--cmdline "debug=0xc serial=3 cpus=$cpus keepsyms=1 -noprogress rd=ufsroot0 ufsroot=iosroot unentitled_ios_sim_launch=1 ignition_level=1 $rw launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 $con sweettouch_rx=8640 sweettouch_ry=9600 sweetusb=2 gpu=3 gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetgl=1 modem=1 wifi=1 audio=2 gpu_mhz=1260 glwait=1 ipa=1 glenv=FD_MESA_DEBUG=sysmem sweetfb_scale=2 sweetfb_w=750 sweet_glload=1 qsee=1 sweetfb_hz=120 sweetmetal=2 sweetsched=13 sweetrscale=750 sweetbl=0 sweet_splash=0 $extra"
+	--cmdline "debug=0xc serial=3 cpus=$cpus keepsyms=1 -noprogress rd=ufsroot0 ufsroot=iosroot unentitled_ios_sim_launch=1 ignition_level=1 $rw launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 $con sweettouch_rx=8640 sweettouch_ry=9600 sweetusb=2 gpu=3 gpu_mmu=1 gpu_service=1 sweetfb_gpucopy=1 sweetgl=1 modem=1 wifi=1 audio=2 gpu_mhz=1260 glwait=1 ipa=1 sweetfb_scale=2 sweetfb_w=750 sweet_glload=1 qsee=1 sweetfb_hz=120 sweetmetal=2 sweetsched=13 sweetbl=0 sweet_splash=0 $extra"
 shim/build.sh ../shim/out/payload.bin
 [[ $out == shim/out/shim-boot.img ]] || cp shim/out/shim-boot.img "$out"
 sha256sum "$out"
