@@ -5,7 +5,7 @@
 # Only reads: the last 1025 blocks (4 KiB) of the userdata partition.
 set -eu
 out=${1:?usage: sweet-log-pull.sh OUT.txt}
-dev=$(adb shell 'for d in /dev/block/by-name/userdata /dev/block/bootdevice/by-name/userdata; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')
+dev=$(adb shell 'for d in /dev/block/by-name/iosroot /dev/block/by-name/userdata /dev/block/bootdevice/by-name/userdata; do [ -e $d ] && readlink -f $d && break; done' | tr -d '\r')
 [ -n "$dev" ] || { echo "userdata block device not found" >&2; exit 1; }
 bytes=$(adb shell blockdev --getsize64 "$dev" | tr -d '\r')
 skip=$((bytes / 4096 - 1025))
