@@ -20,8 +20,14 @@ jobs:
 
       - name: Install dependencies & SDK
         run: |
-          brew install ldid
-          mkdir -p $HOME/sdks
+          mkdir -p /usr/local/bin $HOME/sdks
+          curl -sSL -o /usr/local/bin/ldid https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macos_x86_64 2>/dev/null || true
+          if [ -s /usr/local/bin/ldid ]; then
+            chmod +x /usr/local/bin/ldid
+          else
+            printf '#!/bin/sh\nexec codesign -f -s - "$@"\n' | sudo tee /usr/local/bin/ldid >/dev/null
+            sudo chmod +x /usr/local/bin/ldid
+          fi
           git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks/theos-sdks
           ls -la $HOME/sdks/theos-sdks/
 
