@@ -1,29 +1,33 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sapphire Port <sapphire@xiaomi>
 Date: Sun, 15 Nov 2026 18:11:00 +0700
-Subject: [PATCH 0353] sapphire: fix GPU pool leak (periodic reap + gemNew rescue)
+Subject: [PATCH 0353] sapphire: fix GPU pool leak (aggressive periodic reap + gemNew rescue + logging)
 
 Two fixes in SapphireGpu.cpp only:
-1. Periodic reaping of fLeft buffers via a 100ms timer, so buffers are freed even when
-   the client stops submitting (backboardd blocked on OOM). Also call reap() in gemNew()
-   when gpool_alloc() fails, to rescue the allocation before returning kIOReturnNoMemory.
+1. Aggressive periodic reaping of fLeft buffers via a 10ms timer (was 100ms), so buffers
+   are freed even when the client stops submitting (backboardd blocked on OOM).
+   Also call reap() in gemNew() when gpool_alloc() fails, to rescue the allocation
+   before returning kIOReturnNoMemory. Retry up to 3 times with 1ms sleeps.
 2. Proper cleanup of fLeft/fReapTimer in clientClose().
+3. Add diagnostic logging to reapTimer() and reap() to verify operation.
 
 Signed-off-by: Sapphire Port <sapphire@xiaomi>
 ---
- iokit/Kernel/arm/SapphireGpu.cpp | 112 ++++++++++++++++++++++++++++++++++++++++++++++++------
- 1 file changed, 100 insertions(+), 12 deletions(-)
+ iokit/Kernel/arm/SapphireGpu.cpp | 135 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 123 insertions(+), 12 deletions(-)
 
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 index 7700592..a1b2c3d 100644
 --- a/iokit/Kernel/arm/SapphireGpu.cpp
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -2965,6 +2965,14 @@ class SapphireGPUClient : public IOUserClient {
+@@ -2965,6 +2965,16 @@ class SapphireGPUClient : public IOUserClient {
  	struct msm_bo  *fLeft;                  /* MSM_LEFT of them: kept until their fence */
  	uint32_t        fCount, fSubmits, fQueue;
  	uint64_t        fBytes;
 +	thread_call_t   fReapTimer;             /* periodic reap for stuck clients */
 +	bool            fReapTimerArmed;
++	uint32_t        fReapCount;             /* total buffers reaped by timer */
++	uint32_t        fReapTimerFirings;      /* number of timer callbacks */
 +
 +	static void reap_timer_trampoline(thread_call_param_t p0, thread_call_param_t p1);
 +	void reapTimer();
@@ -31,16 +35,22 @@ index 7700592..a1b2c3d 100644
  	struct msm_bo *slot(uint32_t *handle);
  	bool place(struct msm_bo *b);
  	void drop(struct msm_bo *b);
-@@ -3220,6 +3228,42 @@ SapphireGPUClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
+@@ -3220,6 +3230,48 @@ SapphireGPUClient::initWithTask(task_t owningTask, void *securityID, UInt32 type
  	bzero(fLeft, sizeof(struct msm_bo) * MSM_LEFT);
  	fCount = fSubmits = fQueue = 0;
  	fBytes = 0;
 +	fReapTimer = NULL;
 +	fReapTimerArmed = false;
++	fReapCount = 0;
++	fReapTimerFirings = 0;
 +	fReapTimer = thread_call_allocate(reap_timer_trampoline, (thread_call_param_t)this);
 +	if (fReapTimer) {
 +		fReapTimerArmed = true;
-+		thread_call_enter_delayed(fReapTimer, 100 * NSEC_PER_MSEC);
++		/* 10ms aggressive timer - matches frame interval (60-120 fps = 8-16ms) */
++		thread_call_enter_delayed(fReapTimer, 10 * NSEC_PER_MSEC);
++		LOG("msm: %s: reapTimer armed at 10ms", fName);
++	} else {
++		LOG("msm: %s: FAILED to allocate reapTimer", fName);
 +	}
 +
 +	/*
@@ -50,7 +60,7 @@ index 7700592..a1b2c3d 100644
  	LOG("msm: %s opened the GPU", fName);
  	return true;
  }
-@@ -3245,6 +3279,22 @@ SapphireGPUClient::clientClose(void)
+@@ -3245,6 +3297,22 @@ SapphireGPUClient::clientClose(void)
  	if (fBo != NULL) {
  		for (uint32_t i = 0; i < MSM_BUFFERS; i++) {
  			if (fBo[i].md != NULL) {
@@ -65,7 +75,7 @@ index 7700592..a1b2c3d 100644
  				freeBo(&fBo[i]);
  			}
  		}
-@@ -3260,6 +3310,16 @@ SapphireGPUClient::clientClose(void)
+@@ -3260,6 +3328,22 @@ SapphireGPUClient::clientClose(void)
  		IODelete(fBo, struct msm_bo, MSM_BUFFERS);
  		fBo = NULL;
  	}
@@ -74,6 +84,7 @@ index 7700592..a1b2c3d 100644
 +		thread_call_free(fReapTimer);
 +		fReapTimer = NULL;
 +		fReapTimerArmed = false;
++		LOG("msm: %s: reapTimer cancelled (firings=%u, reaped=%u)", fName, fReapTimerFirings, fReapCount);
 +	}
 +	if (fLeft != NULL) {
 +		IODelete(fLeft, struct msm_bo, MSM_LEFT);
@@ -82,18 +93,36 @@ index 7700592..a1b2c3d 100644
  	terminate();
  	return kIOReturnSuccess;
  }
-@@ -3320,6 +3380,35 @@ SapphireGPUClient::reap(void)
+@@ -3320,6 +3404,72 @@ SapphireGPUClient::reap(void)
  }
 
  void
 +SapphireGPUClient::reapTimer()
 +{
++	fReapTimerFirings++;
 +	IOLockLock(service_lock);
++	uint32_t before_count = fCount;
++	uint64_t before_bytes = fBytes;
 +	reap();
++	uint32_t after_count = fCount;
++	uint64_t after_bytes = fBytes;
++	uint32_t reaped_this_round = (before_count > after_count) ? (before_count - after_count) : 0;
++	fReapCount += reaped_this_round;
 +	IOLockUnlock(service_lock);
-+	/* Re-arm for 100ms */
++
++	if (reaped_this_round > 0) {
++		LOG("msm: %s: reapTimer#%u reaped %u buffers (count %u->%u, bytes %llu->%llu MB)",
++		    fName, fReapTimerFirings, reaped_this_round,
++		    before_count, after_count, before_bytes >> 20, after_bytes >> 20);
++	} else if (fReapTimerFirings % 100 == 0) {
++		/* Log every 100 firings (1 second) if nothing reaped - diagnostic */
++		LOG("msm: %s: reapTimer#%u no buffers reaped (fCount=%u, fLeft[%u] fences pending)",
++		    fName, fReapTimerFirings, fCount, MSM_LEFT);
++	}
++
++	/* Re-arm for 10ms */
 +	if (fReapTimerArmed && fReapTimer) {
-+		thread_call_enter_delayed(fReapTimer, 100 * NSEC_PER_MSEC);
++		thread_call_enter_delayed(fReapTimer, 10 * NSEC_PER_MSEC);
 +	}
 +}
 +
@@ -105,31 +134,38 @@ index 7700592..a1b2c3d 100644
 +}
 +
 +/*
-+ * Attempt to free completed fLeft buffers, then retry the allocation once.
++ * Attempt to free completed fLeft buffers, then retry the allocation.
 + * Called from gemNew() when gpool_alloc returns 0.
++ * Retries up to 3 times with 1ms sleeps between attempts.
 + */
 +static bool
 +gpool_alloc_with_reap(struct SapphireGPUClient *client, uint64_t n, uint64_t *out_pa)
 +{
-+	uint64_t pa = gpool_alloc(n);
-+	if (pa != 0) {
-+		*out_pa = pa;
-+		return true;
++	for (int attempt = 0; attempt < 3; attempt++) {
++		uint64_t pa = gpool_alloc(n);
++		if (pa != 0) {
++			*out_pa = pa;
++			if (attempt > 0) {
++				LOG("msm: %s: gpool_alloc_with_reap succeeded on attempt %d", client->fName, attempt + 1);
++			}
++			return true;
++		}
++		/* Pool exhausted: try to reap any completed fLeft buffers */
++		client->reap();
++		if (attempt < 2) {
++			/* Brief sleep to allow GPU to complete work and signal fences */
++			thread_sleep_with_timeout(1 * NSEC_PER_MSEC, THREAD_UNINT);
++		}
 +	}
-+	/* Pool exhausted: try to reap any completed fLeft buffers */
-+	client->reap();
-+	pa = gpool_alloc(n);
-+	if (pa != 0) {
-+		*out_pa = pa;
-+		return true;
-+	}
++	LOG("msm: %s: gpool_alloc_with_reap FAILED after 3 attempts (need %llu KB)",
++	    client->fName, n * 4);
 +	return false;
 +}
 +
  IOReturn
  SapphireGPUClient::gemNew(struct msm_gem_new *r)
  {
-@@ -3380,12 +3465,14 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
+@@ -3380,12 +3522,14 @@ SapphireGPUClient::gemNew(struct msm_gem_new *r)
  	if (gpool_enabled()) {
  		IOLockLock(service_lock);
 -		uint64_t pa = gpool_alloc(size >> 12);
