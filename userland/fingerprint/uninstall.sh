@@ -27,29 +27,15 @@ if [ -d /Applications/Huella.app ]; then uicache -u /Applications/Huella.app 2>/
 rm -f /var/run/fpd.sock
 EOF
 
+# Remove boot.d script and restore launchd cache if needed
+ssh $O $P rm -f /redwood/boot.d/95-fpd.sh
+
 if [ $restore = 1 ]; then
 	ssh $O $P /var/jb/bin/bash -s <<'EOF'
 export PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin
 L=/System/Library/xpc/launchd.plist
 [ -f $L.pre-fpd ] || { echo "no $L.pre-fpd"; exit 1; }
 /var/jb/bin/cp -p $L.pre-fpd $L.fpd-new && /var/jb/bin/mv -f $L.fpd-new $L && ls -l $L && echo "launchd cache restored from pre-fpd"
-EOF
-else
-	bk=$HOME/ios-build/launchd-backups
-	mkdir -p "$bk"
-	stamp=$(date +%Y%m%d-%H%M%S)
-	scp -q $O $P:/System/Library/xpc/launchd.plist "$bk/launchd.plist.before-fpd-uninstall.$stamp"
-	python3 -I fpd-launchd.py remove "$bk/launchd.plist.before-fpd-uninstall.$stamp" "$out/launchd.plist"
-	scp -q $O "$out/launchd.plist" $P:/System/Library/xpc/launchd.plist.fpd-new
-	sum=$(sha256sum "$out/launchd.plist" | cut -d' ' -f1)
-	ssh $O $P /var/jb/bin/bash -s "$sum" <<'EOF'
-export PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin
-L=/System/Library/xpc/launchd.plist
-got=$(shasum -a 256 $L.fpd-new 2>/dev/null | cut -d' ' -f1)
-[ -z "$got" ] && got=$(sha256sum $L.fpd-new | cut -d' ' -f1)
-if [ "$got" != "$1" ]; then echo "upload corrupt, cache NOT replaced"; rm -f $L.fpd-new; exit 1; fi
-chown root:wheel $L.fpd-new; chmod 644 $L.fpd-new
-/var/jb/bin/mv -f $L.fpd-new $L && ls -l $L && echo "job removed from launchd's cache"
 EOF
 fi
 

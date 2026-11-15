@@ -29,27 +29,17 @@ scp -q $O "$out/fpd" "$out/fpload" "$out/fpsave" "$out/fpctl" $P:/redwood/bin/
 scp -q $O "$out/com.sapphire.fpd.plist" $P:/redwood/share/fpd/
 scp -q $O "$out/SapphireFingerprint.dylib" "$out/SapphireFingerprint.plist" "$out/SapphireFingerprintSettings.dylib" 	"$out/SapphireFingerprintSettings.plist" $P:/var/jb/usr/lib/TweakInject/
 
-# the launchd cache, patched here (python), checked, then swapped in on the phone
-bk=$HOME/ios-build/launchd-backups
-mkdir -p "$bk"
-stamp=$(date +%Y%m%d-%H%M%S)
-scp -q $O $P:/System/Library/xpc/launchd.plist "$bk/launchd.plist.before-fpd-install.$stamp"
-python3 -I fpd-launchd.py add "$bk/launchd.plist.before-fpd-install.$stamp" "$out/launchd.plist"
-scp -q $O "$out/launchd.plist" $P:/System/Library/xpc/launchd.plist.fpd-new
-sum=$(sha256sum "$out/launchd.plist" | cut -d' ' -f1)
-ssh $O $P /var/jb/bin/bash -s "$sum" <<'EOF'
+# Deploy 95-fpd.sh boot script (avoids launchd cache platform binary panic)
+scp -q $O "$(dirname "$0")/95-fpd.sh" $P:/redwood/boot.d/95-fpd.sh
+ssh $O $P /var/jb/bin/bash -s <<'EOF'
 export PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin
-L=/System/Library/xpc/launchd.plist
-got=$(shasum -a 256 $L.fpd-new 2>/dev/null | cut -d' ' -f1)
-[ -z "$got" ] && got=$(sha256sum $L.fpd-new | cut -d' ' -f1)
-if [ "$got" != "$1" ]; then echo "launchd.plist upload corrupt ($got), cache NOT replaced"; rm -f $L.fpd-new; exit 1; fi
-chown root:wheel $L.fpd-new; chmod 644 $L.fpd-new
-/var/jb/bin/mv -f $L.fpd-new $L
-chown root:wheel /redwood/bin/fpd /redwood/bin/fpload /redwood/bin/fpsave /redwood/bin/fpctl /redwood/share/fpd/com.sapphire.fpd.plist
+mkdir -p /redwood/boot.d
+chmod 755 /redwood/boot.d/95-fpd.sh
+chown root:wheel /redwood/bin/fpd /redwood/bin/fpload /redwood/bin/fpsave /redwood/bin/fpctl /redwood/share/fpd/com.sapphire.fpd.plist /redwood/boot.d/95-fpd.sh
 chmod 755 /redwood/bin/fpd /redwood/bin/fpload /redwood/bin/fpsave /redwood/bin/fpctl
 chmod 644 /redwood/share/fpd/com.sapphire.fpd.plist /var/jb/usr/lib/TweakInject/SapphireFingerprint*.plist
 chmod 755 /var/jb/usr/lib/TweakInject/SapphireFingerprint*.dylib
-ls -l $L /redwood/bin/fpd /var/jb/usr/lib/TweakInject/SapphireFingerprint.*
+ls -l /redwood/bin/fpd /var/jb/usr/lib/TweakInject/SapphireFingerprint.* /redwood/boot.d/95-fpd.sh
 echo "installed; start: fptest.sh start, tweak: fptest.sh respring"
 EOF
 bash install-app.sh "$out/Huella.ipa" "$P"

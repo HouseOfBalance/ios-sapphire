@@ -48,6 +48,14 @@ bash "$I/../userland/fingerprint/build.sh" "$FINGERPRINT_OUT" >/dev/null
 cp "$FINGERPRINT_OUT/fpd" "$FINGERPRINT_OUT/fpload" "$FINGERPRINT_OUT/fpsave" "$FINGERPRINT_OUT/fpctl" "$R/redwood/bin/"
 cp "$FINGERPRINT_OUT/com.sapphire.fpd.plist" "$R/redwood/share/fpd/" 2>/dev/null || mkdir -p "$R/redwood/share/fpd" && cp "$FINGERPRINT_OUT/com.sapphire.fpd.plist" "$R/redwood/share/fpd/"
 
+# Copy 95-fpd.sh to redwood/boot.d/ (starts fpd via boot.d without launchd cache panic)
+mkdir -p "$R/redwood/boot.d"
+if [ -f "$I/../userland/fingerprint/95-fpd.sh" ]; then
+    cp "$I/../userland/fingerprint/95-fpd.sh" "$R/redwood/boot.d/95-fpd.sh"
+    chmod 755 "$R/redwood/boot.d/95-fpd.sh"
+    echo "  ✓ 95-fpd.sh copied to redwood/boot.d"
+fi
+
 # Copy tweaks to TweakInject
 mkdir -p "$R/private/var/jb/usr/lib/TweakInject"
 cp "$FINGERPRINT_OUT/SapphireFingerprint.dylib" "$FINGERPRINT_OUT/SapphireFingerprint.plist" "$FINGERPRINT_OUT/SapphireFingerprintSettings.dylib" "$FINGERPRINT_OUT/SapphireFingerprintSettings.plist" "$R/private/var/jb/usr/lib/TweakInject/"

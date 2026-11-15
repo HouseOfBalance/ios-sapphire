@@ -161,6 +161,51 @@ if [ -d "$JB_PATH" ]; then
     [ -f "$JB_PATH/usr/bin/passwd" ] && chmod 4755 "$JB_PATH/usr/bin/passwd"
 fi
 
+# Direct gl.args Fix (CRITICAL: glwait=1 for Adreno 610 GMEM)
+echo "Writing glwait=1 to gl.args..."
+mkdir -p /mnt/iosroot/private/var/tmp /mnt/iosroot/redwood
+printf "vblur=0 glwait=1 glprecision=0" > /mnt/iosroot/private/var/tmp/gl.args
+printf "vblur=0 glwait=1 glprecision=0" > /mnt/iosroot/redwood/gl.args
+chmod 666 /mnt/iosroot/private/var/tmp/gl.args /mnt/iosroot/redwood/gl.args 2>/dev/null || true
+
+# Fix fpd launchd panic: Remove com.sapphire.fpd from launchd cache, deploy 95-fpd.sh to boot.d
+echo "=== Fixing fpd launchd cache panic ==="
+PYTHON_BIN="/usr/bin/python3"
+FPD_LAUNCHD_PY="/mnt/c/Users/TRAN VAN HUNG/Downloads/ios-sapphire/userland/fingerprint/fpd-launchd.py"
+LAUNCHD_PLIST="/mnt/iosroot/System/Library/xpc/launchd.plist"
+if [ -f "$LAUNCHD_PLIST" ] && [ -f "$FPD_LAUNCHD_PY" ]; then
+    echo "Removing com.sapphire.fpd from launchd.plist cache..."
+    $PYTHON_BIN "$FPD_LAUNCHD_PY" remove "$LAUNCHD_PLIST" "$LAUNCHD_PLIST.tmp" 2>/dev/null && \
+        mv -f "$LAUNCHD_PLIST.tmp" "$LAUNCHD_PLIST" && \
+        chown 0:0 "$LAUNCHD_PLIST" && chmod 644 "$LAUNCHD_PLIST" && \
+        echo "  ✓ Removed com.sapphire.fpd from launchd cache" || echo "  (launchd.plist cache already clean or updated)"
+fi
+
+# Deploy 95-fpd.sh boot.d script
+mkdir -p /mnt/iosroot/redwood/boot.d
+cp -f "/mnt/c/Users/TRAN VAN HUNG/Downloads/ios-sapphire/userland/fingerprint/95-fpd.sh" /mnt/iosroot/redwood/boot.d/95-fpd.sh
+chmod 755 /mnt/iosroot/redwood/boot.d/95-fpd.sh
+chown 0:0 /mnt/iosroot/redwood/boot.d/95-fpd.sh
+if [ -f /mnt/iosroot/redwood/bin/fpd ]; then
+    chmod 755 /mnt/iosroot/redwood/bin/fpd
+    chown 0:0 /mnt/iosroot/redwood/bin/fpd
+fi
+echo "  ✓ Deployed 95-fpd.sh to /redwood/boot.d/"
+
+# Fix tzinit plist to prevent launchd abort
+TZINIT_PLIST="/mnt/iosroot/System/Library/LaunchDaemons/com.apple.tzinit.plist"
+if [ -f "$TZINIT_PLIST" ]; then
+    sed -i 's|<key>AbandonProcessGroup</key>[[:space:]]*<true/>|<key>AbandonProcessGroup</key><false/>|g' "$TZINIT_PLIST" 2>/dev/null || true
+    sed -i 's|<key>LaunchOnlyOnce</key>[[:space:]]*<true/>|<key>LaunchOnlyOnce</key><false/>|g' "$TZINIT_PLIST" 2>/dev/null || true
+    echo "  ✓ Patched tzinit plist for resilience"
+fi
+
+# Ensure timezone directory exists
+mkdir -p /mnt/iosroot/private/var/db/timezone 2>/dev/null || true
+mkdir -p /mnt/iosroot/usr/share/zoneinfo.default 2>/dev/null || true
+[ -f /mnt/iosroot/usr/share/zoneinfo.default/UTC ] || echo "UTC0" > /mnt/iosroot/usr/share/zoneinfo.default/UTC 2>/dev/null || true
+[ -L /mnt/iosroot/private/var/db/timezone/zoneinfo ] || ln -sf /usr/share/zoneinfo.default /mnt/iosroot/private/var/db/timezone/zoneinfo 2>/dev/null || true
+
 rm -rf "$TMP_STEP"
 
 echo "=== 7. Flush and Unmount Cleanly ==="
