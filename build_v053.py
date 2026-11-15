@@ -5,7 +5,7 @@ import zipfile
 import subprocess
 import glob
 
-REPO = r"C:\Users\TRAN VAN HUNG\Downloads\ios-sapphire"
+REPO = os.path.dirname(os.path.abspath(__file__))
 BUILD = os.path.join(REPO, "build_tmp")
 os.makedirs(BUILD, exist_ok=True)
 T = os.path.join(BUILD, "staging_053")
@@ -53,9 +53,11 @@ android_bin = os.path.join(root_dir, "Applications", "Android.app", "Android")
 ent_path = os.path.join(REPO, "userland", "dualboot", "ios-app", "AndroidBoot.entitlements")
 if os.path.exists(android_bin) and os.path.exists(ent_path):
     print("Signing Android.app with AndroidBoot.entitlements via WSL ldid...")
-    wsl_bin = "/mnt/c/" + android_bin[3:].replace("\\", "/")
-    wsl_ent = "/mnt/c/" + ent_path[3:].replace("\\", "/")
-    cmd = ["wsl", "/home/khanh/tools-dl/ldid/ldid", f"-S{wsl_ent}", wsl_bin]
+    ldid_bin = "/home/khanh/tools-dl/ldid/ldid"
+    if os.path.exists(ldid_bin):
+        cmd = [ldid_bin, f"-S{ent_path}", android_bin]
+    else:
+        cmd = ["wsl", ldid_bin, f"-S/mnt/c/{ent_path[3:].replace('\\\\', '/')}", f"/mnt/c/{android_bin[3:].replace('\\\\', '/')}"]
     res = subprocess.run(cmd, capture_output=True, text=True)
     print(f"  ldid result: code={res.returncode}")
 

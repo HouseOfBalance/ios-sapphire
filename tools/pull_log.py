@@ -2,14 +2,14 @@ import subprocess
 import os
 import sys
 
-ADB = r"C:\Users\TRAN VAN HUNG\.gemini\antigravity\scratch\ios-sapphire\platform-tools\adb.exe"
+ADB = r"C:\Users\TRAN VAN HUNG\Downloads\platform-tools\adb.exe"
 
 def run_cmd(cmd):
     res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
     return res.stdout.strip()
 
 print("Getting device block...")
-dev = run_cmd([ADB, "shell", "for d in /dev/block/by-name/iosroot /dev/block/by-name/userdata /dev/block/bootdevice/by-name/userdata; do [ -e $d ] && readlink -f $d && break; done"])
+dev = run_cmd([ADB, "shell", "readlink -f /dev/block/by-name/iosroot || echo /dev/block/sda18"])
 print(f"Device: {dev}")
 
 size_str = run_cmd([ADB, "shell", f"blockdev --getsize64 {dev}"])
