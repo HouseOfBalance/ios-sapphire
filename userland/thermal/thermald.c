@@ -1,7 +1,7 @@
 /*
  * thermald: Qualcomm Thermal Manager for iOS on Sapphire (SM6225/Snapdragon 685)
  *
- * Reads thermal zones from /sys/class/thermal/thermal_zone*/temp and PMIC PM6225 battery temp.
+ * Reads thermal zones from /sys/class/thermal/thermal_zone(N)/temp and PMIC PM6225 battery temp.
  * Implements 4-tier throttling policy:
  *   Normal (<40°C):    Full performance, A73 boost on touch
  *   Warm (40-45°C):    A73 max 2.4GHz, GPU max 900MHz
