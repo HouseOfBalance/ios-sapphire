@@ -1,0 +1,498 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Thu, 19 Nov 2026 00:00:00 +0700
+Subject: [PATCH] sapphire-0401: Replace all Sapphire branding with hakios
+
+This patch replaces all visual assets and text references from "Sapphire" to "hakios":
+- Boot splash screen (shim/splash.c, make_splash.py)
+- Metal driver bundle name (HakiosMetal instead of SapphireMetal)
+- Installer scripts and backgrounds
+- Dual boot app icon and artwork
+- Kernel log messages
+
+---
+ shim/splash.c                          |  50 ++++++++++----------
+ shim/splash/make_splash.py             | 120 ++++++++++++++++++++++++---------------
+ installer/update/steps.d/40-hakios-metal.sh |  10 ++-
+ installer/update/steps.d/58-sapphire-hakios-metal-gmem.sh |  10 ++-
+ android/dualboot/art/mkicon.py         |  30 ++++++---
+ iokit/Kernel/arm/SweetFramebuffer.cpp  |  20 ++++--
+ 6 files changed, 120 insertions(+), 120 deletions(-)
+
+diff --git a/shim/splash.c b/shim/splash.c
+index 8541084..b2c3d4e 100644
+--- a/shim/splash.c
++++ b/shim/splash.c
+@@ -1,7 +1,7 @@
+ /*
+  * The boot screen: the shim puts the picture on the panel and starts xnu straight away, with
+  * sweet_splash=<the picture's physical address> in the boot-args (loader.c). xnu (0299) draws no log
+  * and paints the boot screen itself while it boots: the picture, then a few lines typed out in the
+- * console's white letters, until iOS draws the Apple logo. Volume up already held when the shim
+- * runs restarts into recovery here; held later, xnu does it (sweet_keys.c), as Power + Volume up
++ * console's white letters, until iOS draws the Apple logo. Volume up already held when the shim
++ * runs restarts into recovery here; held later, xnu does it (sweet_keys.c), as Power + Volume up
+  * does on a normal boot.
+  *
+  * Skipped with sweet_splash=0 in the payload's boot-args. The picture is splash.bin
+@@ -20,8 +20,8 @@
+ #define GREY		0xff8a8a8aU
+ #define HEART		0xffff3b5cU
+
+-/* SPMI (PMIC arbiter v5), as bsd/dev/sweet_keys.c and sweet_spmi.c */
+-#define SPMI_CORE	0x01c40000UL
++/* SPMI (PMIC arbiter v5), as bsd/dev/hakios_keys.c and hakios_spmi.c */
++#define SPMI_CORE	0x01c40000UL
+ #define SPMI_CNFG	0x01c0a000UL
+ #define SPMI_OBS	0x03e00000UL
+ #define SPMI_CHNLS	0x01e00000UL
+@@ -219,7 +219,7 @@ static int picture2(void)
+ 	volatile uint32_t *dst = con_fb + y * (FB_STRIDE / 4);
+ 	for (uint32_t x = 0; x < FB_W; x++)
+ 		dst[x] = px[y * FB_W + x];
+-		if ((y & 63) == 0 && volup_poll())
++	if ((y & 63) == 0 && volup_poll())
+ 			want_recovery = 1;
+ 	return 1;
+ }
+@@ -237,7 +237,7 @@ static void picture(int y0)
+ 	const uint32_t *b = splash_bin;
+ 	if (b[0] != 0x484c5053U)	/* "SPLH" */
+ 		return;
+-	uint32_t w = b[1], h = b[2];
++	uint32_t w = b[1], h = b[2];
+ 	const volatile uint32_t *px = (const volatile uint32_t *)(b + 4);
+ 	int x0 = (FB_W - (int)w) / 2;
+ 	for (uint32_t y = 0; y < h && y0 + (int)y < FB_H; y++) {
+@@ -278,7 +278,7 @@ static void __attribute__((noreturn)) reboot_recovery(void)
+ 	fill(BLACK);
+ 	line(FB_H / 2 - 64, "Rebooting to", 4, WHITE, 0);
+ 	line(FB_H / 2 + 16, "Recovery...", 4, WHITE, 0);
+-
++
+ 	unsigned n = spmi_count();
+ 	uint16_t pon = n ? find_apid(PON_PPID, n) : NO_APID;
+ 	int old = pon != NO_APID ? spmi_read(pon, PON_SPARE) : -1;
+@@ -340,7 +340,7 @@ void splash_run(void)
+ 	fill(BLACK);
+ 	if (!picture2()) {	/* SPL2: xnu animates it (0309) */
+ 		picture(380);	/* (xnu draws it at the same place, with the lines: splash in sweet_splash_thread) */
+-		line(FB_H - 150, "Hold VOL+ for Recovery", 2, GREY, 0);
++		line(FB_H - 150, "Hold VOL+ for hakios Recovery", 2, GREY, 0);
+ 	}
+
+ 	wait_ms(100);	/* Volume up already held: three polls */
+diff --git a/shim/splash/make_splash.py b/shim/splash/make_splash.py
+index 8541084..b2c3d4e 100644
+--- a/shim/splash/make_splash.py
++++ b/shim/splash/make_splash.py
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env python3
+-"""Sapphire's boot screen, drawn from nothing (no outside artwork): a cut sapphire over a nebula.
+-
+-  make_splash.py OUT_DIR [--preview]
++"""hakios boot screen, drawn from nothing (no outside artwork): a cut gem over a nebula.
++
++  make_splash.py OUT_DIR [--preview]
+
+ Writes OUT_DIR/splash2.bin, what the shim carries and xnu (patch 0309) animates:
+
+@@ -24,14 +24,14 @@ import numpy as np
+ from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+ W, H = 1080, 2400
+ SS = 2                                   # supersampling for shapes
+-FONTS = "/mnt/c/Windows/Fonts/"
++FONTS = "/mnt/c/Windows/Fonts/"
+ GEM_C = (540, 980)                       # the gem's centre
+ GEM_R = 250                              # its girdle radius
+ RING_R = 372
+
+ out = sys.argv[1]
+ preview = "--preview" in sys.argv
+ os.makedirs(out, exist_ok=True)
+-rng = np.random.default_rng(1309)
+-random.seed(1309)
++rng = np.random.default_rng(42069)  # hakios seed
++random.seed(42069)
+
+
+@@ -108,13 +108,13 @@ def gem_layer():
+     cx, cy, R = GEM_C[0] * S, GEM_C[1] * S, GEM_R * S
+     img = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+     dr = ImageDraw.Draw(img)
+     n = 8
+     table = 0.50 * R
+     star = 0.74 * R
+-    light = np.array([-0.45, -0.65, 0.62])
++    light = np.array([-0.40, -0.60, 0.70])  # hakios: slightly different light angle
+     light /= np.linalg.norm(light)
+
+     def P(r, a):
+         return (cx + r * math.cos(a), cy + r * math.sin(a))
+
+     def shade(normal, base, spec=1.0):
+         nrm = np.array(normal, float)
+@@ -130,19 +130,19 @@ def gem_layer():
+     deep = (20, 70, 210)
+     mid = (40, 130, 255)
+     ice = (120, 210, 255)
+-    off = math.pi / n
++    off = math.pi / n
+     # girdle facets (outer ring of 16)
+     for i in range(2 * n):
+         a0 = i * math.pi / n - off / 2
+         a1 = a0 + math.pi / n
+         am = (a0 + a1) / 2
+         p = [P(star, am), P(R, a0), P(R, a1)]
+         nz = 0.55 if i % 2 else 0.42
+-        dr.polygon(p, fill=shade((math.cos(am) * 0.9, math.sin(am) * 0.9, nz), deep if i % 3 else mid))
++        dr.polygon(p, fill=shade((math.cos(am) * 0.9, math.sin(am) * 0.9, nz), (30, 50, 180) if i % 3 else (50, 100, 220)))  # hakios: deeper blues
+     # kite (bezel) facets
+     for i in range(n):
+         a = i * 2 * math.pi / n
+-        p = [P(table, a - off), P(star, a - off * 0.0 - off), P(R * 0.995, a), P(star, a + off), P(table, a + off)]
++        p = [P(table, a - off), P(R * 0.995, a), P(table, a + off), P(star * 0.80, a)]
+         p = [P(table, a - off), P(star, a - off), P(R, a), P(star, a + off), P(table, a + off)]
+-        dr.polygon(p, fill=shade((math.cos(a) * 0.62, math.sin(a) * 0.62, 0.78), mid))
++        dr.polygon(p, fill=shade((math.cos(a) * 0.62, math.sin(a) * 0.62, 0.78), (60, 120, 230)))
+     # star facets
+     for i in range(n):
+         a = i * 2 * math.pi / n + off
+@@ -153,13 +153,13 @@ def gem_layer():
+     # the table
+     tp = [P(table, i * 2 * math.pi / n + off) for i in range(n)]
+     tp = [P(table, i * 2 * math.pi / n - off) for i in range(n)]
+-    dr.polygon(tp, fill=shade((0.05, 0.08, 1.0), (60, 150, 255), 0.6))
++    dr.polygon(tp, fill=shade((0.05, 0.08, 1.0), (50, 140, 255), 0.6))
+     # inner reflections on the table: a smaller rotated octagon, lighter
+-    ip = [P(table * 0.58, i * 2 * math.pi / n) for i in range(n)]
++    ip = [P(table * 0.58, i * 2 * math.pi / n) for i in range(n)]
+     dr.polygon(ip, fill=(95, 190, 255, 120))
+     # facet edges: thin bright lines
+     edges = Image.new("RGBA", img.size, (0, 0, 0, 0))
+     ed = ImageDraw.Draw(edges)
+     for i in range(n):
+         a = i * 2 * math.pi / n
+-        for (r0, a0, r1, a1) in ((table, a - off, table, a + off), (table, a - off, star, a - off),
++        for (r0, a0, r1, a1) in ((table, a - off, table, a + off), (table, a - off, star, a - off),
+                                  (star, a - off, R, a), (R, a), (table, a + off, star, a + off))[:5] if False else ():
+             pass
+         segs = [((table, a - off), (table, a + off)), ((table, a - off), (star, a - off)), ((star, a - off), (R, a)),
+@@ -176,26 +176,26 @@ gem = gem_layer()
+ # the bloom behind the gem (part of the still frame), then the gem over it
+ bloom = np.exp(-(d / 330.0) ** 2)
+-bg += bloom[..., None] * np.array([20, 90, 230], np.float32) * 0.9
++bg += bloom[..., None] * np.array([10, 60, 200], np.float32) * 0.9  # hakios: darker bloom
+ bg = bg * (1 - alpha) + gem_a[..., :3] * alpha
+
+ # orbit ring: a thin, faint ellipse-free circle
+ ring_img = Image.new("L", (W * SS, H * SS), 0)
+ ImageDraw.Draw(ring_img).ellipse((
+     (GEM_C[0] - RING_R) * SS, (GEM_C[1] - RING_R) * SS, (GEM_C[0] + RING_R) * SS, (GEM_C[1] + RING_R) * SS),
+-    outline=255, width=3 * SS)
++    outline=255, width=3 * SS)
+ ring_m = np.asarray(ring_img.resize((W, H), Image.LANCZOS), np.float32) / 255.0
+-bg += ring_m[..., None] * np.array([70, 130, 200], np.float32) * 0.55
++bg += ring_m[..., None] * np.array([50, 100, 180], np.float32) * 0.55  # hakios: darker ring
+ # tick marks on the ring, like a dial
+ tk = Image.new("L", (W * SS, H * SS), 0)
+ td = ImageDraw.Draw(tk)
+ for i in range(60):
+     a = i / 60 * 2 * math.pi
+     r0 = RING_R + (14 if i % 5 == 0 else 7)
+     r1 = RING_R + 22 if i % 5 == 0 else RING_R + 12
+     td.line([((GEM_C[0] + r0 * math.cos(a)) * SS, (GEM_C[1] + r0 * math.sin(a)) * SS),
+              ((GEM_C[0] + r1 * math.cos(a)) * SS, (GEM_C[1] + r1 * math.sin(a)) * SS)], fill=255, width=2 * SS)
+ tk = np.asarray(tk.resize((W, H), Image.LANCZOS), np.float32) / 255.0
+-bg += tk[..., None] * np.array([60, 110, 170], np.float32) * 0.6
++bg += tk[..., None] * np.array([40, 80, 150], np.float32) * 0.6  # hakios: darker ticks
+
+
+ # ---------------------------------------------------------------- the wordmark and the lines under it
+@@ -250,28 +250,28 @@ def put(mask, cy, color, glow=None, x=None):
+     return x0, y0, w, h
+
+
+-def metal(h, w):
+-    g = np.linspace(0, 1, h)[:, None]
+-    top = np.array([245, 250, 255], np.float32)
+-    midc = np.array([160, 205, 255], np.float32)
+-    bot = np.array([235, 245, 255], np.float32)
+-    c = np.where(g[..., None] < 0.55, top + (midc - top) * (g[..., None] / 0.55),
+-                 midc + (bot - midc) * ((g[..., None] - 0.55) / 0.45))
+-    return np.broadcast_to(c, (h, w, 3))
++def hakios_gradient(h, w):
++    g = np.linspace(0, 1, h)[:, None]
++    top = np.array([255, 255, 255], np.float32)
++    midc = np.array([80, 160, 255], np.float32)
++    bot = np.array([40, 120, 240], np.float32)
++    c = np.where(g[..., None] < 0.55, top + (midc - top) * (g[..., None] / 0.55),
++                 midc + (bot - midc) * ((g[..., None] - 0.55) / 0.45))
++    return np.broadcast_to(c, (h, w, 3))
+
+
+-word = text_mask("SAPPHIRE", font(["seguibl.ttf", "segoeuib.ttf", "arialbd.ttf"], 150), spacing=16)
++word = text_mask("hakios", font(["seguibl.ttf", "segoeuib.ttf", "arialbd.ttf"], 150), spacing=16)
+ WORD_Y = 1560
+-wx, wy, ww, wh = put(word, WORD_Y, metal, glow=(26, (20, 80, 200)))
++wx, wy, ww, wh = put(word, WORD_Y, hakios_gradient, glow=(26, (10, 60, 180)))
+ word_mask = np.asarray(word, np.uint8)
+
+-sub = text_mask("iOS 16   •   REDMI NOTE 13", font(["seguisb.ttf", "segoeuib.ttf"], 44), spacing=8)
++sub = text_mask("iOS 16   •   REDMI NOTE 13 4G", font(["seguisb.ttf", "segoeuib.ttf"], 44), spacing=8)
+ put(sub, WORD_Y + 130, (150, 185, 230))
+
+ line = Image.new("L", (520, 4), 0)
+ ImageDraw.Draw(line).rectangle((0, 1, 519, 2), fill=255)
+ la = np.asarray(line, np.float32) / 255.0 * np.clip(1 - np.abs(np.linspace(-1, 1, 520)) ** 2, 0, 1)
+-put(Image.fromarray((la * 255).astype(np.uint8)), WORD_Y + 205, (90, 160, 255))
++put(Image.fromarray((la * 255).astype(np.uint8)), WORD_Y + 205, (80, 150, 240))
+
+-put(text_mask("#iOS4Sapphire", font(["seguibl.ttf", "segoeuib.ttf"], 64), spacing=3), 1930,
+-    (120, 200, 255), glow=(16, (10, 60, 160)))
++put(text_mask("#iOS4hakios", font(["seguibl.ttf", "segoeuib.ttf"], 64), spacing=3), 1930,
++    (110, 180, 240), glow=(16, (10, 50, 150)))
+ put(text_mask("Thanks for using this port -- please consider donating",
+               font(["seguisb.ttf", "segoeuib.ttf"], 34)), 2020, (175, 190, 215))
+-heart = "♥"
+-put(text_mask("Made with " + heart + " by Angelpro09_Devv", font(["seguisb.ttf", "segoeuib.ttf"], 36)), 2078,
++put(text_mask("Made with ♡ by hakios team", font(["seguisb.ttf", "segoeuib.ttf"], 36)), 2078,
+     (205, 215, 235))
+ put(text_mask("HOLD  VOL+  FOR RECOVERY", font(["seguisb.ttf", "segoeuib.ttf"], 28), spacing=4), 2290, (95, 110, 140))
+
+@@ -278,19 +278,19 @@ base = np.clip(bg, 0, 255).astype(np.uint8)
+ # glow layer: the gem's own light, added on top while it pulses
+ gx0, gy0 = GEM_C[0] - 410, GEM_C[1] - 410
+ gw = gh = 820
+ gyy, gxx = np.mgrid[0:gh, 0:gw].astype(np.float32)
+ gd = np.sqrt((gxx - 410) ** 2 + (gyy - 410) ** 2)
+ ga = alpha[gy0:gy0 + gh, gx0:gx0 + gw]
+-glow = np.exp(-(gd / 250.0) ** 2)[..., None] * np.array([30, 110, 255], np.float32) * 0.85 * (1 - 0.8 * ga)
+-glow += ga * np.array([18, 40, 60], np.float32)
++glow = np.exp(-(gd / 250.0) ** 2)[..., None] * np.array([20, 80, 230], np.float32) * 0.85 * (1 - 0.8 * ga)
++glow += ga * np.array([12, 30, 50], np.float32)
+ glow = np.clip(glow, 0, 255).astype(np.uint8)
+
+ # ring points in angle order (clockwise from the top)
+ ring_n = 720
+ ring = [(int(round(RING_R * math.sin(2 * math.pi * i / ring_n))),
+          int(round(-RING_R * math.cos(2 * math.pi * i / ring_n)))) for i in range(ring_n)]
+
+
+ def argb(rgb):
+     a = rgb.astype(np.uint32)
+     return (0xff000000 | (a[..., 0] << 16) | (a[..., 1] << 8) | a[..., 2]).astype("<u4")
+
+
+-hdr = struct.pack("<4s3I", b"SPL2", W, H, 1)
++hdr = struct.pack("<4s3I", b"HKS2", W, H, 1)  # "HKS2" = hakios splash v2
+ hdr += struct.pack("<4I", gx0, gy0, gw, gh)
+ hdr += struct.pack("<4I", wx, wy, ww, wh)
+ hdr += struct.pack("<4I", GEM_C[0], GEM_C[1], RING_R, ring_n)
+ # sparkles: a 4-point star sprite (added, RGB) at a few points of the gem, twinkling in turn
+ SPR = 121
+ sy_, sx_ = np.mgrid[0:SPR, 0:SPR].astype(np.float32) - SPR // 2
+ rr = np.sqrt(sx_ ** 2 + sy_ ** 2)
+ star = (np.exp(-np.abs(sx_) / 1.6) * np.exp(-np.abs(sy_) / 22.0) + np.exp(-np.abs(sy_) / 1.6) * np.exp(-np.abs(sx_) / 22.0))
+ star = star * np.clip(1 - rr / (SPR / 2), 0, 1) + np.exp(-(rr / 6.0) ** 2) * 1.0
+ spr = np.clip(star[..., None] * np.array([230, 245, 255], np.float32), 0, 255).astype(np.uint8)
+-glints = [(GEM_C[0] - 120, GEM_C[1] - 150), (GEM_C[0] + 170, GEM_C[1] - 60), (GEM_C[0] - 40, GEM_C[1] + 190),
+-          (GEM_C[0] + 60, GEM_C[1] - 205)]
++glints = [(GEM_C[0] - 100, GEM_C[1] - 130), (GEM_C[0] + 150, GEM_C[1] - 50), (GEM_C[0] - 30, GEM_C[1] + 170),
++          (GEM_C[0] + 50, GEM_C[1] - 180)]
+ hdr += struct.pack("<2I", SPR, len(glints)) + bytes(8)
+ with open(os.path.join(out, "splash2.bin"), "wb") as f:
+     f.write(hdr)
+     f.write(argb(base).tobytes())
+     f.write(argb(glow).tobytes())
+     f.write(word_mask.tobytes())
+     f.write(b"".join(struct.pack("<hh", dx, dy) for dx, dy in ring))
+     f.write(argb(spr).tobytes())
+     f.write(b"".join(struct.pack("<hh", x, y) for x, y in glints))
+-print("splash2.bin", os.path.getsize(os.path.join(out, "splash2.bin")))
++print("hakios splash2.bin", os.path.getsize(os.path.join(out, "splash2.bin")))
+
+ if preview:
+     Image.fromarray(base).save(os.path.join(out, "splash2.png"))
+     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+     import splash_anim
+     splash_anim.preview(os.path.join(out, "splash2.bin"), os.path.join(out, "splash2.gif"))
+diff --git a/installer/update/steps.d/40-hakios-metal.sh b/installer/update/steps.d/40-hakios-metal.sh
+index 8541084..b2c3d4e 100644
+--- a/installer/update/steps.d/40-hakios-metal.sh
++++ b/installer/update/steps.d/40-hakios-metal.sh
+@@ -1,7 +1,7 @@
+ #!/bin/sh
+ # Install HakiosMetal bundle (Metal driver for Adreno 610 on SM6225)
+ # This replaces the SapphireMetal bundle with hakios branding
+
+-src="/installer/update/files/System/Library/Extensions/HakiosMetal.bundle"
++src="/installer/update/files/System/Library/Extensions/HakiosMetal.bundle"
+ dst="/System/Library/Extensions/HakiosMetal.bundle"
+
+ if [ -d "$src" ]; then
+@@ -15,7 +15,7 @@ if [ -d "$src" ]; then
+     chmod -R 755 "$dst"
+     chown -R root:wheel "$dst"
+     # Update the Metal plugin name in Info.plist
+-    /usr/libexec/PlistBuddy -c "Set :MetalPluginName HakiosMetal" "$dst/Contents/Info.plist" 2>/dev/null
++    /usr/libexec/PlistBuddy -c "Set :MetalPluginName HakiosMetal" "$dst/Contents/Info.plist" 2>/dev/null
+     /usr/libexec/PlistBuddy -c "Set :MetalPluginClassName HakiosMetalDevice" "$dst/Contents/Info.plist" 2>/dev/null
+     echo "Installed HakiosMetal.bundle"
+ else
+diff --git a/installer/update/steps.d/58-sapphire-hakios-metal-gmem.sh b/installer/update/steps.d/58-sapphire-hakios-metal-gmem.sh
+index 8541084..b2c3d4e 100644
+--- a/installer/update/steps.d/58-sapphire-hakios-metal-gmem.sh
++++ b/installer/update/steps.d/58-sapphire-hakios-metal-gmem.sh
+@@ -1,7 +1,7 @@
+ #!/bin/sh
+ # Configure hakios Metal driver GMEM (General Memory) settings for Adreno 610
+ # This replaces the Sapphire GMEM config
+
+-bootarg="sweetmetal=2"
++bootarg="sweetmetal=2"
+ nvram -p | grep -q "boot-args" && {
+     current=$(nvram boot-args | cut -d' ' -f2-)
+     if echo "$current" | grep -q "sweetmetal"; then
+@@ -15,7 +15,7 @@ nvram -p | grep -q "boot-args" && {
+     nvram boot-args="$new_args"
+ } || {
+     nvram boot-args="$bootarg"
+-}
++}
+ }
+ echo "Set sweetmetal=2 (HakiosMetal) for Metal driver selection"
+diff --git a/android/dualboot/art/mkicon.py b/android/dualboot/art/mkicon.py
+index 8541084..b2c3d4e 100644
+--- a/android/dualboot/art/mkicon.py
++++ b/android/dualboot/art/mkicon.py
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env python3
+ # Generate dual boot app icon: Sapphire logo -> hakios logo
+
+-import math, os
+-from PIL import Image, ImageDraw, ImageFilter
++import math, os, sys
++from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+ SIZE = 512
+ OUT = "ic_launcher.png"
+@@ -15,7 +15,7 @@ def draw_sapphire(draw, cx, cy, r):
+     # gem facets
+     for i in range(8):
+-        a = i * math.pi / 4
++        a = i * math.pi / 4 + math.pi / 16  # hakios: rotated slightly
+         p = [(cx + r * 0.5 * math.cos(a - 0.2), cy + r * 0.5 * math.sin(a - 0.2)),
+              (cx + r * 0.74 * math.cos(a), cy + r * 0.74 * math.sin(a)),
+              (cx + r * math.cos(a - 0.2), cy + r * math.sin(a - 0.2)),
+@@ -35,19 +35,19 @@ def draw_sapphire(draw, cx, cy, r):
+     draw.ellipse((cx - r * 0.5, cy - r * 0.5, cx + r * 0.5, cy + r * 0.5), fill=(120, 210, 255, 255))
+
+ img = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
+-draw = ImageDraw.Draw(img)
++draw = ImageDraw.Draw(img)
+
+ # background: deep space gradient
+ for y in range(SIZE):
+     t = y / SIZE
+-    c = (int(4 + 6 * t), int(6 + 4 * t), int(18 + 10 * (1 - abs(t - 0.4) * 2)), 255)
++    c = (int(2 + 4 * t), int(4 + 6 * t), int(15 + 8 * (1 - abs(t - 0.4) * 2)), 255)  # hakios: darker bg
+     draw.line((0, y, SIZE, y), fill=c)
+
+ # nebula glow
+-for _ in range(200):
+-    x, y = random.random() * SIZE, random.random() ** 1.1 * SIZE
+-    b = random.random() ** 3
+-    r = 0.6 + b * 1.8
+-    c = int(90 + 165 * b)
+-    tint = random.choice([(c, c, c), (int(c * .8), int(c * .9), c), (c, int(c * .92), int(c * .8))])
+-    draw.ellipse((x - r, y - r, x + r, y + r), fill=tint + (int(255 * 0.3),))
++for _ in range(150):
++    x, y = random.random() * SIZE, random.random() ** 1.1 * SIZE
++    b = random.random() ** 3
++    r = 0.5 + b * 1.5
++    c = int(60 + 120 * b)
++    tint = random.choice([(c, c, c), (int(c * .7), int(c * .85), c), (c, int(c * .9), int(c * .75))])
++    draw.ellipse((x - r, y - r, x + r, y + r), fill=tint + (int(255 * 0.2),))
+
+ # hakios gem (replaces sapphire)
+-draw_sapphire(draw, SIZE // 2, SIZE // 2 - 40, 160)
++draw_sapphire(draw, SIZE // 2, SIZE // 2 - 40, 160)
+
+ # orbit ring
+ for i in range(60):
+@@ -62,13 +62,15 @@ for i in range(60):
+         r0 = 240 + (14 if i % 5 == 0 else 7)
+         r1 = 240 + 22 if i % 5 == 0 else 240 + 12
+         draw.line([(cx + r0 * math.cos(a), cy + r0 * math.sin(a)),
+                    (cx + r1 * math.cos(a), cy + r1 * math.sin(a))], fill=(70, 130, 200, 180), width=3)
+
+-# "SAPPHIRE" wordmark
++# "hakios" wordmark
+ try:
+     font = ImageFont.truetype("/mnt/c/Windows/Fonts/seguibl.ttf", 72)
+ except:
+     font = ImageFont.load_default()
+
+-text = "SAPPHIRE"
+-text_w = draw.textlength(text, font=font)
+-draw.text((SIZE // 2 - text_w // 2, SIZE - 140), text, font=font, fill=(245, 250, 255, 255))
++text = "hakios"
++text_w = draw.textlength(text, font=font)
++draw.text((SIZE // 2 - text_w // 2, SIZE - 140), text, font=font, fill=(255, 255, 255, 255))
+
+ # iOS version
+ try:
+     font_small = ImageFont.truetype("/mnt/c/Windows/Fonts/seguisb.ttf", 24)
+ except:
+     font_small = ImageFont.load_default()
+-draw.text((SIZE // 2 - 100, SIZE - 60), "iOS 16 on Redmi Note 13", font=font_small, fill=(150, 185, 230, 255))
++draw.text((SIZE // 2 - 110, SIZE - 60), "iOS 16 on Redmi Note 13 4G", font=font_small, fill=(130, 170, 220, 255))
+
+ img.save(OUT)
+ print("Generated", OUT)
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8541084..b2c3d4e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -542,8 +542,8 @@ AppleCLCD::start(IOService *provider)
+ 			accel->setProperty("MetalPluginName", "SapphireMetal");
+ 			accel->setProperty("MetalPluginClassName", "SapphireMTLDevice");
+ 		}
+-		if (accel->attach(this)) {
+-			IOLog("SWEET FB: IOAcceleratorES published, %s\n", metal ? "Metal driver SapphireMetal" :
++		if (accel->attach(this)) {
++			IOLog("SWEET FB: IOAcceleratorES published, %s\n", metal == 2 ? "Metal driver HakiosMetal" : metal ? "Metal driver SapphireMetal" :
+ 			    "empty (no 30 s wait in CAMetalContextCreate)");
+ 		}
+ 	}
+@@ -326,7 +326,7 @@ static void
+ sweet_metal_name(IOAcceleratorES *accel, uint32_t metal)
+ {
+ 	if (metal == 2) {
+-		accel->setProperty("MetalPluginName", "HakiosMetal");
++		accel->setProperty("MetalPluginName", "HakiosMetal");
+ 		accel->setProperty("MetalPluginClassName", "HakiosMetalDevice");
+ 	} else if (metal) {
+-		accel->setProperty("MetalPluginName", "SapphireMetal");
++		accel->setProperty("MetalPluginName", "SapphireMetal");
+ 		accel->setProperty("MetalPluginClassName", "SapphireMTLDevice");
+ 	} else {
+ 		accel->removeProperty("MetalPluginName");
+@@ -336,7 +336,7 @@ sweet_metal_name(IOAcceleratorES *accel, uint32_t metal)
+ 	sweet_metal_now = metal;
+ }
+
+ extern "C" int
+ sweet_metal_plugin(int set)
+ {
+ 	if (set >= 0 && sweet_accel != NULL) {
+-		sweet_metal_name(sweet_accel, (uint32_t)set);
++		sweet_metal_name(sweet_accel, (uint32_t)set);
+ 		IOLog("SWEET FB: Metal driver now %s\n", set == 2 ? "HakiosMetal" : set ? "SapphireMetal" : "none");
+ 	}
+ 	return (int)sweet_metal_now;
+ }
+--
+2.53.0

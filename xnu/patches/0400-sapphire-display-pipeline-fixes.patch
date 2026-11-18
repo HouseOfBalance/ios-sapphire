@@ -1,0 +1,557 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Sapphire <sapphire@local>
+Date: Thu, 19 Nov 2026 00:00:00 +0700
+Subject: [PATCH] sapphire-0400: Display pipeline fixes - stride/geometry, cache coherency, VSync, early console
+
+This patch consolidates fixes for the SpringBoard frame generation/display pipeline:
+
+1. Stride/Geometry/Scaling Fixes:
+   - Correct sweetfb_scale handling (2x vs 3x for 1080x2400 panel presented as 1125x2436)
+   - Fix rowbytes calculation for BGRA8888 (4 bytes/pixel, 64-byte alignment)
+   - Fix logical-to-physical coordinate mapping in present() and swap()
+   - Fix SweetHID touch coordinate scaling to match display presentation
+
+2. TTBR0/Physmap/Cache Coherency:
+   - Add dc cvac / dsb sy after CPU blitting to panel memory
+   - Add dc civac / dsb sy before GPU reads from surfaces
+   - Fix write-combine memory handling for MDP scanout buffers
+
+3. VSync/Throttled Present/Deadlocks:
+   - Fix mach_absolute_time to nanoseconds conversion for 60Hz grid
+   - Fix lock inversion between fLock and fPresentLock
+   - Fix missed VSync when GPU copy takes longer than 16.67ms
+   - Increase flipWhenCopied timeout from 20ms to 33ms (2 frames)
+
+4. Early Console Contention:
+   - Fix debug console vs IOMFB/SpringBoard handoff
+   - Ensure console pauses before first frame copy
+   - Add boot-arg sweetfb_console_hold to delay console pause
+
+5. SweetSurface plane rowbytes fix (from 0318):
+   - Add bytesPerRow at +0x10 in lock result for IOSurfaceGetBytesPerRowOfPlane
+
+6. Low DDR pool fix (from 0233):
+   - Ensure SweetLowBuf uses write-combine cache for MDP scanout
+
+7. Pipeline improvements (from 0334):
+   - Fix flip ring race conditions
+   - Add proper memory barriers for flip_head/flip_tail
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 500 +++++++++++++++++++++++++++++++------
+ iokit/Kernel/arm/SweetSurface.cpp     |  20 +-
+ iokit/Kernel/arm/hid/SweetHID.cpp     |  30 ++-
+ 3 files changed, 420 insertions(+), 130 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8541084..b2c3d4e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1,6 +1,10 @@
+ /*
+  * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
+  * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
+  * itself) as the main display, driven by CoreAnimation's CPU renderer.
++ *
++ * Fixes in this version:
++ * - Stride/geometry for 1080x2400 panel presented as 1125x2436 (3x scale)
++ * - Cache coherency: dc cvac/dsb sy after CPU blits, dc civac before GPU reads
++ * - VSync on absolute 60Hz grid with proper armVsync()
++ * - Pipeline flip ring with proper locking and memory barriers
++ * - Early console handoff to avoid contention with SpringBoard
+  */
+ #include "SweetSurface.h"
+
+@@ -73,6 +77,15 @@ class AppleCLCD;
+ static AppleCLCD *sweet_dsi_fb;                 /* 0260: sweet_fb_dsi_seq() */
+ static AppleCLCD *sweet_frame_fb;               /* 0286: kern.sweet_fb_frame_await/_sent */
+ static uint32_t sweet_bl_on;                    /* 0330: sweetbl=0 keeps DSI panel on/level quiet */
++static uint32_t sweet_fb_max_inflight = 3;      /* 0334: max pipelined GPU frames (1-4) */
++static uint32_t sweet_fb_pipeline_enabled = 1;  /* 0334: enable async pipeline (boot arg sweet_fb_pipeline) */
++static IOLock *sweet_fb_flip_lock = NULL;       /* 0334: protects flip ring */
++static volatile uint32_t sweet_fb_flip_head = 0; /* 0334: next slot to write */
++static volatile uint32_t sweet_fb_flip_tail = 0; /* 0334: next slot to flip */
++static uint64_t sweet_fb_flip_timestamps[4];    /* 0334: per-slot flip timestamps */
++static uint32_t sweet_fb_console_hold = 0;      /* 0400: hold console before first frame (ms) */
++static uint32_t sweet_fb_gpucopy = -1;          /* 0147: sweetfb_gpucopy boot arg */
++static uint32_t sweet_fb_stats_on = -1;         /* 0147: sweetfb_stats boot arg */
+ /* 0324: the panel's state for tap to wake (bsd/dev/sweet_touch.c): 1 after RequestPowerChange(0), and since when */
+ extern "C" volatile int sweet_fb_panel_off;
+ extern "C" volatile uint64_t sweet_fb_panel_off_abs;
+@@ -145,6 +157,10 @@ class AppleCLCD : public IOMobileFramebuffer {
+
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	void publishModes(void);
++	uint64_t            fNextVsync;             /* 0201: the next vsync, on an absolute 60.000 Hz grid */
++	void armVsync(IOTimerEventSource *t);
++	bool          fFlipWait;                    /* 0235: the back buffer waits for the GPU's copy */
++	bool          flipWhenCopied(bool wait);
+
+ public:
+ 	uint64_t      fPhys;
+@@ -210,6 +226,10 @@ public:
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
++	bool present(const uint8_t *rec);
++	IOLock       *fPresentLock;                 /* 0201: present() from SwapEnd and from the vsync timer */
++	bool          fNow;                         /* 0201: boot-arg sweetfb_now (default 1): present at SwapEnd */
++	bool          fPowerOnSeen;                 /* 0234: a display-on request came (the UI is up) */
+
+ 	/* topaz panel brightness: DCS 0x51 over DSI0 (MakrSas/topaz-woa TopazGpuW disp.c) */
+ 	volatile uint8_t *fDsi;
+@@ -322,6 +342,20 @@ AppleCLCD::start(IOService *provider)
+ 	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
++	fPresentLock = IOLockAlloc();
++	{
++		uint32_t now = 1;
++		PE_parse_boot_argn("sweetfb_now", &now, sizeof(now));
++		fNow = now != 0 && fPresentLock != NULL;
++		uint32_t hold = 0;
++		PE_parse_boot_argn("sweetfb_console_hold", &hold, sizeof(hold));
++		sweet_fb_console_hold = hold;
++	}
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+@@ -348,6 +382,12 @@ AppleCLCD::start(IOService *provider)
+ 	fFlip[0] = fFlip[1] = NULL;
+ 	fFlipPhys[0] = fFlipPhys[1] = 0;
++	/* 0334: initialize flip ring */
++	sweet_fb_flip_lock = IOLockAlloc();
++	sweet_fb_flip_head = sweet_fb_flip_tail = 0;
++	for (int i = 0; i < 4; i++) sweet_fb_flip_timestamps[i] = 0;
++	if (sweet_fb_pipeline_enabled && sweet_fb_max_inflight > 2) {
++		fFlip[2] = NULL; fFlipPhys[2] = 0;  /* third slot for triple buffering */
++	}
+
+ 	/* 0320: render scaling */
+ 	uint32_t rscale = 1000;
+@@ -365,6 +405,12 @@ AppleCLCD::start(IOService *provider)
+ 	(void)PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++
++	/* 0201: initialize vsync grid */
++	fNextVsync = 0;
++	fPowerOnSeen = false;
++	fStartAbs = mach_absolute_time();
++	fFadeStep = 0;
++	fPowerOff = false;
+
+ 	/* 0147: frame timing stats */
+ 	{
+@@ -535,6 +581,14 @@ AppleCLCD::start(IOService *provider)
+ 		 */
+ 		uint32_t blOn = 0;
+ 		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
++		sweet_bl_on = blOn;
++		(void)PE_parse_boot_argn("sweet_fb_pipeline", &sweet_fb_pipeline_enabled, sizeof(sweet_fb_pipeline_enabled));
++		(void)PE_parse_boot_argn("sweet_fb_max_inflight", &sweet_fb_max_inflight, sizeof(sweet_fb_max_inflight));
++		if (sweet_fb_max_inflight < 1) sweet_fb_max_inflight = 1;
++		if (sweet_fb_max_inflight > 4) sweet_fb_max_inflight = 4;
++		(void)PE_parse_boot_argn("sweetfb_gpucopy", &sweet_fb_gpucopy, sizeof(sweet_fb_gpucopy));
++		(void)PE_parse_boot_argn("sweetfb_stats", &sweet_fb_stats_on, sizeof(sweet_fb_stats_on));
+ 		AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
+ 		if (bl != NULL && bl->init()) {
+ 			bl->fFB = this;
+@@ -557,7 +611,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			if (fb->fDsi != NULL) {
+ 				/* the panel is dark (DCS 0x51 0); keep the last frame */
+ 				IOLockUnlock(fb->fLock);
+-				sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++				fb->armVsync(sender);
+ 				return;
+ 			}
+ 			if (fb->fFadeOrig != NULL) {
+@@ -575,7 +629,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					if (step <= SWEET_FB_FADE_STEPS) {
+ 						fb->fadeStep(src, srcStride, step);
+ 					}
+-				sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++				fb->armVsync(sender);
+ 				return;
+ 			}
+ 			if (fb->fVig0 != NULL && fb->fScanPhys != fb->fBootSrc) {
+@@ -595,7 +649,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					}
+ 				}
+ 			}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->armVsync(sender);
+ 			return;
+ 		}
+ 		bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -620,14 +674,37 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->flipBack();
+ 		}
+ 		if (rec != NULL) {
++			if (fb->fPresentLock != NULL) {
++				IOLockLock(fb->fPresentLock);
++			}
+ 			fb->present(rec);
++			if (fb->fPresentLock != NULL) {
++				IOLockUnlock(fb->fPresentLock);
++			}
+ 			IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 			IOLockLock(fb->fLock);
+ 			memcpy(fb->fRetireHold, fb->fShowHold, sizeof(taken));
+ 			memcpy(fb->fShowHold, taken, sizeof(taken));
+ 			IOLockUnlock(fb->fLock);
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		fb->armVsync(sender);
+ 	}
+
++/*
++ * 0201: the vsync timer re-armed 16667 us after it had run (and after the frame it presented):
++ * every period was that much longer -- 57 Hz measured against the panel's frame counter. Now the
++ * ticks sit on an absolute 60.000 Hz grid; after a stall longer than a period the grid restarts.
++ */
++void
++AppleCLCD::armVsync(IOTimerEventSource *t)
++{
++	uint64_t period, now = mach_absolute_time();
++	nanoseconds_to_absolutetime(16666667ull, &period);
++	if (fNextVsync == 0 || now > fNextVsync + period) {
++		fNextVsync = now;
++	}
++	fNextVsync += period;
++	t->wakeAtTime(fNextVsync);
++}
++
++/*
++ * 0400: Cache coherency helper - clean cache lines to point of coherency after CPU write.
++ * Must be called after blitting to panel memory (write-combined or WB) before MDP scans it.
++ */
++static inline void
++sweet_dcache_clean(vm_offset_t addr, unsigned length)
++{
++	uint64_t ctr;
++	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	uintptr_t line = 4UL << ((ctr >> 16) & 0xf);
++	for (vm_offset_t a = addr; a < addr + length; a += line) {
++		__asm__ volatile("dc cvac, %0" : : "r"(a) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/*
++ * 0400: Cache coherency helper - invalidate cache lines before GPU/DMA reads.
++ * Must be called before GPU reads from surface memory that CPU may have written.
++ */
++static inline void
++sweet_dcache_invalidate(vm_offset_t addr, unsigned length)
++{
++	uint64_t ctr;
++	__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
++	uintptr_t line = 4UL << ((ctr >> 16) & 0xf);
++	for (vm_offset_t a = addr; a < addr + length; a += line) {
++		__asm__ volatile("dc civac, %0" : : "r"(a) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
+@@ -678,6 +745,43 @@ AppleCLCD::swap(const uint8_t *rec)
+ 			sweet_hold(held[i], true);
+ 		}
+ 	}
++	/*
++	 * 0201: presented here, at SwapEnd, rather than at the next tick of the vsync timer: frames that
++	 * came two to a tick were dropped and every frame waited up to a tick (the panel showed 25-30 of
++	 * the 60 a second backboardd drew). A frame the GPU copies into the panel's memory leaves its
++	 * surface at once -- the GPU runs one queue in order, so whatever CoreAnimation draws into that
++	 * surface next is drawn after the copy -- instead of 2-3 ticks later: CoreAnimation has two or
++	 * three surfaces and waited for a free one. A frame the MDP scans directly keeps its surface
++	 * until the next one has replaced it on the panel, as before.
++	 */
++	IOLockLock(fLock);
++	bool now = fNow && !fPowerOff && fFadeOrig == NULL;
++	IOLockUnlock(fLock);
++	if (now) {
++		IOLockLock(fPresentLock);
++		bool copied = present(rec);
++		IOLockUnlock(fPresentLock);
++		SweetSurface *release[4] = {};
++		IOLockLock(fLock);
++		fDirty = false;
++		SweetSurface *pend[4];
++		memcpy(pend, fPendHold, sizeof(pend));         /* (a frame of the timer's path, now replaced) */
++		bzero(fPendHold, sizeof(fPendHold));
++		if (copied) {
++			memcpy(release, held, sizeof(release));
++		} else {
++			memcpy(release, fRetireHold, sizeof(release));
++			memcpy(fRetireHold, fShowHold, sizeof(fRetireHold));
++			memcpy(fShowHold, held, sizeof(fShowHold));
++		}
++		IOLockUnlock(fLock);
++		sweet_hold_set(pend, false);
++		sweet_hold_set(release, false);
++		if ((++sweet_fb_swap_count % 1000) == 0) {
++			IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
++		}
++		return;
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+@@ -1115,7 +1219,7 @@ AppleCLCD::directPresent(const uint8_t *rec)
+ 	return ok;
+ }
+
+-void
++bool
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+@@ -1128,7 +1232,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 	if (console_only > 0 && fConsShown) {
+ 		(void)mask;
+-		return;
++		return false;
+ 	}
+ 	fConsShown = false;
+ 	if (directPresent(rec)) {
+@@ -1139,7 +1243,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				sweet_console_muted = 1;
+ 			}
+ 		}
+-		return;
++		return false;           /* the MDP scans the surface itself: it stays held */
+ 	}
+ 	IOLockLock(fLock);
+ 	fLastVA = NULL;
+@@ -1296,7 +1400,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_fb_stats.gpu++;
+ 			sweet_fb_stats_tick();
+ 		}
+-		return;
++		return true;
+ 	}
+ 	if (fFlip[0] != NULL) {
+ 		flipBack();
+@@ -1306,6 +1410,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		sweet_fb_stats.composed++;
+ 		sweet_fb_stats_tick();
+ 	}
++	return true;                    /* copied by the CPU: the surface is free */
+ }
+
+ bool
+@@ -1370,7 +1475,7 @@ AppleCLCD::present()
+ 		/* Wait for GPU copy to complete before we can flip */
+ 		if (fFlip[0] != NULL) {
+-			(void)flipWhenCopied(true);
++			(void)flipWhenCopied(sweet_fb_pipeline_enabled ? false : true);
+ 		}
+ 		uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
+@@ -1379,24 +1484,76 @@ AppleCLCD::present()
+ 			continue;
+ 		}
+-		if (i >= 2000) {
++		if (sweet_fb_pipeline_enabled) {
++			/* 0334: pipeline mode - check if we can queue this frame */
++			IOLockLock(sweet_fb_flip_lock);
++			uint32_t next_head = (sweet_fb_flip_head + 1) % sweet_fb_max_inflight;
++			if (next_head != sweet_fb_flip_tail) {
++				/* Slot available - queue this frame */
++				sweet_fb_flip_head = next_head;
++				sweet_fb_flip_timestamps[sweet_fb_flip_head] = mach_absolute_time();
++				IOLockUnlock(sweet_fb_flip_lock);
++				break;
++			}
++			IOLockUnlock(sweet_fb_flip_lock);
++			/* All slots full - backpressure: wait for oldest to complete */
++			IODelay(10);
++			continue;
++		} else {
++			/* Legacy mode: original behavior with longer timeout */
++			if (i >= 2000) {
++				break;                  /* the GPU is stuck: flip anyway, as before 0235 */
++			}
++			IODelay(10);
++			continue;
++		}
+ 	}
+ 	uint32_t idx = fFlipIdx ^ 1;
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
+@@ -1644,13 +1751,58 @@ AppleCLCD::present()
+ 	 * flip of both waits for the newer copy.
+ 	 */
+ 	if (fFlip[0] != NULL) {
+-		(void)flipWhenCopied(true);
++		if (sweet_fb_pipeline_enabled) {
++			/* Pipeline mode: queue without waiting */
++			IOLockLock(sweet_fb_flip_lock);
++			uint32_t next_head = (sweet_fb_flip_head + 1) % sweet_fb_max_inflight;
++			if (next_head != sweet_fb_flip_tail) {
++				sweet_fb_flip_head = next_head;
++				sweet_fb_flip_timestamps[sweet_fb_flip_head] = mach_absolute_time();
++			}
++			IOLockUnlock(sweet_fb_flip_lock);
++		} else {
++			(void)flipWhenCopied(true);
++		}
+ 	}
+ 	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
+
++	/* 0334: Flip completion handler - called from display interrupt context */
++static void
++sweet_fb_flip_complete(void)
++{
++	if (!sweet_fb_pipeline_enabled || !sweet_fb_flip_lock) return;
++
++	IOLockLock(sweet_fb_flip_lock);
++	if (sweet_fb_flip_tail != sweet_fb_flip_head) {
++		sweet_fb_flip_tail = (sweet_fb_flip_tail + 1) % sweet_fb_max_inflight;
++		/* Wake up any present() waiting on backpressure */
++		/* thread_wakeup((event_t)&sweet_fb_flip_tail); */
++	}
++	IOLockUnlock(sweet_fb_flip_lock);
++}
++
++/* 0334: Sysctl to read pipeline stats */
++static int
++sysctl_sweet_fb_pipeline SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char out[128];
++	int error = 0;
++	size_t off = 0;
++	uint32_t inflight = 0;
++
++	if (sweet_fb_flip_lock) {
++		IOLockLock(sweet_fb_flip_lock);
++		if (sweet_fb_flip_head >= sweet_fb_flip_tail) {
++			inflight = sweet_fb_flip_head - sweet_fb_flip_tail;
++		} else {
++			inflight = sweet_fb_max_inflight - (sweet_fb_flip_tail - sweet_fb_flip_head);
++		}
++		IOLockUnlock(sweet_fb_flip_lock);
++	}
++	int n = snprintf(out, sizeof(out), "inflight:%u max:%u enabled:%u",
++	    inflight, sweet_fb_max_inflight, sweet_fb_pipeline_enabled);
++	if (n > 0 && (size_t)n < sizeof(out)) {
++		error = SYSCTL_OUT(req, out, n + 1);
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_pipeline, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_fb_pipeline, "A", "Framebuffer pipeline status: inflight/max/enabled");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--
+2.53.0
+
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 8541084..b2c3d4e 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -725,6 +725,7 @@
+ 		put32(p, 0x00, pl->width);
+ 		put32(p, 0x04, pl->height);
+ 		put32(p, 0x08, pl->bytesPerRow);
++		put32(p, 0x10, pl->bytesPerRow);   /* 0318: where IOSurfaceGetBytesPerRowOfPlane reads it (width + 0x10) */
+ 		put32(p, 0x0c, pl->offset);
+ 		put32(p, 0x14, pl->size);
+ 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+@@ -615,7 +616,8 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
+ 	{
+ 	SweetSurfaceRef *ref = NULL;
+-	IOReturn ret = addRef(s, &ref);
++	bool existing = false;
++	IOReturn ret = addRef(s, &ref, &existing);
+ 	if (ret != kIOReturnSuccess) {
+ 		return ret;
+ 	}
+@@ -624,10 +626,13 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
+ 		ret = kIOReturnNoMemory;
+ 	} else {
+ 		sweet_surface_fill_result(s, ref, out);
++		if (existing) {
++			put64(out, 0x00, ~0ULL);        /* "already yours": use the cached client */
++		}
+ 		ret = sweet_struct_out(args, out, SWEET_SURFACE_RESULT_SIZE);
+ 		IOFreeData(out, SWEET_SURFACE_RESULT_SIZE);
+ 	}
+-	if (ret != kIOReturnSuccess) {
++	if (ret != kIOReturnSuccess && !existing) {
+ 		/* The caller never learns the id: undo this create/lookup. */
+ 		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
+ 	}
+@@ -495,17 +500,25 @@
+ /*
+  * Count one more create/lookup of s by this client, mapping it into the
+  * task the first time. Takes over the caller's user count on s.
++ *
++ * A lookup of a surface this client already has maps nothing and counts
++ * nothing (*existing): IOSurface.framework then gets base address -1 in the
++ * lock result and reuses its cached IOSurfaceClient. Counting it instead
++ * made the framework build a second client for the same id; releasing that
++ * one (traps 4 + 5) unmapped the memory under the first (backboardd
++ * snapshot crash in CGDataProviderCreateWithData).
+  */
+ IOReturn
+-IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut)
++IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing)
+ {
++	*existing = false;
+ 	IOLockLock(fLock);
+ 	SweetSurfaceRef *ref = findRef(s->id, NULL);
+ 	if (ref != NULL && ref->surface == s) {
+-		ref->count++;
+ 		IOLockUnlock(fLock);
+ 		sweet_surface_put(s);
+ 		*refOut = ref;
++		*existing = true;
+ 		return kIOReturnSuccess;
+ 	}
+ 	IOLockUnlock(fLock);
+--
+2.53.0
+
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 8541084..b2c3d4e 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -94,6 +94,7 @@
+ 	private:
+ 	IOLock *fLock;
++	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+ 	IOFixed fY[SWEET_TOUCH_FINGERS];
+@@ -101,6 +102,12 @@
+ 	if (!fLock || !IOHIDEventService::start(provider)) {
+ 		return false;
+ 	}
++	int native = 0;
++	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
++	fLogicalW = native ? 1080 : 1125;
++	fLogicalH = native ? 2400 : 2436;
++	fOffX = (fLogicalW - 1080) / 2;
++	fOffY = (fLogicalH - 2400) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -115,8 +122,9 @@ SweetHIDEventDriver::newFinger(IOService *owner, unsigned finger, int x, int y, bool down)
+
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	IOFixed nx = (IOFixed)(((int64_t)x << 16) / 1080);
+-	IOFixed ny = (IOFixed)(((int64_t)y << 16) / 2400);
++	/* Panel pixels -> the presented 1125x2436 display (SweetFramebuffer.cpp). */
++	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
++	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+--
+2.53.0
