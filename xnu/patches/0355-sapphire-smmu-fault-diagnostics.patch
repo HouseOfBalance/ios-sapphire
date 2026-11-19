@@ -1,217 +1,61 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sapphire Port <sapphire@xiaomi>
 Date: Sun, 15 Nov 2026 18:11:00 +0700
-Subject: [PATCH 0355] sapphire: SMMU fault diagnostics + GPU pool page table validation + auto-mapping fix
+Subject: [PATCH 0355] sapphire: SMMU fault diagnostics and kern.sweet_smmu_fault sysctl
 
-Persistent SMMU translation fault at FAR 0x116f1cc80060 (FSR 0x400) after every
-GPU command submission. This indicates a GPU pool buffer page lacks a valid
-SMMU page table entry.
-
-Changes:
-1. Map FAR to GPU pool buffer index for immediate fault diagnosis
-2. Validate all GPU pool pages have SMMU mappings at hw_init
-3. Install SMMU fault handler callback to dump full context on fault
-4. Fix root cause: gpool_alloc() now maps pages in SMMU page tables immediately
-
-Signed-off-by: Sapphire Port <sapphire@xiaomi>
 ---
- iokit/Kernel/arm/SapphireGpu.cpp | 180 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- 1 file changed, 180 insertions(+)
-
 diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
-index 7700592..a1b2c3d 100644
+index 64b11c7..0c468a6 100644
 --- a/iokit/Kernel/arm/SapphireGpu.cpp
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -4610,6 +4610,192 @@ SapphireGPU::hw_init(void)
- 		}
- 	 }
-
-+	/* Validate SMMU mappings for all GPU pool pages */
-+	{
-+		uint64_t pool_base = gpool_base();
-+		uint64_t pool_size = gpool_size();
-+		if (pool_base && pool_size) {
-+			LOG("msm: GPU pool at 0x%llx size 0x%llx (%llu MB), validating SMMU mappings...",
-+			    pool_base, pool_size, pool_size >> 20);
-+			uint64_t page = pool_base;
-+			uint32_t unmapped = 0;
-+			for (; page < pool_base + pool_size; page += PAGE_SIZE) {
-+				/* Check if this page has a valid SMMU mapping */
-+				if (!smmu_page_mapped(page)) {
-+					LOG("msm: *** GPU pool page 0x%llx (index %llu) NOT MAPPED in SMMU - MAPPING NOW ***",
-+					    page, (page - pool_base) >> 12);
-+					smmu_map_page(page);
-+					unmapped++;
-+				}
-+			}
-+			LOG("msm: GPU pool pages: 0x%llx - 0x%llx, fixed %u unmapped pages",
-+			    pool_base, pool_base + pool_size - 1, unmapped);
-+			/* Known faulting FAR from logs: 0x116f1cc80060 */
-+			if (0x116f1cc80060ULL >= pool_base && 0x116f1cc80060ULL < pool_base + pool_size) {
-+				LOG("msm: *** KNOWN FAULT FAR 0x116f1cc80060 FALLS INSIDE GPU POOL ***");
-+				LOG("msm: *** Pool page index: %llu ***", (0x116f1cc80060ULL - pool_base) >> 12);
-+			}
-+		}
-+	}
-+
-+	/* Install SMMU fault handler callback (if exported by SMMU driver) */
-+	if (smmu_install_fault_handler != NULL) {
-+		smmu_install_fault_handler(sapphire_smmu_fault_handler);
-+	}
-+
- 	return KERN_SUCCESS;
+@@ -1196,16 +1196,48 @@ smmu_identity(void)
+ 	return true;
  }
-
-+/*
-+ * SMMU fault context for diagnostics
-+ */
-+struct smmu_fault_context {
-+    uint64_t far;
-+    uint32_t fsr;
-+    uint32_t gfsr;
-+    uint64_t cb_sctlr;
-+    uint64_t timestamp;
-+    const char *client_name;
-+    uint32_t fence_seq;
-+    uint32_t submit_queue;
-+};
+ 
++static uint64_t last_smmu_far;
++static uint32_t last_smmu_fsr;
++static uint32_t last_smmu_gfsr;
++static uint32_t last_smmu_syndrome;
++static uint32_t smmu_fault_count;
 +
-+static struct smmu_fault_context last_smmu_fault;
-+static bool smmu_fault_logged = false;
-+
-+/*
-+ * SMMU fault handler callback - called from SMMU driver on translation fault
-+ * Dumps full fault context including GPU pool page index if applicable
-+ */
-+void
-+sapphire_smmu_fault_handler(uint64_t far, uint32_t fsr, uint32_t gfsr, uint64_t cb_sctlr)
-+{
-+    uint64_t pool_base = gpool_base();
-+    uint64_t pool_size = gpool_size();
-+    const char *client = "unknown";
-+    uint32_t fence = 0;
-+    uint32_t queue = 0;
-+
-+    /* Get current client context if available */
-+    if (sapphire_gpu_current_client != NULL && sapphire_gpu_current_client() != NULL) {
-+        client = sapphire_gpu_current_client()->fName;
-+        fence = sapphire_gpu_current_client()->fSubmits ? fence_seq : 0;
-+        queue = sapphire_gpu_current_client()->fQueue;
-+    }
-+
-+    last_smmu_fault.far = far;
-+    last_smmu_fault.fsr = fsr;
-+    last_smmu_fault.gfsr = gfsr;
-+    last_smmu_fault.cb_sctlr = cb_sctlr;
-+    last_smmu_fault.timestamp = mach_absolute_time();
-+    last_smmu_fault.client_name = client;
-+    last_smmu_fault.fence_seq = fence;
-+    last_smmu_fault.submit_queue = queue;
-+    smmu_fault_logged = true;
-+
-+    /* Log full fault context */
-+    LOG("msm: ===== SMMU TRANSLATION FAULT =====");
-+    LOG("msm: FAR=0x%llx FSR=0x%x GFSR=0x%x CB0_SCTLR=0x%llx", far, fsr, gfsr, cb_sctlr);
-+    LOG("msm: Client=%s Fence=%u Queue=%u", client, fence, queue);
-+
-+    /* Map FAR to GPU pool buffer for immediate diagnosis */
-+    if (pool_base && far >= pool_base && far < pool_base + pool_size) {
-+        uint64_t page_idx = (far - pool_base) >> 12;
-+        uint64_t offset = far - pool_base;
-+        LOG("msm: SMMU FAULT: FAR=0x%llx -> GPU_POOL[%llu] (offset 0x%llx)", far, page_idx, offset);
-+
-+        /* Check if this specific page is mapped */
-+        if (!smmu_page_mapped(far & ~0xFFFull)) {
-+            LOG("msm: *** FAULTING PAGE NOT MAPPED IN SMMU - AUTO-MAPPING ***");
-+            smmu_map_page(far & ~0xFFFull);
-+        }
-+    } else if (far >= 0x5c000000 && far < 0x5c9e3400) {
-+        LOG("msm: SMMU FAULT: FAR=0x%llx -> FRAMEBUFFER (offset 0x%llx)", far, far - 0x5c000000);
-+    } else {
-+        LOG("msm: SMMU FAULT: FAR=0x%llx -> UNKNOWN", far);
-+    }
-+
-+    /* Dump active fences for context */
-+    LOG("msm: Active fences: last_done=%u current_seq=%u",
-+        *(volatile uint32_t *)(pool + OFF_FENCE), fence_seq);
+ static void
+ smmu_fault(const char *tag)
+ {
+ 	if (smmu == NULL) {
+ 		return;
+ 	}
+-	LOG("  [%s] SMMU gfsr %08x CB0 SCTLR %08x FSR %08x FAR %08x%08x FSYNR0 %08x", tag, rd(smmu, 0x48),
+-	    rd(smmu, 0x8000), rd(smmu, 0x8058), rd(smmu, 0x8064), rd(smmu, 0x8060), rd(smmu, 0x8068));
++	uint32_t gfsr = rd(smmu, 0x48), sctlr = rd(smmu, 0x8000), fsr = rd(smmu, 0x8058);
++	uint64_t far = ((uint64_t)rd(smmu, 0x8064) << 32) | rd(smmu, 0x8060);
++	uint32_t fsynr0 = rd(smmu, 0x8068);
++	if (fsr != 0 || gfsr != 0) {
++		last_smmu_far = far;
++		last_smmu_fsr = fsr;
++		last_smmu_gfsr = gfsr;
++		last_smmu_syndrome = fsynr0;
++		smmu_fault_count++;
++	}
++	LOG("  [%s] SMMU gfsr %08x CB0 SCTLR %08x FSR %08x FAR %08x%08x FSYNR0 %08x", tag, gfsr,
++	    sctlr, fsr, (uint32_t)(far >> 32), (uint32_t)far, fsynr0);
 +}
 +
-+/*
-+ * Map GPU virtual address to buffer description for diagnostics
-+ */
-+const char *
-+gpu_addr_to_buffer_desc(uint64_t gpu_va)
++static int
++sysctl_sweet_smmu_fault SYSCTL_HANDLER_ARGS
 +{
-+    static char buf[128];
-+    uint64_t pool_base = gpool_base();
-+    uint64_t pool_size = gpool_size();
++#pragma unused(oidp, arg1, arg2)
++	char buf[192];
++	int n = snprintf(buf, sizeof(buf), "count=%u,far=0x%llx,fsr=0x%x,gfsr=0x%x,fsynr0=0x%x",
++	    smmu_fault_count, last_smmu_far, last_smmu_fsr, last_smmu_gfsr, last_smmu_syndrome);
++	if (n < 0) {
++		return EIO;
++	}
++	return SYSCTL_OUT(req, buf, (size_t)n + 1);
+ }
+ 
++SYSCTL_PROC(_kern, OID_AUTO, sweet_smmu_fault, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_smmu_fault, "A", "Sapphire GPU SMMU fault diagnostics");
 +
-+    if (pool_base && gpu_va >= pool_base && gpu_va < pool_base + pool_size) {
-+        uint64_t page_idx = (gpu_va - pool_base) >> 12;
-+        snprintf(buf, sizeof(buf), "GPU_POOL[%llu] (offset 0x%llx)", page_idx, gpu_va - pool_base);
-+    } else if (gpu_va >= 0x5c000000 && gpu_va < 0x5c9e3400) {
-+        snprintf(buf, sizeof(buf), "FRAMEBUFFER (offset 0x%llx)", gpu_va - 0x5c000000);
-+    } else {
-+        snprintf(buf, sizeof(buf), "UNKNOWN (0x%llx)", gpu_va);
-+    }
-+    return buf;
-+}
-+
-+/* Optional external SMMU/client hooks (weak so link succeeds even if absent) */
-+extern void smmu_install_fault_handler(void (*cb)(uint64_t, uint32_t, uint32_t, uint64_t)) __attribute__((weak));
-+extern uint64_t smmu_pte_lookup(uint64_t pa) __attribute__((weak));
-+extern "C" SapphireGPUClient *sapphire_gpu_current_client(void) __attribute__((weak));
-+
-+/*
-+ * Check if a physical page has a valid SMMU mapping
-+ * Returns true if mapped, false otherwise
-+ */
-+bool
-+smmu_page_mapped(uint64_t pa)
-+{
-+    if (smmu_pte_lookup != NULL) {
-+        return smmu_pte_lookup(pa) != 0;
-+    }
-+    return false;
-+}
-+
-+/*
-+ * Map a single physical page in the SMMU page tables (context bank 0)
-+ * Used for auto-recovery on fault and during hw_init validation
-+ */
-+void
-+smmu_map_page(uint64_t pa)
-+{
-+    /* Map 4KB page in SMMU context bank 0 via SapphireGpu's map_page_4k() */
-+    uint64_t aligned = pa & ~0xFFFull;
-+    (void)map_page_4k(aligned, aligned);
-+    __asm__ volatile("dsb sy; isb" ::: "memory");
-+}
-+
-+/*
-+ * Map multiple physical pages in the SMMU page tables
-+ * Called from gpool_alloc() after allocating physical pages
-+ */
-+void
-+smmu_map_pages(uint64_t pa, uint64_t npages)
-+{
-+    for (uint64_t i = 0; i < npages; i++) {
-+        smmu_map_page(pa + (i << 12));
-+    }
-+}
-+
-+/*
-+ * Dump last recorded SMMU fault (called by 0353 diagnostic dump)
-+ */
-+extern "C" void
-+smmu_dump_fault_info(void)
-+{
-+    if (!smmu_fault_logged) {
-+        LOG("msm: SMMU fault info: no faults recorded");
-+        return;
-+    }
-+    LOG("msm: Last SMMU fault: FAR=0x%llx FSR=0x%x GFSR=0x%x client=%s fence=%u",
-+        last_smmu_fault.far, last_smmu_fault.fsr, last_smmu_fault.gfsr,
-+        last_smmu_fault.client_name ? last_smmu_fault.client_name : "unknown",
-+        last_smmu_fault.fence_seq);
-+}
+ /* ---------------------------------------------------------------- CP bring-up */
+ 
+ /* The subset of Linux a6xx_gpu.c hw_init the command processor needs to run at all. */
