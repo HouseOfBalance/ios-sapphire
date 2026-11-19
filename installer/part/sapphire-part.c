@@ -58,8 +58,8 @@ wr(uint64_t lba, const void *buf, size_t n)
 		ioctl(fd, BLKROGET, &ro);
 		printf("write failed: BLKROGET=%d\n", ro);
 		fflush(stdout);
-		system("for f in /sys/block/sda/ro /sys/block/sda/size /sys/block/sda/device/model; do echo \"$f=$(cat $f 2>&1)\"; done; "
-		       "dmesg 2>/dev/null | grep -iE 'write.?protect|read-only|ro=|sda' | tail -8");
+		if (system("for f in /sys/block/sda/ro /sys/block/sda/size /sys/block/sda/device/model; do echo \"$f=$(cat $f 2>&1)\"; done; "
+		       "dmesg 2>/dev/null | grep -iE 'write.?protect|read-only|ro=|sda' | tail -8") != 0) {}
 		printf("ERROR write at LBA %llu: %s\n", (unsigned long long)lba, strerror(e));
 		exit(2);
 	}
