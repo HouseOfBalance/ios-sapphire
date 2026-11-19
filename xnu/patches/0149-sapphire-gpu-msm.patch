@@ -28,7 +28,7 @@ diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 index a20dfc2..2271633 100644
 --- a/iokit/Kernel/arm/SapphireGpu.cpp
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -43,12 +43,15 @@
+@@ -43,12 +43,16 @@
  #include <IOKit/IOMemoryDescriptor.h>
  #include <IOKit/IOBufferMemoryDescriptor.h>
  #include <IOKit/IOUserClient.h>
@@ -41,6 +41,7 @@ index a20dfc2..2271633 100644
  #include <sys/param.h>
  #include <sys/errno.h>
 +#include <sys/systm.h>                         /* copyin, copyout (the msm client) */
++#include <sys/sysctl.h>                        /* SYSCTL macros for fence stats */
  #include <pexpert/device_tree.h>
  
  #define LOG(fmt, ...)       IOLog("SapphireGpu: " fmt "\n", ##__VA_ARGS__)
@@ -52,7 +53,7 @@ index a20dfc2..2271633 100644
  
  /*
   * The persistent log is written to userdata about once a second, so a step that hangs or
-@@ -907,16 +911,52 @@ static uint32_t pt_used;
+@@ -907,16 +911,264 @@ static uint32_t pt_used;
  static uint64_t *pt_l1;
  static uint64_t pt_l1_pa;
  
@@ -76,6 +77,218 @@ index a20dfc2..2271633 100644
 +		return (uint64_t *)(pool + (pa - POOL_PA));
 +	}
 +	return (uint64_t *)(pt2 + (pa - PT2_PA));
++}
++
++/* --------------------------------------------------- msm fence wait: logging, stats, sysctl */
++
++#define MSM_MAX_CLIENTS     32
++#define MSM_RATE_LIMIT_NS   10000000ull    /* 100/sec = 10ms minimum between logs per client */
++
++struct msm_fence_client_stats {
++    char                name[32];
++    uint64_t            total_waits;
++    uint64_t            failed_waits;
++    uint64_t            total_latency_ns;
++    uint64_t            max_latency_ns;
++    uint64_t            last_log_ns;
++    bool                active;
++};
++
++static struct msm_fence_client_stats msm_fence_stats[MSM_MAX_CLIENTS];
++static IOLock *msm_fence_stats_lock;
++
++/* GPU interrupt event for fence completion */
++static IOLock *msm_fence_lock;
++static volatile uint32_t msm_fence_done_seq;
++
++static int
++msm_fence_client_index(const char *name)
++{
++    int free_idx = -1;
++    for (int i = 0; i < MSM_MAX_CLIENTS; i++) {
++        if (msm_fence_stats[i].active) {
++            if (strcmp(msm_fence_stats[i].name, name) == 0) {
++                return i;
++            }
++        } else if (free_idx == -1) {
++            free_idx = i;
++        }
++    }
++    if (free_idx != -1) {
++        bzero(&msm_fence_stats[free_idx], sizeof(msm_fence_stats[free_idx]));
++        strlcpy(msm_fence_stats[free_idx].name, name, sizeof(msm_fence_stats[free_idx].name));
++        msm_fence_stats[free_idx].active = true;
++        return free_idx;
++    }
++    return -1;
++}
++
++static bool
++msm_should_log(int idx)
++{
++    uint64_t now = mach_absolute_time();
++    if (now - msm_fence_stats[idx].last_log_ns >= MSM_RATE_LIMIT_NS) {
++        msm_fence_stats[idx].last_log_ns = now;
++        return true;
++    }
++    return false;
++}
++
++static void
++msm_record_wait(int idx, uint64_t elapsed_ns, bool ok)
++{
++    msm_fence_stats[idx].total_waits++;
++    msm_fence_stats[idx].total_latency_ns += elapsed_ns;
++    if (elapsed_ns > msm_fence_stats[idx].max_latency_ns) {
++        msm_fence_stats[idx].max_latency_ns = elapsed_ns;
++    }
++    if (!ok) {
++        msm_fence_stats[idx].failed_waits++;
++    }
++}
++
++static void
++msm_log_entry(const char *client, uint32_t fence, uint64_t timeout_ms)
++{
++    IOLog("msm_wait_fence: fence=%u, timeout_ms=%llu, client=%s\n", fence, timeout_ms, client);
++}
++
++static void
++msm_log_exit(const char *client, uint32_t fence, const char *result, uint64_t elapsed_ns)
++{
++    IOLog("msm_wait_fence: fence=%u, result=%s, elapsed_ns=%llu\n", fence, result, elapsed_ns);
++}
++
++/* Called from GPU interrupt handler when fence timestamp is reached */
++void
++msm_fence_signal(uint32_t seq)
++{
++    IOLockLock(msm_fence_lock);
++    msm_fence_done_seq = seq;
++    if (msm_fence_lock) {
++        IOLockLock(msm_fence_lock);
++        IOLockWakeup(msm_fence_lock, (void *)&msm_fence_done_seq, /* oneThread */ false);
++        IOLockUnlock(msm_fence_lock);
++    }
++}
++
++/* Sysctl: kern.sweet_gpu_fence_stats */
++SYSCTL_DECL(_kern);
++static SYSCTL_NODE(_kern, OID_AUTO, sweet_gpu_fence_stats, CTLFLAG_RD | CTLFLAG_LOCKED, 0,
++    "Per-client GPU fence wait statistics");
++
++static int
++msm_fence_stats_sysctl(SYSCTL_HANDLER_ARGS)
++{
++    #pragma unused(oidp, arg1, arg2)
++    char buf[4096];
++    char *p = buf;
++    size_t left = sizeof(buf);
++
++    IOLockLock(msm_fence_stats_lock);
++    p += snprintf(p, left, "client,total_waits,failed_waits,avg_latency_ns,max_latency_ns\n");
++    left = sizeof(buf) - (p - buf);
++
++    for (int i = 0; i < MSM_MAX_CLIENTS; i++) {
++        if (msm_fence_stats[i].active && msm_fence_stats[i].total_waits > 0) {
++            uint64_t avg = msm_fence_stats[i].total_latency_ns / msm_fence_stats[i].total_waits;
++            p += snprintf(p, left, "%s,%llu,%llu,%llu,%llu\n",
++                msm_fence_stats[i].name,
++                msm_fence_stats[i].total_waits,
++                msm_fence_stats[i].failed_waits,
++                avg,
++                msm_fence_stats[i].max_latency_ns);
++            left = sizeof(buf) - (p - buf);
++        }
++    }
++    IOLockUnlock(msm_fence_stats_lock);
++
++    return sysctl_handle_string(oidp, buf, strlen(buf), req);
++}
++SYSCTL_PROC(_kern_sweet_gpu_fence_stats, OID_AUTO, stats,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, msm_fence_stats_sysctl, "A", "CSV of per-client fence wait stats");
++
++static bool
++msm_wait_fence_impl(uint32_t fence, uint64_t timeout_ms, const char *client)
++{
++    int idx = msm_fence_client_index(client);
++    uint64_t start = mach_absolute_time();
++    uint64_t timeout_ns = timeout_ms * 1000000ull;
++    bool ok = false;
++
++    if (idx >= 0 && msm_should_log(idx)) {
++        msm_log_entry(client, fence, timeout_ms);
++    }
++
++    /* Fast path: fence already done */
++    if (msm_fence_done(fence)) {
++        ok = true;
++        goto out;
++    }
++
++    /* Wait for fence with timeout using IOLockSleepDeadline */
++    if (msm_fence_lock == NULL) {
++        msm_fence_lock = IOLockAlloc();
++    }
++    if (msm_fence_lock == NULL) {
++        msm_fence_lock = IOLockAlloc();
++    }
++
++    uint64_t deadline = start + timeout_ns;
++    AbsoluteTime abstime;
++    nanoseconds_to_absolutetime(timeout_ns, &abstime);
++    clock_deadline_for_periodic_event(abstime, TIMEOUT_URGENCY_USER_NORMAL, &abstime);
++
++    while (!msm_fence_done(fence)) {
++        IOLockLock(msm_fence_lock);
++        bool already_done = msm_fence_done(fence);
++        IOLockUnlock(msm_fence_lock);
++
++        if (already_done) {
++            ok = true;
++            break;
++        }
++
++        /* Wait on lock with 1ms polling/wakeup deadline */
++        if (msm_fence_lock != NULL) {
++            AbsoluteTime poll_dl;
++            clock_interval_to_deadline(1, kMillisecondScale, &poll_dl);
++            if (poll_dl > abstime) {
++                poll_dl = abstime;
++            }
++            IOLockLock(msm_fence_lock);
++            if (!msm_fence_done(fence)) {
++                IOLockSleepDeadline(msm_fence_lock, (void *)&msm_fence_done_seq, poll_dl, THREAD_UNINT);
++            }
++            IOLockUnlock(msm_fence_lock);
++        } else {
++            IOSleep(1);
++        }
++        if (mach_absolute_time() >= abstime && !msm_fence_done(fence)) {
++            /* Timeout or interrupted */
++            break;
++        }
++    }
++
++    ok = msm_fence_done(fence);
++
++out:
++    uint64_t elapsed = mach_absolute_time() - start;
++    if (idx >= 0) {
++        msm_record_wait(idx, elapsed, ok);
++        if (msm_should_log(idx) || !ok) {
++            msm_log_exit(client, fence, ok ? "ok" : "timeout", elapsed);
++        }
++    }
++
++    return ok;
++}
++
++bool
++msm_wait_fence(uint32_t fence, uint64_t timeout_ms)
++{
++    return msm_wait_fence_impl(fence, timeout_ms, "SweetFramebuffer");
 +}
 +
  static uint64_t
@@ -183,7 +396,7 @@ index a20dfc2..2271633 100644
  	} else if (keep_running || service) {
  		LOG("%s: the GPU stays up%s", service ? "gpu_service" : "gpu_keep=1",
  		    service ? " but takes no work (needs gpu_mmu=1 and every test passed)" : "");
-@@ -2769,6 +2813,683 @@ sapphire_gpu_new_client(IOService *provider, task_t task, void *security, UInt32
+@@ -2769,6 +2813,690 @@ sapphire_gpu_new_client(IOService *provider, task_t task, void *security, UInt32
  	return kIOReturnSuccess;
  }
  
@@ -795,9 +1008,12 @@ index a20dfc2..2271633 100644
 +	case kMsmGemSubmit:
 +		ret = submitIt(&r.submit);
 +		break;
-+	case kMsmWaitFence:
-+		ret = msm_fence_done(r.waitFence.fence) ? kIOReturnSuccess : kIOReturnTimeout;
++	case kMsmWaitFence: {
++		uint64_t timeout_ms = r.waitFence.timeout.nanoseconds / 1000000ull + (r.waitFence.timeout.seconds * 1000ull);
++		bool ok = msm_wait_fence_impl(r.waitFence.fence, timeout_ms, fName);
++		ret = ok ? kIOReturnSuccess : kIOReturnTimeout;
 +		break;
++	}
 +	case kMsmGemMadvise:
 +		r.madvise.retained = 1;
 +		break;
@@ -850,6 +1066,10 @@ index a20dfc2..2271633 100644
 +		OSSafeReleaseNULL(gpu);
 +		LOG("msm: cannot make the SapphireGPU service");
 +		return;
++	}
++	/* Initialize fence stats lock */
++	if (msm_fence_stats_lock == NULL) {
++		msm_fence_stats_lock = IOLockAlloc();
 +	}
 +	gpu->setProperty(kIOUserClientClassKey, "SapphireGPUClient");
 +	gpu->setName("SapphireGPU");

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Sapphire Port <sapphire@xiaomi>
 Date: Sun, 15 Nov 2026 18:11:00 +0700
-Subject: [PATCH 0354] sapphire: fix multi-layer frame drop + GPU fence sync in scale2 path (with logging)
+Subject: [PATCH 0354] sapphire: fix multi-layer frame drop + GPU fence sync in scale2 path
 
 When fScale2=1 and nlayers > 1 (Control Center, Spotlight keyboard), gpu_frame=false
 and the old code did 'continue' which dropped the frame entirely, freezing the
@@ -25,7 +25,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 index d84bcd0..e5f6a7b 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -1444,18 +1444,76 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -1444,9 +1444,59 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		uintptr_t src = s->kernelAddress();
  		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
@@ -56,19 +56,11 @@ index d84bcd0..e5f6a7b 100644
 +					 * Wait for GPU fence to complete before flipping.
 +					 * This ensures the GPU is done reading the source buffer before
 +					 * we hand it back to the pool (via drop/reap).
++					 * Logging is now handled inside msm_wait_fence() with rate limiting.
 +					 */
 +					if (s->gpuDrawn && s->gpuSeed != 0) {
 +						extern bool msm_wait_fence(uint32_t fence, uint64_t ms);
-+						uint64_t wait_start = mach_absolute_time();
-+						bool fence_ok = msm_wait_fence(s->gpuSeed, 200);
-+						uint64_t wait_elapsed = mach_absolute_time() - wait_start;
-+						if (!fence_ok) {
-+							IOLog("SWEET FB: GPU fence %u wait FAILED after %llu ns (scale2, layers=%u)\n",
-+							      s->gpuSeed, wait_elapsed, nlayers);
-+						} else if (wait_elapsed > 1000000) { /* >1ms */
-+							IOLog("SWEET FB: GPU fence %u wait OK but SLOW: %llu ns (scale2)\n",
-+							      s->gpuSeed, wait_elapsed);
-+						}
++						msm_wait_fence(s->gpuSeed, 200);
 +					}
 +					gpu_used = true;
 +					s->release();
@@ -85,19 +77,11 @@ index d84bcd0..e5f6a7b 100644
 +		/*
 +		 * For GPU copy path (sweetfb_gpucopy=1), wait on fence before CPU touches the buffer.
 +		 * The gpuDrawn/gpuSeed was set in SapphireGpuClient::submitIt().
++		 * Logging is now handled inside msm_wait_fence() with rate limiting.
 +		 */
 +		if (gpu_used && s->gpuDrawn && s->gpuSeed != 0) {
 +			extern bool msm_wait_fence(uint32_t fence, uint64_t ms);
-+			uint64_t wait_start = mach_absolute_time();
-+			bool fence_ok = msm_wait_fence(s->gpuSeed, 200);
-+			uint64_t wait_elapsed = mach_absolute_time() - wait_start;
-+			if (!fence_ok) {
-+				IOLog("SWEET FB: GPU fence %u wait FAILED after %llu ns (non-scale2, layers=%u)\n",
-+				      s->gpuSeed, wait_elapsed, nlayers);
-+			} else if (wait_elapsed > 1000000) { /* >1ms */
-+				IOLog("SWEET FB: GPU fence %u wait OK but SLOW: %llu ns (non-scale2)\n",
-+				      s->gpuSeed, wait_elapsed);
-+			}
++			msm_wait_fence(s->gpuSeed, 200);
 +		}
  		w = (int32_t)s->width;
  		h = (int32_t)s->height;
