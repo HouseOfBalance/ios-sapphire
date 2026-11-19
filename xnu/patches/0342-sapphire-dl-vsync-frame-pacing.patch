@@ -23,7 +23,7 @@ diff --git a/bsd/kern/sweet_displaylink.c b/bsd/kern/sweet_displaylink.c
 index 0000000..d4e5f6a 100644
 --- /dev/null
 +++ b/bsd/kern/sweet_displaylink.c
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,151 @@
 +/*
 + * sapphire-0342: DisplayLink VSYNC support for SapphireDisplayLink.m
 + * Cached VSYNC timestamp, GPU util, adaptive phase coefficients, quality hysteresis

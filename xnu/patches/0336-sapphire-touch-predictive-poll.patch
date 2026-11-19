@@ -24,7 +24,7 @@ diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 index 0000000..d4e5f6a 100644
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,310 @@
+@@ -0,2 +1,172 @@
 +/*
 + * sapphire-0336: FT3519T touch predictive polling, debounce, velocity tracking
 + * Builds on 0285/0313 (250 Hz while down, 0.5 ms IRQ-paced reads).

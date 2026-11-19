@@ -31,7 +31,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/shader_pipeline.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,111 @@
 +/*
 + * Shader pipeline: AIR → NIR → IR3 → Adreno 610 binary
 + * For HakiosMetal driver on SM6225/sapphire
@@ -148,7 +148,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/air_to_nir.c
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,201 @@
 +/*
 + * AIR → NIR translation for Metal shaders
 + * Based on Mesa's spirv_to_nir and Apple's AIR specification
@@ -355,7 +355,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/nir_to_ir3.c
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,241 @@
 +/*
 + * NIR → IR3 translation for Adreno 610
 + * Based on freedreno's nir_to_ir3.c
@@ -602,7 +602,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/ir3_compiler.c
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,102 @@
 +/*
 + * IR3 → Adreno 610 binary compilation
 + * Final assembly and binary emission
@@ -710,7 +710,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/HakiosMetalCompiler.cpp
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,78 @@
 +/*
 + * HakiosMetalCompiler - Metal shader compiler entry point
 + * Called from HakiosMetalLibrary when creating functions
@@ -793,12 +793,12 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 index 8541084..b2c3d4e 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -1,3 +1,5 @@
+@@ -1,2 +1,4 @@
 +#include <metal/shader_pipeline.h>
 +#include <metal/HakiosMetalCompiler.h>
  /*
   * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
-@@ -542,8 +544,8 @@ AppleCLCD::start(IOService *provider)
+@@ -542,10 +544,9 @@ AppleCLCD::start(IOService *provider)
  			accel->setProperty("MetalPluginName", "SapphireMetal");
  			accel->setProperty("MetalPluginClassName", "SapphireMTLDevice");
  		}

@@ -23,7 +23,7 @@ diff --git a/shim/splash.c b/shim/splash.c
 index 8541084..b2c3d4e 100644
 --- a/shim/splash.c
 +++ b/shim/splash.c
-@@ -1,7 +1,7 @@
+@@ -1,9 +1,9 @@
  /*
   * The boot screen: the shim puts the picture on the panel and starts xnu straight away, with
   * sweet_splash=<the picture's physical address> in the boot-args (loader.c). xnu (0299) draws no log
@@ -86,7 +86,7 @@ diff --git a/shim/splash/make_splash.py b/shim/splash/make_splash.py
 index 8541084..b2c3d4e 100644
 --- a/shim/splash/make_splash.py
 +++ b/shim/splash/make_splash.py
-@@ -1,8 +1,8 @@
+@@ -1,6 +1,6 @@
  #!/usr/bin/env python3
 -"""Sapphire's boot screen, drawn from nothing (no outside artwork): a cut sapphire over a nebula.
 -
@@ -117,7 +117,7 @@ index 8541084..b2c3d4e 100644
 +random.seed(42069)
 
 
-@@ -108,13 +108,13 @@ def gem_layer():
+@@ -108,14 +108,14 @@ def gem_layer():
      cx, cy, R = GEM_C[0] * S, GEM_C[1] * S, GEM_R * S
      img = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
      dr = ImageDraw.Draw(img)
@@ -133,7 +133,7 @@ index 8541084..b2c3d4e 100644
 
      def shade(normal, base, spec=1.0):
          nrm = np.array(normal, float)
-@@ -130,19 +130,19 @@ def gem_layer():
+@@ -130,21 +130,21 @@ def gem_layer():
      deep = (20, 70, 210)
      mid = (40, 130, 255)
      ice = (120, 210, 255)
@@ -159,7 +159,7 @@ index 8541084..b2c3d4e 100644
      # star facets
      for i in range(n):
          a = i * 2 * math.pi / n + off
-@@ -153,13 +153,13 @@ def gem_layer():
+@@ -153,16 +153,16 @@ def gem_layer():
      # the table
      tp = [P(table, i * 2 * math.pi / n + off) for i in range(n)]
      tp = [P(table, i * 2 * math.pi / n - off) for i in range(n)]
@@ -210,7 +210,7 @@ index 8541084..b2c3d4e 100644
 
 
  # ---------------------------------------------------------------- the wordmark and the lines under it
-@@ -250,28 +250,28 @@ def put(mask, cy, color, glow=None, x=None):
+@@ -250,34 +250,33 @@ def put(mask, cy, color, glow=None, x=None):
      return x0, y0, w, h
 
 
@@ -261,7 +261,7 @@ index 8541084..b2c3d4e 100644
      (205, 215, 235))
  put(text_mask("HOLD  VOL+  FOR RECOVERY", font(["seguisb.ttf", "segoeuib.ttf"], 28), spacing=4), 2290, (95, 110, 140))
 
-@@ -278,19 +278,19 @@ base = np.clip(bg, 0, 255).astype(np.uint8)
+@@ -278,50 +278,50 @@ base = np.clip(bg, 0, 255).astype(np.uint8)
  # glow layer: the gem's own light, added on top while it pulses
  gx0, gy0 = GEM_C[0] - 410, GEM_C[1] - 410
  gw = gh = 820
@@ -322,7 +322,7 @@ diff --git a/installer/update/steps.d/40-hakios-metal.sh b/installer/update/step
 index 8541084..b2c3d4e 100644
 --- a/installer/update/steps.d/40-hakios-metal.sh
 +++ b/installer/update/steps.d/40-hakios-metal.sh
-@@ -1,7 +1,7 @@
+@@ -1,8 +1,8 @@
  #!/bin/sh
  # Install HakiosMetal bundle (Metal driver for Adreno 610 on SM6225)
  # This replaces the SapphireMetal bundle with hakios branding
@@ -345,7 +345,7 @@ diff --git a/installer/update/steps.d/58-sapphire-hakios-metal-gmem.sh b/install
 index 8541084..b2c3d4e 100644
 --- a/installer/update/steps.d/58-sapphire-hakios-metal-gmem.sh
 +++ b/installer/update/steps.d/58-sapphire-hakios-metal-gmem.sh
-@@ -1,7 +1,7 @@
+@@ -1,8 +1,8 @@
  #!/bin/sh
  # Configure hakios Metal driver GMEM (General Memory) settings for Adreno 610
  # This replaces the Sapphire GMEM config
@@ -355,7 +355,7 @@ index 8541084..b2c3d4e 100644
  nvram -p | grep -q "boot-args" && {
      current=$(nvram boot-args | cut -d' ' -f2-)
      if echo "$current" | grep -q "sweetmetal"; then
-@@ -15,7 +15,7 @@ nvram -p | grep -q "boot-args" && {
+@@ -15,6 +15,6 @@ nvram -p | grep -q "boot-args" && {
      nvram boot-args="$new_args"
  } || {
      nvram boot-args="$bootarg"
@@ -367,7 +367,7 @@ diff --git a/android/dualboot/art/mkicon.py b/android/dualboot/art/mkicon.py
 index 8541084..b2c3d4e 100644
 --- a/android/dualboot/art/mkicon.py
 +++ b/android/dualboot/art/mkicon.py
-@@ -1,7 +1,7 @@
+@@ -1,8 +1,8 @@
  #!/usr/bin/env python3
  # Generate dual boot app icon: Sapphire logo -> hakios logo
 
@@ -378,7 +378,7 @@ index 8541084..b2c3d4e 100644
 
  SIZE = 512
  OUT = "ic_launcher.png"
-@@ -15,7 +15,7 @@ def draw_sapphire(draw, cx, cy, r):
+@@ -15,6 +15,6 @@ def draw_sapphire(draw, cx, cy, r):
      # gem facets
      for i in range(8):
 -        a = i * math.pi / 4
@@ -386,7 +386,7 @@ index 8541084..b2c3d4e 100644
          p = [(cx + r * 0.5 * math.cos(a - 0.2), cy + r * 0.5 * math.sin(a - 0.2)),
               (cx + r * 0.74 * math.cos(a), cy + r * 0.74 * math.sin(a)),
               (cx + r * math.cos(a - 0.2), cy + r * math.sin(a - 0.2)),
-@@ -35,19 +35,19 @@ def draw_sapphire(draw, cx, cy, r):
+@@ -35,25 +35,25 @@ def draw_sapphire(draw, cx, cy, r):
      draw.ellipse((cx - r * 0.5, cy - r * 0.5, cx + r * 0.5, cy + r * 0.5), fill=(120, 210, 255, 255))
 
  img = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
@@ -422,7 +422,7 @@ index 8541084..b2c3d4e 100644
 
  # orbit ring
  for i in range(60):
-@@ -62,13 +62,15 @@ for i in range(60):
+@@ -62,24 +62,24 @@ for i in range(60):
          r0 = 240 + (14 if i % 5 == 0 else 7)
          r1 = 240 + 22 if i % 5 == 0 else 240 + 12
          draw.line([(cx + r0 * math.cos(a), cy + r0 * math.sin(a)),
@@ -467,7 +467,7 @@ index 8541084..b2c3d4e 100644
  			    "empty (no 30 s wait in CAMetalContextCreate)");
  		}
  	}
-@@ -326,7 +326,7 @@ static void
+@@ -326,10 +326,10 @@ static void
  sweet_metal_name(IOAcceleratorES *accel, uint32_t metal)
  {
  	if (metal == 2) {
@@ -480,7 +480,7 @@ index 8541084..b2c3d4e 100644
  		accel->setProperty("MetalPluginClassName", "SapphireMTLDevice");
  	} else {
  		accel->removeProperty("MetalPluginName");
-@@ -336,7 +336,7 @@ sweet_metal_name(IOAcceleratorES *accel, uint32_t metal)
+@@ -336,14 +336,13 @@ sweet_metal_name(IOAcceleratorES *accel, uint32_t metal)
  	sweet_metal_now = metal;
  }
 

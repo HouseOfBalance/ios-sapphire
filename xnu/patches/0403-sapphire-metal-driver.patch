@@ -30,7 +30,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/installer/update/files/System/Library/Extensions/HakiosMetal.bundle/Contents/Info.plist
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,42 @@
 +<?xml version="1.0" encoding="UTF-8"?>
 +<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 +<plist version="1.0">
@@ -78,7 +78,7 @@ new file mode 100755
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/installer/update/files/System/Library/Extensions/HakiosMetal.bundle/Contents/MacOS/HakiosMetal
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,21 @@
 +#!/bin/sh
 +# HakiosMetal bundle executable - loads the Metal driver kext
 +# This is a stub that ensures the kext is loaded
@@ -105,7 +105,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/HakiosMetalDevice.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,68 @@
 +/*
 + * HakiosMetalDevice - Metal driver for Adreno 610 (SM6225/sapphire)
 + * Implements MTLDevice protocol for iOS 16.7 (MSL 2.2)
@@ -179,7 +179,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/HakiosMetalDevice.cpp
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,218 @@
 +/*
 + * HakiosMetalDevice implementation
 + */
@@ -403,7 +403,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/HakiosCommandQueue.cpp
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,67 @@
 +/*
 + * HakiosCommandQueue - Metal command queue for Adreno 610
 + */
@@ -476,7 +476,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/HakiosCommandBuffer.cpp
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,155 @@
 +/*
 + * HakiosCommandBuffer - Metal command buffer for Adreno 610
 + * Implements blit/compute encoders for present path
@@ -637,7 +637,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/HakiosTexture.cpp
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,139 @@
 +/*
 + * HakiosTexture - Metal texture for Adreno 610
 + * Supports IOSurface-backed textures for panel memory
@@ -782,7 +782,7 @@ new file mode 100644
 index 0000000..b2c3d4e
 --- /dev/null
 +++ b/metal/HakiosArgumentBuffer.cpp
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,95 @@
 +/*
 + * HakiosArgumentBuffer - Tier 1 argument buffer support for Adreno 610
 + * Allows binding textures/samplers via buffer descriptors
@@ -893,7 +893,7 @@ index 8541084..b2c3d4e 100644
  			    "empty (no 30 s wait in CAMetalContextCreate)");
  		}
  	}
-@@ -326,7 +326,7 @@ static void
+@@ -326,10 +326,10 @@ static void
  sweet_metal_name(IOAcceleratorES *accel, uint32_t metal)
  {
  	if (metal == 2) {
@@ -906,7 +906,7 @@ index 8541084..b2c3d4e 100644
  		accel->setProperty("MetalPluginClassName", "SapphireMTLDevice");
  	} else {
  		accel->removeProperty("MetalPluginName");
-@@ -336,7 +336,7 @@ sweet_metal_name(IOAcceleratorES *accel, uint32_t metal)
+@@ -336,14 +336,13 @@ sweet_metal_name(IOAcceleratorES *accel, uint32_t metal)
  	sweet_metal_now = metal;
  }
 

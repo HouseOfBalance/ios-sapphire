@@ -13,7 +13,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 index 8541084..f6a7b8c 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -1183,6 +1183,56 @@ AppleCLCD::setPanelLevel(uint32_t level)
+@@ -1183,5 +1183,71 @@ AppleCLCD::setPanelLevel(uint32_t level)
  }
 
 +/* 0346: Send arbitrary DSI DCS command from sysctl */

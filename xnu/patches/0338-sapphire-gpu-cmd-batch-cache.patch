@@ -23,7 +23,7 @@ diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 index a1b2c3d..f6a7b8c 100644
 --- a/iokit/Kernel/arm/SapphireGpu.cpp
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -3400,6 +3400,286 @@ msm_wait(uint32_t f, uint64_t ms)
+@@ -3400,5 +3400,255 @@ msm_wait(uint32_t f, uint64_t ms)
  	return true;
  }
 

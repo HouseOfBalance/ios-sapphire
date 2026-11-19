@@ -21,7 +21,7 @@ diff --git a/iokit/Kernel/arm/SapphireMesa.c b/iokit/Kernel/arm/SapphireMesa.c
 index 0000000..e5f6a7b 100644
 --- /dev/null
 +++ b/iokit/Kernel/arm/SapphireMesa.c
-@@ -0,0 +1,220 @@
+@@ -0,0 +1,274 @@
 +/*
 + * sapphire-0341: Mesa/freedreno optimizations for Adreno 610
 + * GMEM verification, dynamic buffer pool, LRU shader cache eviction

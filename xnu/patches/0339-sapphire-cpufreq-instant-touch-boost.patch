@@ -18,7 +18,7 @@ diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
 index b863e35..c4d5e6f 100644
 --- a/bsd/dev/sweet_cpufreq.c
 +++ b/bsd/dev/sweet_cpufreq.c
-@@ -187,6 +187,226 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+@@ -187,2 +187,258 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
      0, 0, sysctl_sweet_cpufreq, "A", "active CPU perf state and MHz per cluster (write: re-apply max)");
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 +

@@ -35,7 +35,7 @@ new file mode 100644
 index 0000000..6e46e20
 --- /dev/null
 +++ b/bsd/dev/sweet_dsi_cmd.c
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,51 @@
 +/*
 + * sapphire-0345: DSI command sysctl for brightness and deep sleep
 + * Provides kern.sweet_dsi_cmd sysctl for userspace to send DCS commands

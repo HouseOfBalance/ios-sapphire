@@ -33,7 +33,7 @@ new file mode 100644
 index 0000000..6e46e20
 --- /dev/null
 +++ b/bsd/dev/sweet_thermal.c
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,150 @@
 +/*
 + * sapphire-0344: Thermal sysctls for thermald daemon
 + * Provides kern.sweet_thermal_zone[N], kern.sweet_thermal_state,

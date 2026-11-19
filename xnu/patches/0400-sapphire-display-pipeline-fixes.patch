@@ -47,7 +47,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 index 8541084..b2c3d4e 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -1,6 +1,10 @@
+@@ -1,6 +1,13 @@
  /*
   * Built-in IOMobileFramebuffer for SWEET: the ABL's continuous-splash
   * framebuffer (1080x2400 a8r8g8b8 in RAM, the panel scans it out by
@@ -100,7 +100,7 @@ index 8541084..b2c3d4e 100644
 
  	/* topaz panel brightness: DCS 0x51 over DSI0 (MakrSas/topaz-woa TopazGpuW disp.c) */
  	volatile uint8_t *fDsi;
-@@ -322,6 +342,20 @@ AppleCLCD::start(IOService *provider)
+@@ -322,6 +342,15 @@ AppleCLCD::start(IOService *provider)
  	fOffX = ((int32_t)(fLogicalW - fWidth) / 2) & ~3;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
  	fLock = IOLockAlloc();
@@ -116,7 +116,7 @@ index 8541084..b2c3d4e 100644
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
  	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
-@@ -348,6 +382,12 @@ AppleCLCD::start(IOService *provider)
+@@ -348,5 +382,12 @@ AppleCLCD::start(IOService *provider)
  	fFlip[0] = fFlip[1] = NULL;
  	fFlipPhys[0] = fFlipPhys[1] = 0;
 +	/* 0334: initialize flip ring */
@@ -129,7 +129,7 @@ index 8541084..b2c3d4e 100644
 
  	/* 0320: render scaling */
  	uint32_t rscale = 1000;
-@@ -365,6 +405,12 @@ AppleCLCD::start(IOService *provider)
+@@ -365,6 +405,13 @@ AppleCLCD::start(IOService *provider)
  	(void)PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
  	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
@@ -143,7 +143,7 @@ index 8541084..b2c3d4e 100644
 
  	/* 0147: frame timing stats */
  	{
-@@ -535,6 +581,14 @@ AppleCLCD::start(IOService *provider)
+@@ -535,6 +581,13 @@ AppleCLCD::start(IOService *provider)
  		 */
  		uint32_t blOn = 0;
  		(void)PE_parse_boot_argn("sweetbl", &blOn, sizeof(blOn));
@@ -184,7 +184,7 @@ index 8541084..b2c3d4e 100644
  			return;
  		}
  		bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
-@@ -620,14 +674,37 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+@@ -620,16 +674,71 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  			fb->flipBack();
  		}
  		if (rec != NULL) {
@@ -345,14 +345,14 @@ index 8541084..b2c3d4e 100644
  }
 
  bool
-@@ -1370,7 +1475,7 @@ AppleCLCD::present()
+@@ -1370,5 +1475,5 @@ AppleCLCD::present()
  		/* Wait for GPU copy to complete before we can flip */
  		if (fFlip[0] != NULL) {
 -			(void)flipWhenCopied(true);
 +			(void)flipWhenCopied(sweet_fb_pipeline_enabled ? false : true);
  		}
  		uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
-@@ -1379,24 +1484,76 @@ AppleCLCD::present()
+@@ -1379,6 +1484,28 @@ AppleCLCD::present()
  			continue;
  		}
 -		if (i >= 2000) {
@@ -382,7 +382,7 @@ index 8541084..b2c3d4e 100644
  	}
  	uint32_t idx = fFlipIdx ^ 1;
  	scanFrom(fFlipPhys[idx], fRowBytes);
-@@ -1644,13 +1751,58 @@ AppleCLCD::present()
+@@ -1644,10 +1751,64 @@ AppleCLCD::present()
  	 * flip of both waits for the newer copy.
  	 */
  	if (fFlip[0] != NULL) {
@@ -462,7 +462,7 @@ index 8541084..b2c3d4e 100644
  		put32(p, 0x0c, pl->offset);
  		put32(p, 0x14, pl->size);
  		memcpy(p + 0x18, &pl->bytesPerElement, 2);
-@@ -615,7 +616,8 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
+@@ -615,6 +616,7 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArguments *args)
  	{
  	SweetSurfaceRef *ref = NULL;
 -	IOReturn ret = addRef(s, &ref);
@@ -486,7 +486,7 @@ index 8541084..b2c3d4e 100644
  		/* The caller never learns the id: undo this create/lookup. */
  		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
  	}
-@@ -495,17 +500,25 @@
+@@ -495,19 +500,26 @@
  /*
   * Count one more create/lookup of s by this client, mapping it into the
   * task the first time. Takes over the caller's user count on s.
@@ -521,7 +521,7 @@ diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.c
 index 8541084..b2c3d4e 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
-@@ -94,6 +94,7 @@
+@@ -94,5 +94,6 @@
  	private:
  	IOLock *fLock;
 +	int fLogicalW, fLogicalH, fOffX, fOffY;
@@ -541,7 +541,7 @@ index 8541084..b2c3d4e 100644
  	/* The digitizer covers the main display (backboardd maps it 1:1). */
  	setProperty("DisplayIntegrated", kOSBooleanTrue);
  	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
-@@ -115,8 +122,9 @@ SweetHIDEventDriver::newFinger(IOService *owner, unsigned finger, int x, int y, bool down)
+@@ -115,10 +122,10 @@ SweetHIDEventDriver::newFinger(IOService *owner, unsigned finger, int x, int y, bool down)
 
  	IOLockLock(fLock);
  	bool was = fDown[finger];

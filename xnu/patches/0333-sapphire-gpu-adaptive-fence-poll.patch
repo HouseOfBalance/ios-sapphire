@@ -18,7 +18,7 @@ diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
 index 2e785d1..a1b2c3d 100644
 --- a/iokit/Kernel/arm/SapphireGpu.cpp
 +++ b/iokit/Kernel/arm/SapphireGpu.cpp
-@@ -3318,16 +3318,61 @@ static bool
+@@ -3318,17 +3318,80 @@ static bool
  msm_wait(uint32_t f, uint64_t ms)
  {
  	uint64_t deadline, now;

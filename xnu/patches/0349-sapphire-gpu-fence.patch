@@ -16,7 +16,7 @@ diff --git a/bsd/kern/sweet_gpu_fence.c b/bsd/kern/sweet_gpu_fence.c
 index 0000000..e5f6a7b 100644
 --- /dev/null
 +++ b/bsd/kern/sweet_gpu_fence.c
-@@ -0,0 +1,320 @@
+@@ -0,0 +1,176 @@
 +/*
 + * sapphire-0346: GPU Fence Adaptive Sync & Async Flush for Adreno 610
 + * Eliminates CPU stalls waiting on GPU fences, enables async submit

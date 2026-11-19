@@ -22,7 +22,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 index e5f6a7b..f6a7b8c 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -85,6 +85,15 @@ static uint32_t sweet_fb_max_inflight = 3;      /* 0334: max pipelined GPU frames (1-4) */
+@@ -85,5 +85,12 @@ static uint32_t sweet_fb_max_inflight = 3;      /* 0334: max pipelined GPU frames (1-4) */
  static uint32_t sweet_fb_pipeline_enabled = 1;  /* 0334: enable async pipeline (boot arg sweet_fb_pipeline) */
  static IOLock *sweet_fb_flip_lock = NULL;       /* 0334: protects flip ring */
 +static uint32_t sweet_fb_event_driven = 1;      /* 0343: enable event-driven flip completion */
@@ -35,7 +35,7 @@ index e5f6a7b..f6a7b8c 100644
  static volatile uint32_t sweet_fb_flip_head = 0; /* 0334: next slot to write */
  static volatile uint32_t sweet_fb_flip_tail = 0; /* 0334: next slot to flip */
  static uint64_t sweet_fb_flip_timestamps[4];    /* 0334: per-slot flip timestamps */
-@@ -547,6 +556,16 @@ AppleCLCD::start(IOService *provider)
+@@ -547,4 +556,14 @@ AppleCLCD::start(IOService *provider)
          if (sweet_fb_max_inflight < 1) sweet_fb_max_inflight = 1;
          if (sweet_fb_max_inflight > 4) sweet_fb_max_inflight = 4;
 
@@ -50,7 +50,7 @@ index e5f6a7b..f6a7b8c 100644
 +        }
 +
          AppleARMBacklight *bl = blOn ? OSTypeAlloc(AppleARMBacklight) : NULL;
-@@ -1450,15 +1489,55 @@ AppleCLCD::present()
+@@ -1450,3 +1489,93 @@ AppleCLCD::present()
          }
          uint32_t idx = fFlipIdx ^ 1;
          scanFrom(fFlipPhys[idx], fRowBytes);

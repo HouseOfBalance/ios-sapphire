@@ -19,7 +19,7 @@ diff --git a/bsd/kern/sched_affinity.c b/bsd/kern/sched_affinity.c
 index 0000000..c3d4e5f 100644
 --- /dev/null
 +++ b/bsd/kern/sched_affinity.c
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,120 @@
 +/*
 + * sapphire-0345: CPU Affinity syscall support for SM6225 (A73/A53 big.LITTLE)
 + * Allows userspace to pin threads to performance cores
