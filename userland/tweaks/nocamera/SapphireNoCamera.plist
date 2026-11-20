@@ -8,6 +8,10 @@
 		<array>
 			<string>com.apple.InCallService</string>
 			<string>com.apple.mobilephone</string>
+			<string>com.apple.camera</string>
+			<string>com.apple.FaceTime</string>
+			<string>com.apple.mobilesafari</string>
+			<string>com.apple.QRCodeReader</string>
 		</array>
 	</dict>
 </dict>

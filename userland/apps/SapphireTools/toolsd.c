@@ -34,6 +34,7 @@ static int allowed_proc(const char *name) {
     static const char *const kAllowed[] = {
         "backboardd", "SpringBoard", "fpd", "btmonitor",
         "vibd", "thermald", "sensord", "mediaserverd",
+        "CommCenter", "wifid", "bluetoothd", "camd",
         "sshd", "dropbear", "sharingd", NULL
     };
     for (int i = 0; kAllowed[i]; i++) {

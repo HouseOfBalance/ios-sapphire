@@ -36,10 +36,15 @@ jobs:
           cd userland
           mkdir -p obj
 
-          # 1. Build btcapability tweak
+          # 1. Build btcapability & nocamera/AVCamera tweaks
           echo "Building SapphireBTCapability..."
           cd tweaks/btcapability
           SDK="$SDK_PATH" LDID="$LDID_BIN" bash build.sh ../../obj
+          cd ../..
+
+          echo "Building SapphireNoCamera (AVFoundation camd bridge)..."
+          cd tweaks/nocamera
+          SDK="$SDK_PATH" LDID="$LDID_BIN" CLANG="clang" bash build.sh ../../obj
           cd ../..
 
           # 2. Build btmonitor & daemons

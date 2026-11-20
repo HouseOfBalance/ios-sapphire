@@ -1,0 +1,33 @@
+From: Sapphire Port <sapphire@xiaomi>
+Subject: [PATCH] sapphire-0359: RBBM_INT_0_STATUS CACHE_FLUSH_TS check and 100us fast-poll in msm_wait
+
+Check RBBM_INT_0_STATUS bit 20 (CACHE_FLUSH_TS) directly and extend the
+tight poll window to 100 us (20 x 5 us) with a 15 us sleep interval to
+reduce fence completion latency on Adreno 610.
+---
+diff --git a/iokit/Kernel/arm/SapphireGpu.cpp b/iokit/Kernel/arm/SapphireGpu.cpp
+index 0c468a6..7762160 100644
+--- a/iokit/Kernel/arm/SapphireGpu.cpp
++++ b/iokit/Kernel/arm/SapphireGpu.cpp
+@@ -3377,12 +3377,18 @@ msm_wait(uint32_t f, uint64_t ms)
+ 			}
+ 			return false;
+ 		}
+-		/* 0329: fast-path poll up to 50 us before sleeping (delay_for_interval sleeps 50-150+ us) */
+-		if (polls < 10u) {
++		/* 0359: RBBM_INT_0_STATUS CACHE_FLUSH_TS wakeup + 100 us fast-path poll before sleeping */
++		if ((grd(REG_RBBM_INT_0_STATUS) & (1u << 20)) != 0) {
++			gwr(REG_RBBM_INT_CLEAR_CMD, 1u << 20);
++			if (msm_fence_done(f)) {
++				return true;
++			}
++		}
++		if (polls < 20u) {
+ 			IODelay(5);
+ 			polls++;
+ 		} else {
+-			delay_for_interval(25, NSEC_PER_USEC);
++			delay_for_interval(15, NSEC_PER_USEC);
+ 		}
+ 	}
+ 	return true;

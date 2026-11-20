@@ -98,6 +98,7 @@ static NSArray<NSArray<NSString *> *> *SWServiceList(void) {
     return @[
         @[@"SpringBoard",   @"UI shell"],
         @[@"backboardd",    @"display / touch events"],
+        @[@"camd",          @"camera daemon"],
         @[@"fpd",           @"fingerprint"],
         @[@"btmonitor",     @"bluetooth monitor"],
         @[@"vibd",          @"haptics"],
@@ -271,6 +272,7 @@ static NSString *SWHintForTitle(NSString *title) {
             @[@"Copy scp command", @"Sao chép lệnh để gửi file từ máy tính sang điện thoại."],
             @[@"Refresh SSH", @"Kiểm tra lại SSH đang bật hay tắt và địa chỉ IP."],
             @[@"Sysctl Explorer", @"Danh sách mọi thông số tinh chỉnh của hệ thống (kể cả cái mới thêm sau này). Xem và sửa được."],
+            @[@"Open Sapphire Camera", @"Mở máy ảnh trực tiếp (camd): hỗ trợ đủ 4 ống kính (108MP/12MP, góc siêu rộng, macro, cam trước), chạm lấy nét AF và lưu vào Photos/Files."],
             @[@"Edit metal.args", @"Tự gõ sửa các cờ cấu hình Metal."],
             @[@"Copy debug snapshot", @"Gom toàn bộ thông tin máy thành một đoạn chữ để dán gửi cho người phân tích lỗi."],
             @[@"Share debug snapshot", @"Giống nút trên nhưng gửi qua menu Chia sẻ dưới dạng file."],
@@ -843,6 +845,11 @@ static int SWKillByName(NSString *name, int sig, int *errorCode) {
         else lastErr = errno;
     }
     free(procs);
+    if (killed == 0 && (lastErr == EPERM || lastErr == EACCES)) {
+        if (SWToolsdCall([NSString stringWithFormat:@"KILL %@\n", name], errorCode)) {
+            return 1;
+        }
+    }
     if (killed == 0 && lastErr != 0) {
         if (errorCode) *errorCode = lastErr;
         return -1;
@@ -860,6 +867,10 @@ static BOOL SWKillProcesses(NSArray<NSString *> *names, NSString **errMsg) {
         else if (k < 0) lastErr = e;
     }
     if (total > 0) return YES;
+
+    if (SWToolsdCall([NSString stringWithFormat:@"KILL %@\n", [names componentsJoinedByString:@" "]], NULL)) {
+        return YES;
+    }
 
     NSMutableArray<NSString *> *args = [NSMutableArray arrayWithObjects:@"killall", @"-9", nil];
     [args addObjectsFromArray:names];
@@ -880,6 +891,7 @@ static BOOL SWKillProcesses(NSArray<NSString *> *names, NSString **errMsg) {
 
 static BOOL SWReboot(NSString **errMsg) {
     sync();
+    if (SWToolsdCall(@"REBOOT\n", NULL)) return YES;
     int spawnErr = 0;
     int rc = SWRunFirst(@[@"/sbin/reboot", @"/usr/sbin/reboot", @"/usr/bin/reboot",
                           @"/var/jb/usr/sbin/reboot", @"/var/jb/sbin/reboot"], @[@"reboot"], nil, &spawnErr);
@@ -1128,6 +1140,9 @@ static BOOL SWWriteMetalTokens(NSArray<NSString *> *tokens, NSString **msg) {
         chmod(kMetalArgsPath.fileSystemRepresentation, 0644);
         return YES;
     }
+    if (SWToolsdCall([NSString stringWithFormat:@"WRITE_METAL_ARGS\n%@", content], NULL)) {
+        return YES;
+    }
     if (msg) {
         *msg = [NSString stringWithFormat:@"%@ (%@ %ld)", e.localizedDescription ?: @"write error",
                 e.domain ?: @"", (long)e.code];
@@ -1314,6 +1329,370 @@ static NSString *SWSaveSnapshot(NSString *text) {
     }
     return path;
 }
+
+#include <notify.h>
+#include <sys/mman.h>
+#include <sys/un.h>
+
+#define CAMD_SOCK_PATH    "/var/run/camd.sock"
+#define CAMD_SHM_PATH     "/var/tmp/camd-preview.bin"
+#define CAMD_NOTIFY_FRAME "com.sapphire.cam.frame"
+#define CAMD_SHM_MAGIC    0x444D4143u
+#define CAMD_SHM_SLOTS    3
+
+typedef struct {
+    uint64_t seq;
+    uint64_t ts_ns;
+    uint32_t width, height, stride;
+    uint32_t mode;
+    float exposure_us, gain;
+    float wb[3];
+    float luma;
+} SWCamdSlot;
+
+typedef struct {
+    uint32_t magic, version;
+    uint32_t header_size, slot_size, nslots;
+    uint32_t latest;
+    uint64_t seq;
+    uint32_t running;
+    uint32_t reserved[7];
+    SWCamdSlot slot[CAMD_SHM_SLOTS];
+} SWCamdShm;
+
+static NSString *SWCamdCommand(NSString *cmd, double timeoutSec) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return nil;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strlcpy(addr.sun_path, CAMD_SOCK_PATH, sizeof(addr.sun_path));
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return nil;
+    }
+    NSString *line = [cmd hasSuffix:@"\n"] ? cmd : [cmd stringByAppendingString:@"\n"];
+    const char *c = line.UTF8String;
+    size_t len = strlen(c);
+    if (write(fd, c, len) != (ssize_t)len) {
+        close(fd);
+        return nil;
+    }
+    NSMutableString *out = [NSMutableString string];
+    char buf[512];
+    int64_t deadline = SWNowMs() + (int64_t)(timeoutSec * 1000.0);
+    for (;;) {
+        int64_t left = deadline - SWNowMs();
+        if (left <= 0) break;
+        struct pollfd p = { fd, POLLIN, 0 };
+        if (poll(&p, 1, (int)left) <= 0) break;
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        if (n <= 0) break;
+        buf[n] = '\0';
+        [out appendFormat:@"%s", buf];
+        if ([cmd hasPrefix:@"CAPTURE"]) {
+            if ([out containsString:@"DONE "] || [out containsString:@"ERR "]) break;
+        } else if ([out containsString:@"\n"]) {
+            break;
+        }
+    }
+    close(fd);
+    return [out stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+@interface SWCameraViewController : UIViewController
+@property (nonatomic, strong) UIImageView *previewView;
+@property (nonatomic, strong) UILabel *hudLabel;
+@property (nonatomic, strong) UISegmentedControl *lensSeg;
+@property (nonatomic, strong) UISegmentedControl *resSeg;
+@property (nonatomic, strong) UISlider *evSlider;
+@property (nonatomic, strong) UIButton *shutterBtn;
+@property (nonatomic, assign) int shmFd;
+@property (nonatomic, assign) void *shmPtr;
+@property (nonatomic, assign) size_t shmLen;
+@property (nonatomic, assign) int notifyToken;
+@property (nonatomic, assign) uint64_t lastSeq;
+@property (nonatomic, assign) int currentMode;
+@property (nonatomic, strong) dispatch_queue_t camQueue;
+@end
+
+@implementation SWCameraViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Sapphire Camera";
+    self.view.backgroundColor = UIColor.blackColor;
+    self.shmFd = -1;
+    self.notifyToken = -1;
+    self.currentMode = 1; // 1 = Main 12MP 4:3, 12 = UltraWide, 11 = Front, 13 = Macro
+    self.camQueue = dispatch_queue_create("com.sapphire.tools.cam", DISPATCH_QUEUE_SERIAL);
+
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
+                                                      target:self action:@selector(closeTapped)];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"AF" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(afTapped)];
+
+    self.previewView = [[UIImageView alloc] init];
+    self.previewView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.previewView.contentMode = UIViewContentModeScaleAspectFit;
+    self.previewView.userInteractionEnabled = YES;
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(previewTapped:)];
+    [self.previewView addGestureRecognizer:tap];
+    [self.view addSubview:self.previewView];
+
+    self.hudLabel = SWMakeLabel([UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightMedium], UIColor.whiteColor, 2);
+    self.hudLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.hudLabel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.55];
+    self.hudLabel.textAlignment = NSTextAlignmentCenter;
+    self.hudLabel.layer.cornerRadius = 6;
+    self.hudLabel.clipsToBounds = YES;
+    self.hudLabel.text = @"Connecting to camd…";
+    [self.view addSubview:self.hudLabel];
+
+    self.lensSeg = [[UISegmentedControl alloc] initWithItems:@[@"1x Main", @"0.6x UW", @"2x Crop", @"Macro", @"Front"]];
+    self.lensSeg.translatesAutoresizingMaskIntoConstraints = NO;
+    self.lensSeg.selectedSegmentIndex = 0;
+    self.lensSeg.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.85];
+    [self.lensSeg addTarget:self action:@selector(lensChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.view addSubview:self.lensSeg];
+
+    self.resSeg = [[UISegmentedControl alloc] initWithItems:@[@"12 MP", @"108 MP", @"12MP+DNG"]];
+    self.resSeg.translatesAutoresizingMaskIntoConstraints = NO;
+    self.resSeg.selectedSegmentIndex = 0;
+    self.resSeg.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.85];
+    [self.view addSubview:self.resSeg];
+
+    self.evSlider = [[UISlider alloc] init];
+    self.evSlider.translatesAutoresizingMaskIntoConstraints = NO;
+    self.evSlider.minimumValue = -2.0f;
+    self.evSlider.maximumValue = 2.0f;
+    self.evSlider.value = 0.0f;
+    [self.evSlider addTarget:self action:@selector(evChanged:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+    [self.view addSubview:self.evSlider];
+
+    self.shutterBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.shutterBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    self.shutterBtn.backgroundColor = UIColor.whiteColor;
+    self.shutterBtn.layer.cornerRadius = 34;
+    self.shutterBtn.layer.borderWidth = 4;
+    self.shutterBtn.layer.borderColor = UIColor.systemGray2Color.CGColor;
+    [self.shutterBtn addTarget:self action:@selector(shutterTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:self.shutterBtn];
+
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [self.hudLabel.topAnchor constraintEqualToAnchor:g.topAnchor constant:6],
+        [self.hudLabel.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:12],
+        [self.hudLabel.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-12],
+        [self.hudLabel.heightAnchor constraintEqualToConstant:34],
+
+        [self.previewView.topAnchor constraintEqualToAnchor:self.hudLabel.bottomAnchor constant:6],
+        [self.previewView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [self.previewView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [self.previewView.bottomAnchor constraintEqualToAnchor:self.lensSeg.topAnchor constant:-10],
+
+        [self.lensSeg.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:12],
+        [self.lensSeg.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-12],
+        [self.lensSeg.bottomAnchor constraintEqualToAnchor:self.resSeg.topAnchor constant:-8],
+
+        [self.resSeg.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:12],
+        [self.resSeg.widthAnchor constraintEqualToConstant:190],
+        [self.resSeg.bottomAnchor constraintEqualToAnchor:self.shutterBtn.topAnchor constant:-12],
+
+        [self.evSlider.leadingAnchor constraintEqualToAnchor:self.resSeg.trailingAnchor constant:12],
+        [self.evSlider.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-12],
+        [self.evSlider.centerYAnchor constraintEqualToAnchor:self.resSeg.centerYAnchor],
+
+        [self.shutterBtn.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [self.shutterBtn.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-14],
+        [self.shutterBtn.widthAnchor constraintEqualToConstant:68],
+        [self.shutterBtn.heightAnchor constraintEqualToConstant:68],
+    ]];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    __weak typeof(self) ws = self;
+    notify_register_dispatch(CAMD_NOTIFY_FRAME, &_notifyToken, dispatch_get_main_queue(), ^(int tok) {
+        [ws renderLatestFrame];
+    });
+    [self startPreviewMode:self.currentMode];
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    if (self.notifyToken != -1) {
+        notify_cancel(self.notifyToken);
+        self.notifyToken = -1;
+    }
+    dispatch_async(self.camQueue, ^{
+        SWCamdCommand(@"STOP", 2.0);
+    });
+    if (self.shmPtr && self.shmPtr != MAP_FAILED) {
+        munmap(self.shmPtr, self.shmLen);
+        self.shmPtr = NULL;
+    }
+    if (self.shmFd >= 0) {
+        close(self.shmFd);
+        self.shmFd = -1;
+    }
+}
+
+- (void)closeTapped {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)startPreviewMode:(int)mode {
+    self.currentMode = mode;
+    self.hudLabel.text = [NSString stringWithFormat:@"Starting mode %d…", mode];
+    __weak typeof(self) ws = self;
+    dispatch_async(self.camQueue, ^{
+        NSString *r = SWCamdCommand([NSString stringWithFormat:@"START %d", mode], 4.0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            if (!r || ![r hasPrefix:@"OK"]) {
+                s.hudLabel.text = [NSString stringWithFormat:@"camd error: %@", r ?: @"socket /var/run/camd.sock not reachable"];
+                return;
+            }
+            s.hudLabel.text = r;
+            [s openShmIfNeeded];
+            [s renderLatestFrame];
+        });
+    });
+}
+
+- (void)openShmIfNeeded {
+    if (self.shmPtr && self.shmPtr != MAP_FAILED) return;
+    int fd = open(CAMD_SHM_PATH, O_RDONLY);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(SWCamdShm)) {
+        close(fd);
+        return;
+    }
+    void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+    self.shmFd = fd;
+    self.shmPtr = p;
+    self.shmLen = (size_t)st.st_size;
+}
+
+- (void)renderLatestFrame {
+    [self openShmIfNeeded];
+    if (!self.shmPtr || self.shmPtr == MAP_FAILED) return;
+    const SWCamdShm *shm = (const SWCamdShm *)self.shmPtr;
+    if (shm->magic != CAMD_SHM_MAGIC || shm->nslots == 0) return;
+    uint32_t idx = shm->latest;
+    if (idx >= shm->nslots || idx >= CAMD_SHM_SLOTS) return;
+    SWCamdSlot slot = shm->slot[idx];
+    if (slot.seq == 0 || slot.seq == self.lastSeq || slot.width == 0 || slot.height == 0) return;
+    size_t off = (size_t)shm->header_size + (size_t)idx * (size_t)shm->slot_size;
+    size_t need = (size_t)slot.stride * (size_t)slot.height;
+    if (off + need > self.shmLen) return;
+    self.lastSeq = slot.seq;
+
+    const uint8_t *pixels = (const uint8_t *)self.shmPtr + off;
+    CFDataRef data = CFDataCreate(NULL, pixels, (CFIndex)need);
+    if (!data) return;
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef prov = CGDataProviderCreateWithCFData(data);
+    CGBitmapInfo bi = (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | (CGBitmapInfo)kCGBitmapByteOrder32Little;
+    CGImageRef cg = CGImageCreate(slot.width, slot.height, 8, 32, slot.stride, cs, bi, prov, NULL, false, kCGRenderingIntentDefault);
+    if (cg) {
+        self.previewView.image = [UIImage imageWithCGImage:cg];
+        CGImageRelease(cg);
+    }
+    CGDataProviderRelease(prov);
+    CGColorSpaceRelease(cs);
+    CFRelease(data);
+
+    self.hudLabel.text = [NSString stringWithFormat:@"#%llu  %ux%u  %.1f ms  %.1fx  luma %.2f",
+                          (unsigned long long)slot.seq, slot.width, slot.height,
+                          slot.exposure_us / 1000.0f, slot.gain, slot.luma];
+}
+
+- (void)lensChanged:(UISegmentedControl *)seg {
+    static const int modes[] = { 1, 12, 4, 13, 11 };
+    NSInteger idx = seg.selectedSegmentIndex;
+    if (idx >= 0 && idx < 5) {
+        [self startPreviewMode:modes[idx]];
+    }
+}
+
+- (void)evChanged:(UISlider *)s {
+    float v = s.value;
+    dispatch_async(self.camQueue, ^{
+        SWCamdCommand([NSString stringWithFormat:@"EV %.2f", v], 1.5);
+    });
+}
+
+- (void)afTapped {
+    dispatch_async(self.camQueue, ^{
+        SWCamdCommand(@"AF", 2.0);
+    });
+    SWToast(self.view, @"Autofocus triggered");
+}
+
+- (void)previewTapped:(UITapGestureRecognizer *)g {
+    CGPoint pt = [g locationInView:self.previewView];
+    CGSize sz = self.previewView.bounds.size;
+    if (sz.width < 1 || sz.height < 1) return;
+    float nx = (float)(pt.x / sz.width);
+    float ny = (float)(pt.y / sz.height);
+    nx = nx < 0 ? 0 : (nx > 1 ? 1 : nx);
+    ny = ny < 0 ? 0 : (ny > 1 ? 1 : ny);
+    dispatch_async(self.camQueue, ^{
+        SWCamdCommand([NSString stringWithFormat:@"METER %.3f,%.3f", nx, ny], 2.0);
+    });
+    SWToast(self.view, [NSString stringWithFormat:@"Spot meter & AF (%.2f, %.2f)", nx, ny]);
+}
+
+- (void)shutterTapped {
+    self.shutterBtn.enabled = NO;
+    self.shutterBtn.alpha = 0.4;
+    NSInteger rIdx = self.resSeg.selectedSegmentIndex;
+    NSString *cmd = (rIdx == 1) ? @"CAPTURE 108 nodng" : (rIdx == 2 ? @"CAPTURE 12 dng" : @"CAPTURE 12 nodng");
+    self.hudLabel.text = [NSString stringWithFormat:@"Capturing (%@)…", cmd];
+    __weak typeof(self) ws = self;
+    dispatch_async(self.camQueue, ^{
+        NSString *resp = SWCamdCommand(cmd, 25.0);
+        NSString *jpgPath = nil;
+        for (NSString *line in [resp componentsSeparatedByString:@"\n"]) {
+            NSRange r = [line rangeOfString:@"DONE "];
+            if (r.location != NSNotFound) {
+                NSString *rest = [[line substringFromIndex:r.location + 5]
+                                  stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                NSRange dngR = [rest rangeOfString:@" DNG "];
+                jpgPath = (dngR.location != NSNotFound) ? [rest substringToIndex:dngR.location] : rest;
+            }
+        }
+        if (jpgPath.length) {
+            UIImage *img = [UIImage imageWithContentsOfFile:jpgPath];
+            if (img) {
+                UIImageWriteToSavedPhotosAlbum(img, nil, NULL, NULL);
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            s.shutterBtn.enabled = YES;
+            s.shutterBtn.alpha = 1.0;
+            if (jpgPath.length) {
+                SWToast(s.view, [NSString stringWithFormat:@"Saved %@", jpgPath.lastPathComponent]);
+            } else {
+                SWToast(s.view, [NSString stringWithFormat:@"Capture: %@", resp ?: @"timeout"]);
+            }
+        });
+    });
+}
+
+@end
 
 #pragma mark - Log viewer
 
@@ -1742,12 +2121,14 @@ static NSString *SWSaveSnapshot(NSString *text) {
     [super viewDidAppear:animated];
     if (!self.shownRootWarning && geteuid() != 0) {
         self.shownRootWarning = YES;
-        [self alertTitle:@"Not running as root"
-                 message:[NSString stringWithFormat:
-                          @"uid=%d euid=%d. Writing sysctl values, SSH/daemon control and reboot will fail.\n\n"
-                          @"Fix: chown root:wheel + chmod 6755 on the app binary (make install does this), "
-                          @"and make sure /Applications is not mounted nosuid.",
-                          (int)getuid(), (int)geteuid()]];
+        int e = 0;
+        if (!SWToolsdCall(@"PING\n", &e)) {
+            [self alertTitle:@"Not running as root & toolsd offline"
+                     message:[NSString stringWithFormat:
+                              @"uid=%d euid=%d and /var/run/sapphire-toolsd.sock is not responding (%@).\n\n"
+                              @"Fix: install SapphireTools.deb (starts com.sapphire.toolsd as root).",
+                              (int)getuid(), (int)geteuid(), SWErrText(e)]];
+        }
     }
 }
 
@@ -2067,6 +2448,14 @@ static NSString *SWSaveSnapshot(NSString *text) {
         toSection:SecAccess action:nil];
 
     // ---------- Tools ----------
+    UITableViewCell *camCell = [self buttonCellWithTitle:@"Open Sapphire Camera (camd)" color:UIColor.systemGreenColor];
+    camCell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    [self addCell:camCell toSection:SecTools action:^{
+        SWCameraViewController *cvc = [[SWCameraViewController alloc] init];
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:cvc];
+        nav.modalPresentationStyle = UIModalPresentationFullScreen;
+        [ws presentViewController:nav animated:YES completion:nil];
+    }];
     UITableViewCell *explorer = [self buttonCellWithTitle:@"Sysctl Explorer (kern.sweet_*)" color:blue];
     explorer.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     [self addCell:explorer toSection:SecTools action:^{
