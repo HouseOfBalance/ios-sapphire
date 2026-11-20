@@ -5,7 +5,7 @@
  * safely to bridge camd's zero-copy IOSurface frames into Apple's mediaserverd pipeline.
  */
 #include <CoreFoundation/CoreFoundation.h>
-#include <IOSurface/IOSurface.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <objc/message.h>

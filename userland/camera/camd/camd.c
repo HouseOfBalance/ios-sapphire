@@ -31,7 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <CoreFoundation/CoreFoundation.h>
-#include <IOSurface/IOSurface.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -871,7 +871,7 @@ ensure_pv_surface(unsigned slot, int ow, int oh, long stride)
 	CFNumberRef nPF = CFNumberCreate(NULL, kCFNumberIntType, &pf);
 	const void *keys[6] = {
 		kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement,
-		kIOSurfaceBytesPerRow, kIOSurfacePixelFormat, kIOSurfaceIsGlobal
+		kIOSurfaceBytesPerRow, kIOSurfacePixelFormat, CFSTR("IOSurfaceIsGlobal")
 	};
 	const void *vals[6] = { nW, nH, nBPE, nBPR, nPF, kCFBooleanTrue };
 	CFDictionaryRef props = CFDictionaryCreate(NULL, keys, vals, 6, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
