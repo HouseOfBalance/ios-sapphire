@@ -1829,16 +1829,106 @@ static NSString *SWFilterLogLines(NSArray<NSString *> *allLines, NSArray<NSStrin
             [list addObject:makeItem(@"Thermal & Sensors", st, sum, info, @[@"THERMAL", @"SENSOR"])];
         }
 
-        // 11. SSH & Jailbreak
+        // 11. SSH & Jailbreak -> split into Storage, Jailbreak & Tweaks, SSH Server, USB Networking, Battery, Brightness, Sleep, Calls/SMS, Camera
+
+        // 11. Brightness & Backlight
+        {
+            BOOL hasBl = ([bootargs rangeOfString:@"sweetbl=1"].location != NSNotFound);
+            BOOL hasBlLog = [SWFilterLogLines(logLines, @[@"SWEET BL", @"AppleARMBacklight"]) rangeOfString:@"No matching"].location == NSNotFound;
+            SWHealthState st = (hasBl && hasBlLog) ? SWHealthGreen : (hasBl ? SWHealthYellow : SWHealthRed);
+            NSString *sum = hasBl ? (hasBlLog ? @"Backlight active (sweetbl=1)" : @"Enabled, no log yet") : @"Disabled (sweetbl=0)";
+            NSString *info = [NSString stringWithFormat:@"boot-arg sweetbl=1: %@", hasBl ? @"Yes" : @"No"];
+            [list addObject:makeItem(@"Brightness & Backlight", st, sum, info, @[@"SWEET BL", @"AppleARMBacklight", @"DCS 0x51"])];
+        }
+
+        // 12. Screen Sleep & Tap-to-Wake
+        {
+            long long tw = -1, tws = 0;
+            BOOL hasTw = [SWSysctl getInteger:&tw name:kSysTapWake errnoOut:nil];
+            [SWSysctl getInteger:&tws name:@"kern.sweet_tap_wakes" errnoOut:nil];
+            SWHealthState st = (hasTw && tw > 0) ? SWHealthGreen : (hasTw ? SWHealthYellow : SWHealthRed);
+            NSString *sum = hasTw ? [NSString stringWithFormat:@"tap_wake=%lld, wakes=%lld", tw, tws] : @"Unavailable";
+            NSString *info = [NSString stringWithFormat:@"kern.sweet_tap_wake: %@\nkern.sweet_tap_wakes: %lld",
+                              hasTw ? [@(tw) stringValue] : @"N/A", tws];
+            [list addObject:makeItem(@"Screen Sleep & Wake", st, sum, info, @[@"tap to wake", @"RequestPowerChange", @"panel display"])];
+        }
+
+        // 13. Battery & Charging
+        {
+            long long soc = -1, chg = -1;
+            BOOL hasBat = [SWSysctl getInteger:&soc name:@"kern.hakios.battery_soc" errnoOut:nil];
+            [SWSysctl getInteger:&chg name:@"kern.hakios.battery_charging" errnoOut:nil];
+            BOOL hasBatLog = [SWFilterLogLines(logLines, @[@"BATTERY", @"QG", @"FG"]) rangeOfString:@"No matching"].location == NSNotFound;
+            SWHealthState st = hasBat ? SWHealthGreen : (hasBatLog ? SWHealthYellow : SWHealthRed);
+            NSString *sum = hasBat ? [NSString stringWithFormat:@"%lld%% (%@)", soc, chg > 0 ? @"Charging" : @"Discharging"]
+                                   : (hasBatLog ? @"Kernel log only (no sysctl)" : @"Battery driver N/A");
+            NSString *info = [NSString stringWithFormat:@"battery_soc: %@\ncharging: %@",
+                              hasBat ? [@(soc) stringValue] : @"N/A", chg >= 0 ? [@(chg) stringValue] : @"N/A"];
+            [list addObject:makeItem(@"Battery & Charging", st, sum, info, @[@"BATTERY", @"QG", @"charger"])];
+        }
+
+        // 14. Calls & SMS (CommCenter)
+        {
+            pid_t cc = SWFindPid(@"CommCenter");
+            pid_t im = SWFindPid(@"imagent");
+            SWHealthState st = (cc > 0 && im > 0) ? SWHealthGreen : (cc > 0 ? SWHealthYellow : SWHealthRed);
+            NSString *sum = [NSString stringWithFormat:@"CommCenter: %@, imagent: %@", cc > 0 ? @"ON" : @"off", im > 0 ? @"ON" : @"off"];
+            NSString *info = [NSString stringWithFormat:@"CommCenter PID: %d\nimagent PID: %d", (int)cc, (int)im];
+            [list addObject:makeItem(@"Calls, SMS & IMEI", st, sum, info, @[@"CommCenter", @"MODEM", @"QMI"])];
+        }
+
+        // 15. Camera
+        {
+            pid_t cam = SWFindPid(@"cameracaptured");
+            if (cam <= 0) cam = SWFindPid(@"applecamerad");
+            SWHealthState st = cam > 0 ? SWHealthGreen : SWHealthRed;
+            NSString *sum = cam > 0 ? [NSString stringWithFormat:@"Camera daemon ON (%d)", (int)cam] : @"Camera daemon not running";
+            NSString *info = [NSString stringWithFormat:@"cameracaptured/applecamerad PID: %d", (int)cam];
+            [list addObject:makeItem(@"Camera", st, sum, info, @[@"CAMERA", @"ISP", @"CSI"])];
+        }
+
+        // 16. Storage Free Space
+        {
+            NSDictionary *attrs = [NSFileManager.defaultManager attributesOfFileSystemForPath:@"/" error:nil];
+            unsigned long long freeB = [attrs[NSFileSystemFreeSize] unsignedLongLongValue];
+            unsigned long long totalB = [attrs[NSFileSystemSize] unsignedLongLongValue];
+            double freeGB = freeB / (1024.0 * 1024.0 * 1024.0);
+            double totalGB = totalB / (1024.0 * 1024.0 * 1024.0);
+            SWHealthState st = freeGB >= 2.0 ? SWHealthGreen : (freeGB >= 0.5 ? SWHealthYellow : SWHealthRed);
+            NSString *sum = [NSString stringWithFormat:@"%.1f GB free / %.1f GB total", freeGB, totalGB];
+            NSString *info = [NSString stringWithFormat:@"Free bytes: %llu\nTotal bytes: %llu", freeB, totalB];
+            [list addObject:makeItem(@"Storage Space", st, sum, info, @[@"UFS", @"HFS", @"ufsroot"])];
+        }
+
+        // 17. Jailbreak & Tweaks
+        {
+            BOOL hasJB = (access("/var/jb", F_OK) == 0);
+            BOOL hasTweak = (access("/var/jb/usr/lib/TweakInject", F_OK) == 0);
+            SWHealthState st = (hasJB && hasTweak) ? SWHealthGreen : (hasJB ? SWHealthYellow : SWHealthRed);
+            NSString *sum = (hasJB && hasTweak) ? @"Procursus + TweakInject OK" : (hasJB ? @"/var/jb OK, no TweakInject" : @"No /var/jb");
+            NSString *info = [NSString stringWithFormat:@"/var/jb: %@\nTweakInject: %@\nuid=%d euid=%d",
+                              hasJB ? @"Present" : @"Missing", hasTweak ? @"Present" : @"Missing", (int)getuid(), (int)geteuid()];
+            [list addObject:makeItem(@"Jailbreak & Tweaks", st, sum, info, @[@"ElleKit", @"TweakInject", @"Sileo", @"jb"])];
+        }
+
+        // 18. SSH Server
         {
             pid_t ssh = SWFindPid(@"sshd");
             if (ssh <= 0) ssh = SWFindPid(@"dropbear");
-            BOOL hasJB = (access("/var/jb", F_OK) == 0);
-            SWHealthState st = (hasJB && ssh > 0) ? SWHealthGreen : (hasJB ? SWHealthYellow : SWHealthRed);
-            NSString *sum = hasJB ? (ssh > 0 ? [NSString stringWithFormat:@"JB OK, SSH ON (%d)", (int)ssh] : @"JB OK, SSH off") : @"No /var/jb";
-            NSString *info = [NSString stringWithFormat:@"/var/jb: %@\nSSH PID: %d\nuid=%d euid=%d",
-                              hasJB ? @"Present" : @"Missing", (int)ssh, (int)getuid(), (int)geteuid()];
-            [list addObject:makeItem(@"SSH & Jailbreak", st, sum, info, @[@"sshd", @"dropbear", @"jb", @"ElleKit"])];
+            NSString *ip = SWWiFiIP();
+            SWHealthState st = ssh > 0 ? SWHealthGreen : SWHealthRed;
+            NSString *sum = ssh > 0 ? [NSString stringWithFormat:@"ON (pid %d) • %@", (int)ssh, ip] : @"SSH daemon off";
+            NSString *info = [NSString stringWithFormat:@"SSH PID: %d\nWi-Fi IP: %@", (int)ssh, ip];
+            [list addObject:makeItem(@"SSH Server", st, sum, info, @[@"sshd", @"dropbear", @"ssh"])];
+        }
+
+        // 19. USB Networking
+        {
+            BOOL hasUsb = ([bootargs rangeOfString:@"sweetusb=2"].location != NSNotFound);
+            SWHealthState st = hasUsb ? SWHealthGreen : SWHealthRed;
+            NSString *sum = hasUsb ? @"CDC-ECM enabled (sweetusb=2)" : @"Disabled";
+            NSString *info = [NSString stringWithFormat:@"boot-arg sweetusb=2: %@", hasUsb ? @"Yes" : @"No"];
+            [list addObject:makeItem(@"USB Networking", st, sum, info, @[@"SWEET USB", @"DWC3", @"CDC-ECM"])];
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
