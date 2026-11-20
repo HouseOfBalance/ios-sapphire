@@ -159,6 +159,10 @@ python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.arg
     "$I/../userland/dualboot/out/Android.ipa" "$T/ipa"
 mv "$T/ipa/Payload/Android.app" "$R/Applications/"
 chmod 755 "$R/Applications/Android.app/Android"
+if [ -f "$R/Applications/SapphireTools.app/SapphireTools" ]; then
+    chown 0:0 "$R/Applications/SapphireTools.app/SapphireTools" 2>/dev/null || true
+    chmod 6755 "$R/Applications/SapphireTools.app/SapphireTools"
+fi
 rm -rf "$T/ipa"
 
 # 9. Generate launchd plists from recipes
