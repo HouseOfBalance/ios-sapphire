@@ -735,7 +735,7 @@ attach_live_layer_to_preview(id previewView)
 		Class layerCls = objc_getClass("CALayer");
 		g_cam_live_layer = ((id (*)(Class, SEL))objc_msgSend)(layerCls, sel_registerName("layer"));
 		((id (*)(id, SEL))objc_msgSend)(g_cam_live_layer, sel_registerName("retain"));
-		((void (*)(id, SEL, id))objc_msgSend)(g_cam_live_layer, sel_registerName("setContentsGravity:"), (id)kCAGravityResizeAspectFill);
+		((void (*)(id, SEL, id))objc_msgSend)(g_cam_live_layer, sel_registerName("setContentsGravity:"), (id)CFSTR("resizeAspectFill"));
 		((void (*)(id, SEL, BOOL))objc_msgSend)(g_cam_live_layer, sel_registerName("setMasksToBounds:"), YES);
 	}
 	if (g_cam_preview_host != previewView) {
