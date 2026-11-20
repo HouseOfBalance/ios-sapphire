@@ -47,6 +47,11 @@ jobs:
           SDK="$SDK_PATH" LDID="$LDID_BIN" CLANG="clang" bash build.sh ../../obj
           cd ../..
 
+          echo "Building camd & camctl..."
+          cd camera/camd
+          SDK="$SDK_PATH" LDID="$LDID_BIN" CLANG="clang" bash build.sh ../../obj
+          cd ../..
+
           # 2. Build btmonitor & daemons
           echo "Building btmonitor..."
           clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/btmonitor bluetooth/btmonitor.c
