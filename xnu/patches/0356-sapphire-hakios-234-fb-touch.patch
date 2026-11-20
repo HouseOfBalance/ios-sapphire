@@ -1,0 +1,343 @@
+From a31f388361f89eb9c729d484d7501b0ac3701b5a Mon Sep 17 00:00:00 2001
+From: Sapphire Port <sapphire@xiaomi>
+Date: Fri, 20 Nov 2026 10:52:49 +0700
+Subject: [PATCH] sapphire: integrate HakiOS 2.3.4 framebuffer
+ triple-buffering, scale2 fix, and faster touch response
+
+---
+ bsd/dev/sweet_touch.c                 | 73 +++++++++++++++++++++++--
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 79 ++++++++++++++++++---------
+ 2 files changed, 120 insertions(+), 32 deletions(-)
+
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index b52e799..b7b357f 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -644,15 +644,70 @@ touch_tap_wake_check(uint32_t mask, const int *x, const int *y)
+ 	sweet_hid_key(0, 0);
+ }
+ 
++/*
++ * HakiOS 2.3.4 (a3975b6): stroke latency summary, logged every 8 strokes (first move after down,
++ * inter-move gaps, and lift after last move).
++ */
++static struct {
++	uint64_t last;
++	uint32_t strokes, moves, firsts, slow_moves, longest_move, first_sum, first_longest, lift_sum, lift_longest;
++	unsigned finger;
++	bool down, moved;
++} touch_feel;
++
++static void
++touch_feel_add(bool is_down, bool is_up, unsigned finger, uint64_t now)
++{
++	uint64_t nanos;
++	uint32_t ms;
++
++	if (is_down && !touch_feel.down) {
++		touch_feel.down = true;
++		touch_feel.moved = false;
++		touch_feel.finger = finger;
++		touch_feel.last = now;
++		return;
++	}
++	if (!touch_feel.down || finger != touch_feel.finger) {
++		return;
++	}
++	absolutetime_to_nanoseconds(now - touch_feel.last, &nanos);
++	ms = (uint32_t)(nanos / NSEC_PER_MSEC);
++	touch_feel.last = now;
++	if (is_up) {
++		touch_feel.down = false;
++		touch_feel.strokes++;
++		touch_feel.lift_sum += ms;
++		touch_feel.lift_longest = ms > touch_feel.lift_longest ? ms : touch_feel.lift_longest;
++		if ((touch_feel.strokes % 8u) == 0) {
++			printf("SWEET TOUCH: %u strokes: first move after %u ms on average, %u at most; %u moves, %u of them over 13 ms apart, %u at most; "
++			    "the lift %u ms after the last move on average, %u at most\n", touch_feel.strokes,
++			    touch_feel.firsts != 0 ? touch_feel.first_sum / touch_feel.firsts : 0, touch_feel.first_longest, touch_feel.moves,
++			    touch_feel.slow_moves, touch_feel.longest_move, touch_feel.lift_sum / touch_feel.strokes, touch_feel.lift_longest);
++		}
++	} else if (!touch_feel.moved) {
++		touch_feel.moved = true;
++		touch_feel.firsts++;
++		touch_feel.first_sum += ms;
++		touch_feel.first_longest = ms > touch_feel.first_longest ? ms : touch_feel.first_longest;
++	} else {
++		touch_feel.moves++;
++		touch_feel.slow_moves += ms > 13;
++		touch_feel.longest_move = ms > touch_feel.longest_move ? ms : touch_feel.longest_move;
++	}
++}
++
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
++	uint64_t now = mach_absolute_time();
+ 	touch_fod(mask, x, y);
+ 	touch_tap_wake_check(mask, x, y);
+ 	for (unsigned id = 0; id < TOUCH_MAX; ++id) {
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+ 			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++				touch_feel_add(!(st.active & bit), false, id, now);
+ 				sweet_hid_touch((int)id, 1, x[id], y[id]);
+ 				st.s_down++;
+ 				st.s_lastx = x[id];
+@@ -661,6 +716,7 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 			st.x[id] = x[id];
+ 			st.y[id] = y[id];
+ 		} else if (st.active & bit) {
++			touch_feel_add(false, true, id, now);
+ 			sweet_hid_touch((int)id, 0, st.x[id], st.y[id]);
+ 			st.s_up++;
+ 		}
+@@ -735,6 +791,10 @@ touch_focaltech(void)
+ 	if (err) {
+ 		return err;
+ 	}
++	/* HakiOS 2.3.4 (81b5dd2): ignore 0xff 0xff 0xff non-reports instead of releasing or logging EIO */
++	if (buf[1] == 0xffu && buf[2] == 0xffu && buf[3] == 0xffu) {
++		return 0;
++	}
+ 	/* 0312: how often the IC really has a new frame while a contact is down (kern.sweet_touch_rate) */
+ 	{
+ 		static uint64_t prev;
+@@ -1048,10 +1108,10 @@ touch_thread(void *arg, wait_result_t result)
+ 	 * With no finger down, 10 ms as before.
+ 	 */
+ 	nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &period_down);
+-	nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &period_up);
++	nanoseconds_to_absolutetime(8 * NSEC_PER_MSEC, &period_up);
+ 	uint64_t period_fast, late_after, last_read = 0;
+ 	nanoseconds_to_absolutetime(500 * NSEC_PER_USEC, &period_fast);
+-	nanoseconds_to_absolutetime(6 * NSEC_PER_MSEC, &late_after);
++	nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &late_after);
+ 	while (!st.dead) {
+ 		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
+ 			panic("SWEET TOUCH stats: frames=%u errs=%u lasterr=%d maxn=%u hid down=%u up=%u last=%d,%d | "
+@@ -1061,7 +1121,11 @@ touch_thread(void *arg, wait_result_t result)
+ 			    st.s_raw[3], st.s_raw[4], st.s_raw[5], st.s_raw[6], st.s_raw[7],
+ 			    st.s_raw[8], st.s_raw[9], st.s_raw[10], st.s_raw[11]);
+ 		}
+-		/* Optional IRQ hint still reads every 100ms, and always while down. */
++		/*
++		 * HakiOS 2.3.4 (81b5dd2): while a finger is down, read on every 4 ms tick regardless of
++		 * GPIO80 IRQ so finger lift is detected in ~4-5 ms instead of waiting 30-169 ms for
++		 * touch_quiet_ms. When idle, read on IRQ or every 16 ms (2 ticks of 8 ms).
++		 */
+ 		bool fast = touch_fast && st.irq_hint && st.kind == TOUCH_FTS && st.active;
+ 		bool irq_low = st.irq_hint && !(touch_rd(st.west, TOUCH_GPIO_IO(TOUCH_PIN_IRQ)) & 1u);
+ 		if (irq_low) {
+@@ -1069,7 +1133,6 @@ touch_thread(void *arg, wait_result_t result)
+ 		}
+ 		bool want;
+ 		if (fast) {
+-			/* 0313: as soon as the IC has a frame, or 6 ms after the last read anyway */
+ 			uint64_t t = mach_absolute_time();
+ 			want = irq_low || t - last_read >= late_after;
+ 			if (want) {
+@@ -1080,7 +1143,7 @@ touch_thread(void *arg, wait_result_t result)
+ 				}
+ 			}
+ 		} else {
+-			want = !st.irq_hint || st.active || irq_low || (++ticks % 10u) == 0;
++			want = !st.irq_hint || st.active || irq_low || (++ticks % 2u) == 0;
+ 		}
+ 		if (want) {
+ 			last_read = mach_absolute_time();
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 76242aa..8311e78 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -174,6 +174,8 @@ static int sweet_fb_flipflush = 0;
+ static int sweet_fb_rscale = 1000;
+ static uint32_t sweet_fb_ids[4];
+ static unsigned sweet_fb_ids_next;
++static uint32_t sweet_fb_surface_id;
++#define SWEET_FB_FLIPS          3
+ #define SWEET_FB_LOW_SIZE       0x03000000ull
+ static uint64_t sweet_fb_low_used;
+ 
+@@ -268,15 +270,24 @@ public:
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 	/* topaz fade: cached copy of the last frame and a contiguous output frame */
+ 	IOBufferMemoryDescriptor *fFadeOrig;
+-	/* kernel-drawn frames (console, fade) are double buffered like iOS's:
+-	 * built in the back buffer, then the MDP flips to it at vsync */
+-	SweetLowBuf  *fFlip[2];
+-	uint64_t      fFlipPhys[2];
++	/* kernel-drawn frames (console, fade) and GPU blits are triple buffered in the 48 MB
++	 * low-DDR pool (SWEET_FB_FLIPS = 3): one scanned out, one waiting for GPU copy, one free */
++	SweetLowBuf  *fFlip[SWEET_FB_FLIPS];
++	uint64_t      fFlipPhys[SWEET_FB_FLIPS];
+ 	uint32_t      fFlipIdx;
++	uint32_t      fFlipWaitIdx;
+ 	bool          fConsShown;     /* console frames on the panel (no iOS frame yet) */
+ 	void          flipFrom(const uint8_t *src, uint32_t srcStride);
+ 	void          splashEnd(void);
+-	uint8_t      *backBuffer(void) { return (uint8_t *)fFlip[fFlipIdx ^ 1]->getBytesNoCopy(); }
++	uint32_t      nextFlipIdx(void) const {
++		uint32_t base = fFlipWait ? fFlipWaitIdx : fFlipIdx;
++		uint32_t next = (base + 1) % SWEET_FB_FLIPS;
++		if (next == fFlipIdx) {
++			next = (next + 1) % SWEET_FB_FLIPS;
++		}
++		return next;
++	}
++	uint8_t      *backBuffer(void) { return (uint8_t *)fFlip[nextFlipIdx()]->getBytesNoCopy(); }
+ 	void          flipBack(void);
+ 	bool          fFlipWait;      /* 0235: the back buffer waits for the GPU's copy before the MDP is pointed at it */
+ 	bool          flipWhenCopied(bool wait);
+@@ -593,15 +604,20 @@ AppleCLCD::start(IOService *provider)
+ 		    fBootSrc, fBootStride);
+ 		sweet_scanout_set_geometry(fWidth, fHeight, fLogicalW, fLogicalH);
+ 		vm_size_t fsz = (vm_size_t)fRowBytes * fHeight;
+-		for (int i = 0; i < 2; i++) {
++		bool flipOk = true;
++		for (int i = 0; i < SWEET_FB_FLIPS; i++) {
+ 			fFlip[i] = SweetLowBuf::alloc(fsz);
+ 			fFlipPhys[i] = fFlip[i] ? fFlip[i]->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
++			if (fFlip[i] == NULL) {
++				flipOk = false;
++			}
+ 		}
+ 		fFadeOrig = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, fsz, page_size);
+ 		fCons = SweetLowBuf::alloc(fsz);
+-		if (fFlip[0] == NULL || fFlip[1] == NULL || fFadeOrig == NULL) {
+-			OSSafeReleaseNULL(fFlip[0]);
+-			OSSafeReleaseNULL(fFlip[1]);
++		if (!flipOk || fFadeOrig == NULL) {
++			for (int i = 0; i < SWEET_FB_FLIPS; i++) {
++				OSSafeReleaseNULL(fFlip[i]);
++			}
+ 			OSSafeReleaseNULL(fFadeOrig);
+ 			OSSafeReleaseNULL(fCons);
+ 		}
+@@ -1384,7 +1400,7 @@ AppleCLCD::flipWhenCopied(bool wait)
+ 		}
+ 		IODelay(10);
+ 	}
+-	uint32_t idx = fFlipIdx ^ 1;
++	uint32_t idx = fFlipWaitIdx;
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
+ 	fFlipIdx = idx;
+ 	fFlipWait = false;
+@@ -1395,7 +1411,7 @@ AppleCLCD::flipWhenCopied(bool wait)
+ void
+ AppleCLCD::flipBack(void)
+ {
+-	uint32_t idx = fFlipIdx ^ 1;
++	uint32_t idx = nextFlipIdx();
+ 	sweet_dcache_clean((vm_offset_t)(uintptr_t)fFlip[idx]->getBytesNoCopy(), (unsigned)fFlip[idx]->getLength());
+ 	scanFrom(fFlipPhys[idx], fRowBytes);
+ 	fFlipIdx = idx;
+@@ -1635,18 +1651,20 @@ AppleCLCD::present(const uint8_t *rec)
+ 	 * contiguous, already mapped in the GPU, and write-combined for the CPU, so the GPU's
+ 	 * writes need no invalidate.
+ 	 */
+-	bool gpu_frame = nlayers == 1 && sweet_fb_gpucopy_on() && sapphire_gpu_ready();
++	bool gpu_avail = sweet_fb_gpucopy_on() && sapphire_gpu_ready();
++	bool gpu_frame = nlayers == 1 && gpu_avail;
+ 	bool gpu_used = false;
+ 
+ 	/*
+-	 * 0235: the last GPU copy, landed, goes on the panel first. A frame the CPU composes waits for
+-	 * it (it writes the same back buffer); one the GPU copies is queued behind it, in order, and the
+-	 * flip of both waits for the newer copy.
++	 * 0235/0356: flip the last GPU copy if it has landed. With triple buffering (SWEET_FB_FLIPS=3),
++	 * a GPU frame can blit into the third buffer without stalling on the previous copy's fence;
++	 * CPU frames still wait for the pending copy first.
+ 	 */
+ 	if (fFlip[0] != NULL) {
+-		(void)flipWhenCopied(true);
++		(void)flipWhenCopied(!gpu_avail);
+ 	}
+-	uint8_t *dst = fFlip[0] != NULL ? backBuffer() : (uint8_t *)fPixels;
++	uint32_t dstIdx = fFlip[0] != NULL ? nextFlipIdx() : 0;
++	uint8_t *dst = fFlip[0] != NULL ? (uint8_t *)fFlip[dstIdx]->getBytesNoCopy() : (uint8_t *)fPixels;
+ 	if (fFlip[0] == NULL && fVig0 != NULL && fScanPhys != fBootSrc) {
+ 		scanFrom(fBootSrc, fBootStride);
+ 	}
+@@ -1696,9 +1714,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 			 */
+ 			static uint32_t scale_told;
+ 			bool shown = false;
+-			if (gpu_frame && bpe == 4 && src != 0 && s->width >= fLogicalW && s->height >= fLogicalH &&
++			if (gpu_avail && bpe == 4 && src != 0 && s->width >= fLogicalW && s->height >= fLogicalH &&
+ 			    s->elementWidth == 1 && s->elementHeight == 1 && s->memory != NULL) {
+-				uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[fFlipIdx ^ 1] : fPhys;
++				uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[dstIdx] : fPhys;
+ 				uint32_t seed_now = s->state != NULL ? *(volatile uint32_t *)((uint8_t *)s->state->getBytesNoCopy() + 0xc) : 0;
+ 				if (!(s->gpuDrawn && seed_now == s->gpuSeed)) {
+ 					sweet_dcache_clean((vm_offset_t)(src + s->offset), (unsigned)((uint64_t)s->height * s->bytesPerRow));
+@@ -1708,6 +1726,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 				uint64_t kx = ((uint64_t)fLogicalW << 8) * (uint64_t)rs / 1000, ky = ((uint64_t)fLogicalH << 8) * (uint64_t)rs / 1000;
+ 				{
+ 					uint32_t sid = s->id;
++					if (layer == 0) {
++						sweet_fb_surface_id = sid;
++					}
+ 					bool known = false;
+ 					for (unsigned i = 0; i < 4; i++) {
+ 						known |= sweet_fb_ids[i] == sid;
+@@ -1727,15 +1748,12 @@ AppleCLCD::present(const uint8_t *rec)
+ 					gpu_used = true;
+ 				}
+ 			}
+-			if (shown) {
+-				s->release();
+-				continue;
+-			}
+-			if (scale_told++ < 8) {
+-				IOLog("SWEET FB: 2x frame CPU fallback (layers %u, gpu %d, surface %ux%u bpe %u)\n", nlayers, gpu_frame,
++			if (!shown && scale_told++ < 8) {
++				IOLog("SWEET FB: 2x frame skipped (layers %u, gpu %d, surface %ux%u bpe %u)\n", nlayers, gpu_avail,
+ 				    s->width, s->height, bpe);
+ 			}
+-			/* Fall through to CPU copy path below so multi-layer or pre-GPU frames are not dropped */
++			s->release();
++			continue;
+ 		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+@@ -1780,7 +1798,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		if (src != 0 && bpe == 4 && gpu_frame) {
+ 			uint64_t soff = s->offset + (uint64_t)sy * s->bytesPerRow + (uint64_t)sx * 4;
+-			uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[fFlipIdx ^ 1] : fPhys;
++			uint64_t dbase = fFlip[0] != NULL ? fFlipPhys[dstIdx] : fPhys;
+ 			uint64_t t0 = mach_absolute_time();
+ 			/*
+ 			 * sapphire 0151: a surface the GPU drew (msm client) and nobody locked since -- its seed
+@@ -1826,6 +1844,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		 * (0235: flipWhenCopied(), at the next swap or vsync tick), no clean
+ 		 */
+ 		if (fFlip[0] != NULL) {
++			fFlipWaitIdx = dstIdx;
+ 			fFlipWait = true;
+ 		}
+ 		if (sweet_fb_stats_on()) {
+@@ -1834,6 +1853,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		return true;
+ 	}
++	if (fScale2) {
++		/* Never flip to an unwritten/stale back buffer in scale2 mode */
++		return false;
++	}
+ 	if (fFlip[0] != NULL) {
+ 		flipBack();
+ 		fFlipWait = false;      /* (this frame, the CPU's, replaces one still waiting for its copy) */
+@@ -2378,6 +2401,8 @@ sweet_fb_ids_sysctl SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_ids_sysctl, "S", "0321: the IOSurface ids swapped onto the panel lately");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_surface, CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    &sweet_fb_surface_id, 0, "0356: the IOSurface id last presented on layer 0");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flipflush, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flipflush, 0,
+     "sapphire 0304: 1 = flush the whole flip buffer after each 2x GPU copy (as before)");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_await, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+-- 
+2.56.0.windows.4
+

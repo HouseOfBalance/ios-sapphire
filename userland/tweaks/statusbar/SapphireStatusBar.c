@@ -11,10 +11,13 @@
  */
 #include <objc/runtime.h>
 #include <objc/message.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef Class (*subclass_fn)(id, SEL, id, id);
 static subclass_fn original;
+static Class status_bar_split;
 
 static Class
 subclass_for_screen(id self, SEL selector, id screen, id info)
@@ -23,7 +26,7 @@ subclass_for_screen(id self, SEL selector, id screen, id info)
 	const char *name = chosen != Nil ? class_getName(chosen) : NULL;
 
 	if (chosen == Nil || (name != NULL && strstr(name, "Fallback") != NULL)) {
-		Class x = objc_getClass("_UIStatusBarVisualProvider_Split1125");
+		Class x = status_bar_split != Nil ? status_bar_split : objc_getClass("_UIStatusBarVisualProvider_Split1125");
 		if (x != Nil) {
 			return x;
 		}
@@ -31,9 +34,65 @@ subclass_for_screen(id self, SEL selector, id screen, id info)
 	return chosen;
 }
 
+static id
+status_bar_fallback_alloc(id self __attribute__((unused)), SEL selector)
+{
+	return ((id (*)(Class, SEL))objc_msgSend)(status_bar_split, selector);
+}
+
+static id
+status_bar_fallback_alloc_zone(id self __attribute__((unused)), SEL selector, void *zone)
+{
+	return ((id (*)(Class, SEL, void *))objc_msgSend)(status_bar_split, selector, zone);
+}
+
+/*
+ * HakiOS 2.3.4: hooking +visualProviderSubclassForScreen:visualProviderInfo: alone still left the
+ * fallback provider in some UIKit paths (white band / red rdar://45025538 bar). Replace
+ * _UIStatusBarVisualProvider_Fallback's class methods and alloc/allocWithZone: with Split1125.
+ */
+static void
+status_bar_fallback_is_split(void)
+{
+	Class fallback = objc_getClass("_UIStatusBarVisualProvider_Fallback");
+	status_bar_split = objc_getClass("_UIStatusBarVisualProvider_Split1125");
+	if (fallback == Nil || status_bar_split == Nil) {
+		return;
+	}
+	Class chain[8];
+	unsigned depth = 0;
+
+	for (Class c = status_bar_split; c != Nil && depth < 8; c = class_getSuperclass(c)) {
+		bool common = false;
+		for (Class f = fallback; f != Nil; f = class_getSuperclass(f)) {
+			common = common || f == c;
+		}
+		if (common) {
+			break;
+		}
+		chain[depth++] = c;
+	}
+	while (depth-- > 0) {
+		unsigned count = 0;
+		Method *methods = class_copyMethodList(object_getClass(chain[depth]), &count);
+		for (unsigned i = 0; i < count; i++) {
+			const char *name = sel_getName(method_getName(methods[i]));
+			if (strcmp(name, "load") != 0 && strcmp(name, "initialize") != 0 &&
+			    strcmp(name, "alloc") != 0 && strcmp(name, "allocWithZone:") != 0) {
+				class_replaceMethod(object_getClass(fallback), method_getName(methods[i]),
+				    method_getImplementation(methods[i]), method_getTypeEncoding(methods[i]));
+			}
+		}
+		free(methods);
+	}
+	class_replaceMethod(object_getClass(fallback), sel_registerName("alloc"), (IMP)status_bar_fallback_alloc, "@16@0:8");
+	class_replaceMethod(object_getClass(fallback), sel_registerName("allocWithZone:"), (IMP)status_bar_fallback_alloc_zone, "@24@0:8^v16");
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
+	status_bar_fallback_is_split();
 	Class provider = objc_getClass("_UIStatusBarVisualProvider_iOS");
 	SEL selector = sel_registerName("visualProviderSubclassForScreen:visualProviderInfo:");
 	Method method = provider != Nil ? class_getClassMethod(provider, selector) : NULL;

@@ -1,0 +1,5 @@
+# Per-device Metal settings for Xiaomi Redmi Note 13 4G (sapphire / SM6225 / Adreno 610)
+# Installed to /var/tmp/metal.args
+# HakiOS 2.3.4: each port keeps its own Metal settings.
+metal_defer=1
+metal_gmem=0
