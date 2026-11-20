@@ -13,14 +13,17 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+extern char **environ;
 extern int reboot(int howto);
 #ifndef RB_AUTOBOOT
 #define RB_AUTOBOOT 0
@@ -105,9 +108,16 @@ static void handle_client(int fd) {
         while ((tok = strsep(&p, " ")) != NULL) {
             if (*tok == '\0') continue;
             if (!allowed_proc(tok)) continue;
-            char cmd[128];
-            snprintf(cmd, sizeof(cmd), "/usr/bin/killall -9 %s 2>/dev/null || /var/jb/usr/bin/killall -9 %s 2>/dev/null", tok, tok);
-            system(cmd);
+            const char *bins[] = { "/usr/bin/killall", "/var/jb/usr/bin/killall", "/bin/killall", NULL };
+            for (int i = 0; bins[i]; i++) {
+                if (access(bins[i], X_OK) != 0) continue;
+                pid_t pid = 0;
+                char *argv[] = { "killall", "-9", tok, NULL };
+                if (posix_spawn(&pid, bins[i], NULL, NULL, argv, environ) == 0) {
+                    int st = 0;
+                    waitpid(pid, &st, 0);
+                }
+            }
         }
         write(fd, "OK\n", 3);
     } else if (strcmp(buf, "REBOOT") == 0) {
