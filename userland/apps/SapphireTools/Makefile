@@ -1,4 +1,4 @@
-# SapphireTools — build bang clang + iOS SDK (Linux/macOS), ky bang ldid.
+# SapphireTools v2 — build bang clang + iOS SDK (Linux/macOS), ky bang ldid.
 #
 #   make                         build ra build/SapphireTools.app
 #   make install DESTDIR=/path   chep vao <DESTDIR>/Applications (staging rootfs), chmod 6755 binary
@@ -10,6 +10,7 @@
 #   CLANG=clang                       (vi du: CLANG=/opt/llvm/bin/clang)
 #   EXTRA_CFLAGS / EXTRA_LDFLAGS      (vi du: EXTRA_LDFLAGS=-fuse-ld=/opt/cctools/bin/arm64-apple-darwin-ld)
 #   LDID=ldid
+#   FULL_ROOT=1                       (them -DSW_FULL_ROOT: setuid(0) day du, xem main())
 
 APP_NAME    := SapphireTools
 BUILD_DIR   := build
@@ -25,9 +26,13 @@ DEVICE      ?= root@192.168.1.100
 
 CFLAGS      := -target $(TARGET) -isysroot $(SDK) -fobjc-arc -O2 \
 	           -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations $(EXTRA_CFLAGS)
-LDFLAGS     := -framework UIKit -framework Foundation -Wl,-dead_strip $(EXTRA_LDFLAGS)
+LDFLAGS     := -framework UIKit -framework Foundation -framework QuartzCore -Wl,-dead_strip $(EXTRA_LDFLAGS)
 
-.PHONY: all check-sdk install deploy clean
+ifdef FULL_ROOT
+CFLAGS += -DSW_FULL_ROOT=1
+endif
+
+.PHONY: all check-sdk icons install deploy clean
 
 all: $(BIN)
 
@@ -35,11 +40,14 @@ check-sdk:
 	@test -n "$(SDK)" || { echo "error: iOS SDK not found. Run: make SDK=/path/to/iPhoneOS.sdk"; exit 1; }
 	@test -d "$(SDK)" || { echo "error: SDK path '$(SDK)' does not exist"; exit 1; }
 
-$(BIN): main.m Info.plist entitlements.plist | check-sdk
+icons:
+	python3 tools/make_icon.py
+
+$(BIN): main.m Info.plist entitlements.plist $(wildcard icons/AppIcon60x60*.png) | check-sdk
 	@mkdir -p $(APP_DIR)
 	$(CLANG) $(CFLAGS) main.m -o $(BIN) $(LDFLAGS)
 	cp Info.plist $(APP_DIR)/Info.plist
-	cp -f AppIcon60x60@2x.png AppIcon60x60@3x.png $(APP_DIR)/ 2>/dev/null || true
+	cp icons/AppIcon60x60@2x.png icons/AppIcon60x60@3x.png $(APP_DIR)/
 	printf 'APPL????' > $(APP_DIR)/PkgInfo
 	$(LDID) -Sentitlements.plist $(BIN)
 	@echo "Built $(APP_DIR)"

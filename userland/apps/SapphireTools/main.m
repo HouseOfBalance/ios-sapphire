@@ -1,26 +1,36 @@
-// SapphireTools — main.m
+// SapphireTools v2 — main.m
 // Cong cu cau hinh / chan doan cho ban port iOS 16.7 tren Redmi Note 13 4G
-// (sapphire / SM6225 / Adreno 610).
+// (sapphire / SM6225 / Adreno 610), repo HouseOfBalance/ios-sapphire.
 //
 // Objective-C + UIKit thuan, UI dung hoan toan bang code (khong Storyboard/XIB).
 // Build: xem Makefile (clang + iOS SDK, ky bang ldid -Sentitlements.plist).
+//
+// v2: sua loi pipe/timeout/doc sysctl, them Display+FPS meter, Services, SSH,
+//     Accessibility toggles, Sysctl Explorer, Debug Snapshot (copy/share), metal.args editor.
 
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <Foundation/Foundation.h>
 
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/sysctl.h>
-#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -28,12 +38,24 @@ extern char **environ;
 #ifndef CTL_SYSCTL
 #define CTL_SYSCTL 0
 #endif
+#ifndef CTL_SYSCTL_NAME
+#define CTL_SYSCTL_NAME 1
+#endif
+#ifndef CTL_SYSCTL_NEXT
+#define CTL_SYSCTL_NEXT 2
+#endif
 #ifndef CTL_SYSCTL_OIDFMT
 #define CTL_SYSCTL_OIDFMT 4
 #endif
 #ifndef CTL_MAXNAME
 #define CTL_MAXNAME 12
 #endif
+#ifndef SZOMB
+#define SZOMB 5
+#endif
+
+#define SW_CTLFLAG_RD 0x80000000u
+#define SW_CTLFLAG_WR 0x40000000u
 
 #pragma mark - Constants
 
@@ -44,18 +66,60 @@ static NSString *const kSysTapWake    = @"kern.sweet_tap_wake";
 static NSString *const kSysQuietMs    = @"kern.sweet_touch_quiet_ms";
 static NSString *const kSysStaleMs    = @"kern.sweet_touch_stale_ms";
 static NSString *const kSysTouchRate  = @"kern.sweet_touch_rate";
+static NSString *const kSysTapWakes   = @"kern.sweet_tap_wakes";
+static NSString *const kSysFodPress   = @"kern.sweet_fod_press";
+static NSString *const kSysFodSeq     = @"kern.sweet_fod_seq";
 static NSString *const kSysFrameStats = @"kern.sweet_fb_frame_stats";
 static NSString *const kSysSurface    = @"kern.sweet_fb_surface";
 static NSString *const kSysBootargs   = @"kern.bootargs";
+static NSString *const kSweetPrefix   = @"kern.sweet_";
 
 static NSString *const kMetalArgsPath = @"/var/tmp/metal.args";
 static NSString *const kSweetLogPath  = @"/var/log/sweetlog.txt";
+static NSString *const kSnapshotDir   = @"/var/tmp";
+static NSString *const kSnapshotPrefix = @"sapphire-snapshot-";
 static const NSUInteger kLogLines     = 80;
+static const NSUInteger kSnapshotLogLines = 300;
 
 enum { kTagRScale = 100, kTagQuiet = 101, kTagStale = 102 };
 
+// Thu tu cac section trong man hinh chinh.
+enum {
+    SecGraphics = 0, SecDisplay, SecTouch, SecDiag, SecServices,
+    SecSSH, SecAccess, SecTools, SecPower, SecCount
+};
+
 static NSArray<NSString *> *SWMetalKeys(void) {
     return @[@"metal_gmem", @"metal_defer", @"metal_stats"];
+}
+
+// Daemon can theo doi: {ten tien trinh (p_comm), mo ta}.
+static NSArray<NSArray<NSString *> *> *SWServiceList(void) {
+    return @[
+        @[@"SpringBoard",   @"UI shell"],
+        @[@"backboardd",    @"display / touch events"],
+        @[@"fpd",           @"fingerprint"],
+        @[@"btmonitor",     @"bluetooth monitor"],
+        @[@"vibd",          @"haptics"],
+        @[@"thermald",      @"thermal"],
+        @[@"sensord",       @"sensors"],
+        @[@"CommCenter",    @"modem / cellular"],
+        @[@"mediaserverd",  @"audio / media"],
+        @[@"wifid",         @"Wi-Fi"],
+        @[@"bluetoothd",    @"bluetooth"],
+    ];
+}
+
+// Muc Accessibility: {tieu de, ham doc, ham ghi} trong libAccessibility.dylib.
+static NSArray<NSDictionary<NSString *, NSString *> *> *SWAXItems(void) {
+    return @[
+        @{ @"title": @"Reduce Transparency",
+           @"get": @"_AXSEnhanceBackgroundContrastEnabled",
+           @"set": @"_AXSSetEnhanceBackgroundContrastEnabled" },
+        @{ @"title": @"Reduce Motion",
+           @"get": @"_AXSReduceMotionEnabled",
+           @"set": @"_AXSSetReduceMotionEnabled" },
+    ];
 }
 
 #pragma mark - Small helpers
@@ -67,6 +131,38 @@ static NSString *SWErrText(int e) {
 static NSString *SWNAText(int e) {
     if (e == 0 || e == ENOENT) return @"N/A";
     return [NSString stringWithFormat:@"N/A (%@)", SWErrText(e)];
+}
+
+static int64_t SWNowMs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+}
+
+static NSString *SWFormatDuration(double s) {
+    long long t = (long long)(s > 0 ? s : 0);
+    if (t < 60)    return [NSString stringWithFormat:@"%llds", t];
+    if (t < 3600)  return [NSString stringWithFormat:@"%lldm %llds", t / 60, t % 60];
+    if (t < 86400) return [NSString stringWithFormat:@"%lldh %lldm", t / 3600, (t % 3600) / 60];
+    return [NSString stringWithFormat:@"%lldd %lldh", t / 86400, (t % 86400) / 3600];
+}
+
+// "123", "-5", "0x1f" -> YES. Khong chap nhan phan thua.
+static BOOL SWParseInt(NSString *s, long long *out) {
+    NSString *t = [s stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (t.length == 0) return NO;
+    NSScanner *sc = [NSScanner scannerWithString:t];
+    long long v = 0;
+    if ([t hasPrefix:@"0x"] || [t hasPrefix:@"0X"]) {
+        unsigned long long u = 0;
+        if (![sc scanHexLongLong:&u]) return NO;
+        v = (long long)u;
+    } else if (![sc scanLongLong:&v]) {
+        return NO;
+    }
+    if (!sc.isAtEnd) return NO;
+    if (out) *out = v;
+    return YES;
 }
 
 static UILabel *SWMakeLabel(UIFont *font, UIColor *color, NSInteger lines) {
@@ -96,6 +192,15 @@ static void SWSetValue(UILabel *l, NSString *text) {
     l.hidden = (text.length == 0);
 }
 
+// Gan text neu khac; bao *changed de biet co can relayout bang hay khong.
+static void SWSetText(UILabel *l, NSString *text, BOOL *changed) {
+    NSString *t = text ?: @"";
+    if (![l.text isEqualToString:t]) {
+        l.text = t;
+        if (changed) *changed = YES;
+    }
+}
+
 static UIViewController *SWTopViewController(UIViewController *vc) {
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
@@ -120,9 +225,76 @@ static void SWToast(UIView *anchor, NSString *msg) {
     l.alpha = 0;
     [w addSubview:l];
     [UIView animateWithDuration:0.2 animations:^{ l.alpha = 1; } completion:^(BOOL f) {
-        [UIView animateWithDuration:0.3 delay:1.4 options:0 animations:^{ l.alpha = 0; }
+        [UIView animateWithDuration:0.3 delay:1.8 options:0 animations:^{ l.alpha = 0; }
                          completion:^(BOOL f2) { [l removeFromSuperview]; }];
     }];
+}
+
+
+#pragma mark - Chu thich de hieu (tieng Viet doi thuong)
+
+// Tra ve dong chu nho giai thich tac dung cua muc co tieu de `title` (nil neu khong co).
+static NSString *SWHintForTitle(NSString *title) {
+    static NSArray<NSArray<NSString *> *> *table;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        table = @[
+            @[@"Metal mode", @"Chọn cách vẽ hình: Off = tắt, hai mức còn lại = vẽ trực tiếp bằng chip đồ họa Adreno 610. Đổi thử xem cách nào mượt hơn."],
+            @[@"FB render scale", @"Độ nét của khung hình nội bộ. Thường số thấp = nhẹ máy, mượt hơn nhưng hơi mờ; số cao = nét hơn nhưng nặng hơn."],
+            @[@"FB flip flush", @"Ép đẩy hình xuống màn hình ngay mỗi lần đổi khung. Thử bật nếu thấy hình bị rách hoặc nhấp nháy."],
+            @[@"metal_gmem=1", @"Cờ thử nghiệm của HakiosMetal (bộ nhớ nhanh trên GPU). Chỉ có hiệu lực khi app Metal khởi động lại."],
+            @[@"metal_defer=1", @"Cờ thử nghiệm của HakiosMetal (trì hoãn việc vẽ). Chỉ có hiệu lực khi app Metal khởi động lại."],
+            @[@"metal_stats=1", @"Bật ghi thống kê của HakiosMetal vào nhật ký, để xem máy vẽ nhanh hay chậm."],
+            @[@"/var/tmp/metal.args", @"File chứa các cờ ở trên. Chạm vào đây để tự sửa bằng tay."],
+            @[@"Screen (UIScreen)", @"Thông tin màn hình mà hệ điều hành đang thấy: độ phân giải và số lần làm mới tối đa mỗi giây (Hz)."],
+            @[@"Thermal state", @"Máy đang nóng cỡ nào. Nominal = bình thường; Serious/Critical = quá nóng, máy có thể bị giảm tốc."],
+            @[@"FPS meter", @"Đo số khung hình mỗi giây thực tế. Bật lên rồi thử các thay đổi khác để xem có mượt hơn không."],
+            @[@"Measured", @"Kết quả đo: fps càng gần số Hz tối đa càng mượt. “drops” = số khung bị rớt (giật). Chạm để đo lại từ đầu."],
+            @[@"Motion test", @"Thanh xanh chạy qua lại để bạn nhìn bằng mắt xem có bị giật không."],
+            @[@"Tap to wake", @"Chạm màn hình để bật sáng máy: tắt / chạm 1 lần / chạm 2 lần."],
+            @[@"Touch quiet", @"Thời gian chờ (mili giây) sau khi ngừng chạm thì cảm ứng được coi là “yên”. Chỉnh khi cảm ứng bị lỗi vặt."],
+            @[@"Touch stale", @"Sau bao lâu (mili giây) không có tín hiệu thì dữ liệu chạm cũ bị bỏ đi."],
+            @[@"Touch rate", @"Tốc độ đọc cảm ứng hiện tại do hệ thống báo cáo. Chỉ để xem."],
+            @[@"FOD / tap-wake", @"Bộ đếm vân tay dưới màn hình và số lần đánh thức bằng chạm. Số nhảy lên khi bạn thao tác = tính năng đang hoạt động."],
+            @[@"Frame stats", @"Thống kê khung hình do hệ thống ghi lại. Chạm để xem đầy đủ hoặc sao chép."],
+            @[@"FB surface", @"Thông tin vùng nhớ chứa hình đang hiển thị. Chạm để xem đầy đủ."],
+            @[@"Boot args", @"Các tham số máy nhận lúc khởi động. Chỉ để xem."],
+            @[@"Auto refresh", @"Tự cập nhật các số liệu mỗi 2 giây. Tắt đi nếu thấy máy bị chậm khi mở app."],
+            @[@"SSH daemon", @"Cho phép máy tính điều khiển điện thoại và gửi file qua Wi-Fi. Bật lên khi bạn muốn chép file từ PC sang."],
+            @[@"Device IP", @"Địa chỉ mạng của điện thoại, nhập vào máy tính để kết nối. Chạm để sao chép lệnh ssh."],
+            @[@"Reduce Transparency", @"Tắt hiệu ứng mờ trong suốt của giao diện. Nhẹ cho chip đồ họa hơn nên thường mượt hơn."],
+            @[@"Reduce Motion", @"Giảm hiệu ứng chuyển động, phóng to, trượt của giao diện. Cũng giúp mượt hơn."],
+            @[@"Apply as user", @"Chỉ bật nếu bạn gạt công tắc ở trên mà giao diện không thay đổi gì."],
+            @[@"Reset Touch Rate", @"Đặt bộ đo tốc độ cảm ứng về 0 để đo lại."],
+            @[@"Refresh now", @"Cập nhật mọi số liệu ngay lập tức."],
+            @[@"View Recent Kernel Log", @"Xem nhật ký mới nhất của hệ thống để tìm nguyên nhân khi có lỗi."],
+            @[@"Copy scp command", @"Sao chép lệnh để gửi file từ máy tính sang điện thoại."],
+            @[@"Refresh SSH", @"Kiểm tra lại SSH đang bật hay tắt và địa chỉ IP."],
+            @[@"Sysctl Explorer", @"Danh sách mọi thông số tinh chỉnh của hệ thống (kể cả cái mới thêm sau này). Xem và sửa được."],
+            @[@"Edit metal.args", @"Tự gõ sửa các cờ cấu hình Metal."],
+            @[@"Copy debug snapshot", @"Gom toàn bộ thông tin máy thành một đoạn chữ để dán gửi cho người phân tích lỗi."],
+            @[@"Share debug snapshot", @"Giống nút trên nhưng gửi qua menu Chia sẻ dưới dạng file."],
+            @[@"Share sweetlog", @"Gửi file nhật ký sweetlog.txt cho người khác."],
+            @[@"Respring", @"Khởi động lại giao diện (màn hình đen vài giây), KHÔNG tắt máy."],
+            @[@"Restart SpringBoard only", @"Chỉ khởi động lại màn hình chính, nhẹ hơn Respring."],
+            @[@"Reboot", @"Khởi động lại cả máy."],
+        ];
+    });
+    for (NSArray<NSString *> *row in table) {
+        if ([title hasPrefix:row[0]]) return row[1];
+    }
+    for (NSArray<NSString *> *svc in SWServiceList()) {
+        if ([title hasPrefix:[svc[0] stringByAppendingString:@" ("]]) {
+            return @"Chương trình nền của hệ thống. Xanh = đang chạy, đỏ = không chạy. Chạm để khởi động lại nếu nó bị lỗi.";
+        }
+    }
+    return nil;
+}
+
+static UILabel *SWHintLabel(NSString *text) {
+    UILabel *h = SWMakeLabel([UIFont systemFontOfSize:12], UIColor.secondaryLabelColor, 0);
+    h.text = text;
+    return h;
 }
 
 #pragma mark - sysctl wrapper
@@ -135,29 +307,8 @@ typedef NS_ENUM(NSInteger, SWKind) {
     SWKindStruct   // CTLTYPE_OPAQUE
 };
 
-@interface SWSysctl : NSObject
-+ (BOOL)exists:(NSString *)name;
-+ (NSString *)stringForName:(NSString *)name errnoOut:(int *)err;
-+ (BOOL)getInteger:(long long *)out name:(NSString *)name errnoOut:(int *)err;
-+ (BOOL)setInteger:(long long)v name:(NSString *)name errnoOut:(int *)err;
-+ (BOOL)setString:(NSString *)s name:(NSString *)name errnoOut:(int *)err;
-@end
-
-@implementation SWSysctl
-
-// Lay kieu cua OID qua sysctl magic {0, 4, <oid...>} (CTL_SYSCTL_OIDFMT).
-+ (SWKind)kindForName:(NSString *)name {
-    int q[CTL_MAXNAME + 2];
-    size_t n = CTL_MAXNAME;
-    q[0] = CTL_SYSCTL;
-    q[1] = CTL_SYSCTL_OIDFMT;
-    if (sysctlnametomib(name.UTF8String, q + 2, &n) != 0) return SWKindUnknown;
-    unsigned char buf[256];
-    size_t len = sizeof(buf);
-    if (sysctl(q, (u_int)(n + 2), buf, &len, NULL, 0) != 0 || len < sizeof(uint32_t)) return SWKindUnknown;
-    uint32_t k = 0;
-    memcpy(&k, buf, sizeof(k));
-    switch (k & 0xf) {
+static SWKind SWKindFromRaw(uint32_t raw) {
+    switch (raw & 0xf) {
         case 2: return SWKindInt32;
         case 3: return SWKindString;
         case 4: return SWKindInt64;
@@ -166,15 +317,50 @@ typedef NS_ENUM(NSInteger, SWKind) {
     }
 }
 
-+ (NSData *)readRaw:(NSString *)name errnoOut:(int *)err {
+@interface SWSysctl : NSObject
++ (BOOL)exists:(NSString *)name;
++ (uint32_t)rawKindForMib:(const int *)mib length:(size_t)n;
++ (NSString *)stringForName:(NSString *)name errorCode:(int *)err;
++ (BOOL)getInteger:(long long *)out name:(NSString *)name errorCode:(int *)err;
++ (BOOL)setInteger:(long long)v name:(NSString *)name errorCode:(int *)err;
++ (BOOL)setString:(NSString *)s name:(NSString *)name errorCode:(int *)err;
+@end
+
+@implementation SWSysctl
+
+// Lay "kind" (flags | type) cua OID qua sysctl magic {0, 4, <oid...>} (CTL_SYSCTL_OIDFMT).
++ (uint32_t)rawKindForMib:(const int *)mib length:(size_t)n {
+    if (n == 0 || n > CTL_MAXNAME) return 0;
+    int q[CTL_MAXNAME + 2];
+    q[0] = CTL_SYSCTL;
+    q[1] = CTL_SYSCTL_OIDFMT;
+    memcpy(q + 2, mib, n * sizeof(int));
+    unsigned char buf[256];
+    size_t len = sizeof(buf);
+    if (sysctl(q, (u_int)(n + 2), buf, &len, NULL, 0) != 0 || len < sizeof(uint32_t)) return 0;
+    uint32_t k = 0;
+    memcpy(&k, buf, sizeof(k));
+    return k;
+}
+
++ (uint32_t)rawKindForName:(NSString *)name {
+    int mib[CTL_MAXNAME];
+    size_t n = CTL_MAXNAME;
+    if (sysctlnametomib(name.UTF8String, mib, &n) != 0) return 0;
+    return [self rawKindForMib:mib length:n];
+}
+
++ (SWKind)kindForName:(NSString *)name {
+    return SWKindFromRaw([self rawKindForName:name]);
+}
+
+// Doc dung MOT lan goi handler (khong "do kich thuoc" truoc): mot so sysctl tu kernel
+// tinh gia tri theo khoang thoi gian tu lan doc truoc (rate, stats), goi hai lan se lam lech so lieu.
+// Chi khi buffer 4 KB khong du (ENOMEM) moi hoi kich thuoc that.
++ (NSData *)readRaw:(NSString *)name errorCode:(int *)err {
     const char *n = name.UTF8String;
+    size_t cap = 4096;
     for (int attempt = 0; attempt < 4; attempt++) {
-        size_t len = 0;
-        if (sysctlbyname(n, NULL, &len, NULL, 0) != 0) {
-            if (err) *err = errno;
-            return nil;
-        }
-        size_t cap = len + 256;
         NSMutableData *d = [NSMutableData dataWithLength:cap];
         size_t got = cap;
         if (sysctlbyname(n, d.mutableBytes, &got, NULL, 0) == 0) {
@@ -185,6 +371,13 @@ typedef NS_ENUM(NSInteger, SWKind) {
             if (err) *err = errno;
             return nil;
         }
+        size_t need = 0;
+        if (sysctlbyname(n, NULL, &need, NULL, 0) != 0) {
+            if (err) *err = errno;
+            return nil;
+        }
+        cap = MAX(need + 256, cap * 2);
+        if (cap > 4u * 1024u * 1024u) break;
     }
     if (err) *err = ENOMEM;
     return nil;
@@ -220,8 +413,8 @@ typedef NS_ENUM(NSInteger, SWKind) {
     return s ?: @"";
 }
 
-+ (NSString *)stringForName:(NSString *)name errnoOut:(int *)err {
-    NSData *d = [self readRaw:name errnoOut:err];
++ (NSString *)stringForName:(NSString *)name errorCode:(int *)err {
+    NSData *d = [self readRaw:name errorCode:err];
     if (!d) return nil;
     SWKind k = [self kindForName:name];
     if ([self isStringData:d kind:k]) return [self stringFromData:d];
@@ -241,15 +434,21 @@ typedef NS_ENUM(NSInteger, SWKind) {
     return h;
 }
 
-+ (BOOL)getInteger:(long long *)out name:(NSString *)name errnoOut:(int *)err {
-    NSData *d = [self readRaw:name errnoOut:err];
++ (BOOL)getInteger:(long long *)out name:(NSString *)name errorCode:(int *)err {
+    NSData *d = [self readRaw:name errorCode:err];
     if (!d) return NO;
     SWKind k = [self kindForName:name];
     if ([self isStringData:d kind:k]) {
-        const char *c = [self stringFromData:d].UTF8String;
+        // Sao chep sang buffer C: con tro UTF8String cua object tam co the bi ARC giai phong som.
+        char cbuf[64];
+        NSString *str = [self stringFromData:d];
+        if (![str getCString:cbuf maxLength:sizeof(cbuf) encoding:NSUTF8StringEncoding]) {
+            if (err) *err = EINVAL;
+            return NO;
+        }
         char *end = NULL;
-        long long v = strtoll(c, &end, 0);
-        if (end == c) {
+        long long v = strtoll(cbuf, &end, 0);
+        if (end == cbuf) {
             if (err) *err = EINVAL;
             return NO;
         }
@@ -272,7 +471,7 @@ typedef NS_ENUM(NSInteger, SWKind) {
     return NO;
 }
 
-+ (BOOL)setString:(NSString *)s name:(NSString *)name errnoOut:(int *)err {
++ (BOOL)setString:(NSString *)s name:(NSString *)name errorCode:(int *)err {
     const char *n = name.UTF8String;
     const char *c = s.UTF8String;
     size_t l = strlen(c);
@@ -285,7 +484,7 @@ typedef NS_ENUM(NSInteger, SWKind) {
     return YES;
 }
 
-+ (BOOL)setInteger:(long long)v name:(NSString *)name errnoOut:(int *)err {
++ (BOOL)setInteger:(long long)v name:(NSString *)name errorCode:(int *)err {
     const char *n = name.UTF8String;
     size_t len = 0;
     if (sysctlbyname(n, NULL, &len, NULL, 0) != 0) {
@@ -295,7 +494,7 @@ typedef NS_ENUM(NSInteger, SWKind) {
     SWKind k = [self kindForName:name];
     BOOL asString = (k == SWKindString) || (k == SWKindUnknown && len != 4 && len != 8);
     if (asString) {
-        return [self setString:[NSString stringWithFormat:@"%lld", v] name:name errnoOut:err];
+        return [self setString:[NSString stringWithFormat:@"%lld", v] name:name errorCode:err];
     }
     int rc;
     if (len == 8) {
@@ -314,23 +513,128 @@ typedef NS_ENUM(NSInteger, SWKind) {
 
 @end
 
-#pragma mark - Process helpers (posix_spawn / kill / reboot / log)
+#pragma mark - Guarded sysctl read (timeout + blocking denylist)
 
-// Chay mot file thuc thi. Tra ve exit code, hoac -1 (kem *errOut != 0 neu spawn loi).
+// Cac sysctl kieu "_await" co the CHAN den khi co frame/su kien: khong bao gio doc tu app.
+static BOOL SWSysctlLooksBlocking(NSString *name) {
+    return [name rangeOfString:@"await" options:NSCaseInsensitiveSearch].location != NSNotFound;
+}
+
+static NSMutableSet<NSString *> *SWHungSet(void) {
+    static NSMutableSet<NSString *> *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [NSMutableSet set]; });
+    return s;
+}
+
+// Doc sysctl o thread nen voi timeout 1.5 s. Tra ve nil (kem *errorCode) neu doc loi.
+// Sysctl da timeout se bi danh dau "hung" va khong doc lai (tranh ro ri thread).
+static NSString *SWReadSysctlGuarded(NSString *name, int *errorCode) {
+    if (errorCode) *errorCode = 0;
+    if (SWSysctlLooksBlocking(name)) return @"(blocking sysctl - not read)";
+    @synchronized (SWHungSet()) {
+        if ([SWHungSet() containsObject:name]) return @"(timed out earlier - skipped)";
+    }
+    __block NSString *result = nil;
+    __block int e = 0;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        int err = 0;
+        NSString *s = [SWSysctl stringForName:name errorCode:&err];
+        result = s;
+        e = err;
+        dispatch_semaphore_signal(sem);
+    });
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC)) != 0) {
+        @synchronized (SWHungSet()) { [SWHungSet() addObject:name]; }
+        return @"(timeout)";
+    }
+    if (errorCode) *errorCode = e;
+    return result;
+}
+
+// Chuoi hien thi: gia tri / "(empty)" / "N/A (...)".
+static NSString *SWSysctlDisplay(NSString *name) {
+    int e = 0;
+    NSString *s = SWReadSysctlGuarded(name, &e);
+    if (!s) return SWNAText(e);
+    return s.length ? s : @"(empty)";
+}
+
+// Duyet cay kern.* bang sysctl magic NEXT/NAME, tra ve cac OID la co ten bat dau bang prefix.
+static NSArray<NSDictionary *> *SWEnumerateSysctls(NSString *prefix) {
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    int cur[CTL_MAXNAME];
+    size_t curLen = 1;
+    cur[0] = CTL_KERN;
+    for (int iter = 0; iter < 8000; iter++) {
+        int q[CTL_MAXNAME + 2];
+        q[0] = CTL_SYSCTL;
+        q[1] = CTL_SYSCTL_NEXT;
+        memcpy(q + 2, cur, curLen * sizeof(int));
+        int nxt[CTL_MAXNAME];
+        size_t nbytes = sizeof(nxt);
+        if (sysctl(q, (u_int)(curLen + 2), nxt, &nbytes, NULL, 0) != 0) break;
+        size_t nlen = nbytes / sizeof(int);
+        if (nlen == 0 || nlen > CTL_MAXNAME || nxt[0] != CTL_KERN) break;
+        memcpy(cur, nxt, nlen * sizeof(int));
+        curLen = nlen;
+
+        int nq[CTL_MAXNAME + 2];
+        nq[0] = CTL_SYSCTL;
+        nq[1] = CTL_SYSCTL_NAME;
+        memcpy(nq + 2, cur, curLen * sizeof(int));
+        char nm[256];
+        size_t nl = sizeof(nm);
+        if (sysctl(nq, (u_int)(curLen + 2), nm, &nl, NULL, 0) != 0 || nl == 0) continue;
+        nm[sizeof(nm) - 1] = 0;
+        NSString *name = [NSString stringWithUTF8String:nm];
+        if (!name || ![name hasPrefix:prefix]) continue;
+
+        uint32_t raw = [SWSysctl rawKindForMib:cur length:curLen];
+        if ((raw & 0xf) == 1) continue;   // CTLTYPE_NODE
+        NSString *type;
+        switch (SWKindFromRaw(raw)) {
+            case SWKindString: type = @"string"; break;
+            case SWKindInt32:  type = @"int";    break;
+            case SWKindInt64:  type = @"quad";   break;
+            case SWKindStruct: type = @"opaque"; break;
+            default:           type = @"?";      break;
+        }
+        BOOL wr = (raw & SW_CTLFLAG_WR) != 0;
+        BOOL rd = (raw & SW_CTLFLAG_RD) != 0;
+        [out addObject:@{ @"name": name, @"type": type, @"writable": @(wr),
+                          @"access": wr ? (rd ? @"RW" : @"WO") : @"RO" }];
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"name"] compare:b[@"name"]];
+    }];
+    return out;
+}
+
+#pragma mark - Process helpers (posix_spawn / kill / reboot)
+
+// Chay mot file thuc thi (timeout 8 s). Tra ve exit code, hoac -1 (kem *errOut != 0 neu loi:
+// loi spawn, hoac ETIMEDOUT khi tien trinh bi kill do chay qua lau).
 static int SWSpawnPath(const char *path, NSArray<NSString *> *args, NSString **output, int *errOut) {
+    const int64_t kTimeoutMs = 8000;
     int fds[2] = {-1, -1};
     posix_spawn_file_actions_t fa;
     posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     if (output) {
         if (pipe(fds) != 0) {
             if (errOut) *errOut = errno;
             posix_spawn_file_actions_destroy(&fa);
             return -1;
         }
+        // FD_CLOEXEC tren ca hai dau pipe: neu khong, mot spawn chay song song o thread khac
+        // se ke thua dau ghi va lam read() o day khong bao gio gap EOF.
+        // dup2 xuong 1/2 tu dong bo co CLOEXEC nen child van nhan duoc stdout/stderr.
+        fcntl(fds[0], F_SETFD, FD_CLOEXEC);
+        fcntl(fds[1], F_SETFD, FD_CLOEXEC);
         posix_spawn_file_actions_adddup2(&fa, fds[1], STDOUT_FILENO);
         posix_spawn_file_actions_adddup2(&fa, fds[1], STDERR_FILENO);
-        posix_spawn_file_actions_addclose(&fa, fds[0]);
-        posix_spawn_file_actions_addclose(&fa, fds[1]);
     } else {
         posix_spawn_file_actions_addopen(&fa, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
         posix_spawn_file_actions_addopen(&fa, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
@@ -349,15 +653,26 @@ static int SWSpawnPath(const char *path, NSArray<NSString *> *args, NSString **o
         return -1;
     }
 
+    const int64_t deadline = SWNowMs() + kTimeoutMs;
     NSMutableData *buf = nil;
     if (output) {
         close(fds[1]);
         buf = [NSMutableData data];
         char tmp[4096];
-        ssize_t n;
-        while ((n = read(fds[0], tmp, sizeof(tmp))) != 0) {
-            if (n < 0) {
+        for (;;) {
+            int64_t left = deadline - SWNowMs();
+            if (left <= 0) break;
+            struct pollfd p = { fds[0], POLLIN, 0 };
+            int pr = poll(&p, 1, (int)left);
+            if (pr < 0) {
                 if (errno == EINTR) continue;
+                break;
+            }
+            if (pr == 0) break;   // het gio: de vong waitpid ben duoi quyet dinh
+            ssize_t n = read(fds[0], tmp, sizeof(tmp));
+            if (n == 0) break;
+            if (n < 0) {
+                if (errno == EINTR || errno == EAGAIN) continue;
                 break;
             }
             if (buf.length < 8u * 1024u * 1024u) [buf appendBytes:tmp length:(NSUInteger)n];
@@ -366,12 +681,28 @@ static int SWSpawnPath(const char *path, NSArray<NSString *> *args, NSString **o
     }
 
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+    BOOL timedOut = NO;
+    for (;;) {
+        pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid) break;
+        if (w < 0 && errno != EINTR) { status = 0; break; }   // ECHILD...
+        if (SWNowMs() >= deadline) {
+            timedOut = YES;
+            kill(pid, SIGKILL);
+            while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { }
+            break;
+        }
+        usleep(10 * 1000);
+    }
 
     if (output) {
         NSString *s = [[NSString alloc] initWithData:buf encoding:NSUTF8StringEncoding];
         if (!s) s = [[NSString alloc] initWithData:buf encoding:NSISOLatin1StringEncoding];
         *output = s ?: @"";
+    }
+    if (timedOut) {
+        if (errOut) *errOut = ETIMEDOUT;
+        return -1;
     }
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
@@ -387,6 +718,7 @@ static int SWRunFirst(NSArray<NSString *> *paths, NSArray<NSString *> *args, NSS
         int rc = SWSpawnPath(p.fileSystemRepresentation, args, output, &e);
         if (rc == -1 && e != 0) {
             lastErr = e;
+            if (e == ETIMEDOUT) break;
             continue;
         }
         return rc;
@@ -395,41 +727,103 @@ static int SWRunFirst(NSArray<NSString *> *paths, NSArray<NSString *> *args, NSS
     return -1;
 }
 
-// Du phong khi khong co killall: duyet KERN_PROC_ALL va kill theo ten.
-static int SWKillByName(const char *name, int sig) {
+// Liet ke tien trinh (KERN_PROC_ALL). Tra ve mang malloc (caller free) hoac NULL.
+static struct kinfo_proc *SWCopyProcs(size_t *countOut) {
     int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
-    size_t len = 0;
-    if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0) return -1;
-    len += 16 * sizeof(struct kinfo_proc);
-    struct kinfo_proc *procs = malloc(len);
-    if (!procs) {
-        errno = ENOMEM;
-        return -1;
-    }
-    if (sysctl(mib, 3, procs, &len, NULL, 0) != 0) {
-        int e = errno;
-        free(procs);
-        errno = e;
-        return -1;
-    }
-    size_t count = len / sizeof(struct kinfo_proc);
-    int killed = 0, lastErr = 0;
-    for (size_t i = 0; i < count; i++) {
-        if (procs[i].kp_proc.p_pid > 1 &&
-            strncmp(procs[i].kp_proc.p_comm, name, MAXCOMLEN) == 0) {
-            if (kill(procs[i].kp_proc.p_pid, sig) == 0) killed++;
-            else lastErr = errno;
+    struct kinfo_proc *procs = NULL;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        size_t len = 0;
+        if (sysctl(mib, 3, NULL, &len, NULL, 0) != 0) break;
+        len += 32 * sizeof(struct kinfo_proc);
+        struct kinfo_proc *p2 = realloc(procs, len);
+        if (!p2) break;
+        procs = p2;
+        if (sysctl(mib, 3, procs, &len, NULL, 0) == 0) {
+            if (countOut) *countOut = len / sizeof(struct kinfo_proc);
+            return procs;
         }
+        if (errno != ENOMEM) break;
+    }
+    free(procs);
+    if (countOut) *countOut = 0;
+    return NULL;
+}
+
+// ten tien trinh (p_comm, toi da 16 ky tu) -> [{pid, start(epoch giay)}]
+static NSDictionary<NSString *, NSArray<NSDictionary *> *> *SWProcessMap(void) {
+    size_t n = 0;
+    struct kinfo_proc *procs = SWCopyProcs(&n);
+    if (!procs) return @{};
+    NSMutableDictionary<NSString *, NSMutableArray *> *map = [NSMutableDictionary dictionary];
+    for (size_t i = 0; i < n; i++) {
+        if (procs[i].kp_proc.p_stat == SZOMB) continue;
+        char comm[MAXCOMLEN + 1];
+        strlcpy(comm, procs[i].kp_proc.p_comm, sizeof(comm));
+        NSString *name = [NSString stringWithUTF8String:comm];
+        if (name.length == 0) continue;
+        NSMutableArray *arr = map[name];
+        if (!arr) {
+            arr = [NSMutableArray array];
+            map[name] = arr;
+        }
+        [arr addObject:@{ @"pid": @(procs[i].kp_proc.p_pid),
+                          @"start": @((double)procs[i].kp_proc.p_un.__p_starttime.tv_sec) }];
+    }
+    free(procs);
+    return map;
+}
+
+// Mo ta ngan "PID 123 · 4m 12s" (hoac "PID 12, 15 (2)") cho mot muc trong SWProcessMap.
+static NSString *SWDescribeProcs(NSArray<NSDictionary *> *list) {
+    if (list.count == 0) return @"not running";
+    NSDictionary *first = list.firstObject;
+    double up = [NSDate date].timeIntervalSince1970 - [first[@"start"] doubleValue];
+    if (list.count == 1) {
+        return [NSString stringWithFormat:@"PID %d · %@", [first[@"pid"] intValue], SWFormatDuration(up)];
+    }
+    return [NSString stringWithFormat:@"PID %d +%lu · %@", [first[@"pid"] intValue],
+            (unsigned long)(list.count - 1), SWFormatDuration(up)];
+}
+
+// Gui tin hieu theo ten tien trinh (khop chinh xac p_comm). Tra ve so tien trinh da gui,
+// hoac -1 (kem *errorCode) khi tat ca deu loi.
+static int SWKillByName(NSString *name, int sig, int *errorCode) {
+    size_t n = 0;
+    struct kinfo_proc *procs = SWCopyProcs(&n);
+    if (!procs) {
+        if (errorCode) *errorCode = ENOMEM;
+        return -1;
+    }
+    const char *target = name.UTF8String;
+    int killed = 0, lastErr = 0;
+    pid_t self = getpid();
+    for (size_t i = 0; i < n; i++) {
+        pid_t pid = procs[i].kp_proc.p_pid;
+        if (pid <= 1 || pid == self) continue;
+        if (procs[i].kp_proc.p_stat == SZOMB) continue;
+        if (strncmp(procs[i].kp_proc.p_comm, target, MAXCOMLEN) != 0) continue;
+        if (kill(pid, sig) == 0) killed++;
+        else lastErr = errno;
     }
     free(procs);
     if (killed == 0 && lastErr != 0) {
-        errno = lastErr;
+        if (errorCode) *errorCode = lastErr;
         return -1;
     }
     return killed;
 }
 
+// Kill truc tiep truoc (khong can killall), killall chi la du phong.
 static BOOL SWKillProcesses(NSArray<NSString *> *names, NSString **errMsg) {
+    int total = 0, lastErr = 0;
+    for (NSString *n in names) {
+        int e = 0;
+        int k = SWKillByName(n, SIGKILL, &e);
+        if (k > 0) total += k;
+        else if (k < 0) lastErr = e;
+    }
+    if (total > 0) return YES;
+
     NSMutableArray<NSString *> *args = [NSMutableArray arrayWithObjects:@"killall", @"-9", nil];
     [args addObjectsFromArray:names];
     int spawnErr = 0;
@@ -437,19 +831,11 @@ static BOOL SWKillProcesses(NSArray<NSString *> *names, NSString **errMsg) {
                           @"/var/jb/usr/bin/killall"], args, nil, &spawnErr);
     if (rc == 0) return YES;
 
-    int total = 0, lastErr = 0;
-    for (NSString *n in names) {
-        int k = SWKillByName(n.UTF8String, SIGKILL);
-        if (k > 0) total += k;
-        else if (k < 0) lastErr = errno;
-    }
-    if (total > 0) return YES;
-
     if (errMsg) {
-        NSString *a = (rc == -1) ? [NSString stringWithFormat:@"killall not runnable (%@)", SWErrText(spawnErr)]
-                                 : [NSString stringWithFormat:@"killall exited with status %d", rc];
-        NSString *b = lastErr ? [NSString stringWithFormat:@"direct kill failed (%@)", SWErrText(lastErr)]
+        NSString *a = lastErr ? [NSString stringWithFormat:@"direct kill failed (%@)", SWErrText(lastErr)]
                               : @"no matching process found";
+        NSString *b = (rc == -1) ? [NSString stringWithFormat:@"killall not runnable (%@)", SWErrText(spawnErr)]
+                                 : [NSString stringWithFormat:@"killall exited with status %d", rc];
         *errMsg = [NSString stringWithFormat:@"%@; %@.", a, b];
     }
     return NO;
@@ -459,7 +845,7 @@ static BOOL SWReboot(NSString **errMsg) {
     sync();
     int spawnErr = 0;
     int rc = SWRunFirst(@[@"/sbin/reboot", @"/usr/sbin/reboot", @"/usr/bin/reboot",
-                          @"/var/jb/usr/sbin/reboot"], @[@"reboot"], nil, &spawnErr);
+                          @"/var/jb/usr/sbin/reboot", @"/var/jb/sbin/reboot"], @[@"reboot"], nil, &spawnErr);
     if (rc == 0) return YES;
 
     int (*rebootFn)(int) = (int (*)(int))dlsym(RTLD_DEFAULT, "reboot");
@@ -474,6 +860,256 @@ static BOOL SWReboot(NSString **errMsg) {
     }
     return NO;
 }
+
+#pragma mark - Network / SSH helpers
+
+// Danh sach IPv4 cua cac interface dang up (tru loopback, link-local). *primary: uu tien en0 (Wi-Fi).
+static NSArray<NSString *> *SWInterfaceAddresses(NSString **primary) {
+    struct ifaddrs *ifa = NULL;
+    if (getifaddrs(&ifa) != 0) return @[];
+    NSMutableArray<NSString *> *lines = [NSMutableArray array];
+    NSString *best = nil;
+    BOOL hasEn0 = NO;
+    for (struct ifaddrs *p = ifa; p; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+        if (!(p->ifa_flags & IFF_UP) || (p->ifa_flags & IFF_LOOPBACK)) continue;
+        char buf[INET_ADDRSTRLEN];
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)p->ifa_addr;
+        if (!inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) continue;
+        NSString *ip = [NSString stringWithUTF8String:buf];
+        NSString *nm = [NSString stringWithUTF8String:p->ifa_name];
+        if (!ip || !nm || [ip hasPrefix:@"169.254."]) continue;
+        [lines addObject:[NSString stringWithFormat:@"%@  %@", nm, ip]];
+        if ([nm isEqualToString:@"en0"]) {
+            best = ip;
+            hasEn0 = YES;
+        } else if (!hasEn0 && !best) {
+            best = ip;
+        }
+    }
+    freeifaddrs(ifa);
+    if (primary) *primary = best;
+    return lines;
+}
+
+// Co the connect() toi 127.0.0.1:port khong? (neu sshd chay kieu launchd socket-activation,
+// moi lan probe co the lam launchd bat 1 tien trinh sshd -i roi thoat ngay: vo hai nhung dung probe qua day.)
+static BOOL SWTCPPortOpen(uint16_t port, int timeoutMs) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return NO;
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_len = sizeof(a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    BOOL ok = NO;
+    int rc = connect(fd, (struct sockaddr *)&a, sizeof(a));
+    if (rc == 0) {
+        ok = YES;
+    } else if (errno == EINPROGRESS) {
+        struct pollfd p = { fd, POLLOUT, 0 };
+        if (poll(&p, 1, timeoutMs) > 0) {
+            int soerr = 0;
+            socklen_t sl = sizeof(soerr);
+            if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl) == 0) ok = (soerr == 0);
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+// Cong SSH dang lang nghe: 22, roi 2222 (dropbear thuong dung). 0 neu khong co.
+static uint16_t SWDetectSSHPort(void) {
+    if (SWTCPPortOpen(22, 300)) return 22;
+    if (SWTCPPortOpen(2222, 300)) return 2222;
+    return 0;
+}
+
+static NSArray<NSString *> *SWLaunchctlPaths(void) {
+    return @[@"/var/jb/usr/bin/launchctl", @"/bin/launchctl", @"/usr/bin/launchctl", @"/sbin/launchctl"];
+}
+
+// Tim plist LaunchDaemon cua sshd/dropbear (Procursus: com.openssh.sshd.plist trong /var/jb/Library/LaunchDaemons).
+static NSString *SWFindSSHPlist(void) {
+    NSArray<NSString *> *dirs = @[@"/var/jb/Library/LaunchDaemons", @"/Library/LaunchDaemons",
+                                  @"/System/Library/LaunchDaemons"];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    for (NSString *d in dirs) {
+        for (NSString *f in [fm contentsOfDirectoryAtPath:d error:NULL]) {
+            NSString *l = f.lowercaseString;
+            if (![l hasSuffix:@".plist"] || [l containsString:@"keygen"]) continue;
+            if ([l containsString:@"sshd"] || [l containsString:@"dropbear"]) {
+                return [d stringByAppendingPathComponent:f];
+            }
+        }
+    }
+    return nil;
+}
+
+// Bat/tat SSH. Co plist -> launchctl load -w / unload. Khong co plist -> chay thang daemon (best-effort).
+// Tra ve YES neu lenh chay khong loi (trang thai thuc te phai kiem tra lai bang SWDetectSSHPort).
+static BOOL SWSSHSetEnabled(BOOL on, NSString **msg) {
+    NSString *plist = SWFindSSHPlist();
+    NSString *out = nil;
+    int e = 0, rc = -1;
+    if (plist) {
+        NSArray<NSString *> *args = on ? @[@"launchctl", @"load", @"-w", plist]
+                                       : @[@"launchctl", @"unload", plist];
+        rc = SWRunFirst(SWLaunchctlPaths(), args, &out, &e);
+        if (rc == -1) {
+            if (msg) *msg = [NSString stringWithFormat:@"launchctl not runnable (%@)", SWErrText(e)];
+            return NO;
+        }
+        if (rc != 0 && msg) {
+            NSString *t = [out stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            *msg = [NSString stringWithFormat:@"launchctl %@ exited %d%@%@", on ? @"load" : @"unload", rc,
+                    t.length ? @": " : @"", t];
+        }
+        if (!on) {
+            usleep(500 * 1000);
+            if (SWDetectSSHPort() != 0) {   // van con listener (khong do launchd quan ly): kill
+                SWKillByName(@"sshd", SIGKILL, NULL);
+                SWKillByName(@"dropbear", SIGKILL, NULL);
+            }
+        }
+        return rc == 0;
+    }
+    if (!on) {
+        int e1 = 0;
+        int a = SWKillByName(@"sshd", SIGKILL, &e1);
+        int b = SWKillByName(@"dropbear", SIGKILL, &e1);
+        if (a <= 0 && b <= 0 && msg) *msg = @"No SSH launchd plist found and no sshd/dropbear process to kill.";
+        return (a > 0 || b > 0);
+    }
+    NSArray<NSString *> *sshdPaths = @[@"/var/jb/usr/sbin/sshd", @"/usr/sbin/sshd"];
+    rc = SWRunFirst(sshdPaths, @[@"sshd"], &out, &e);
+    if (rc == 0) return YES;
+    rc = SWRunFirst(@[@"/var/jb/usr/sbin/dropbear", @"/var/jb/usr/local/sbin/dropbear", @"/usr/sbin/dropbear"],
+                    @[@"dropbear", @"-R", @"-p", @"22"], &out, &e);
+    if (rc == 0) return YES;
+    if (msg) *msg = @"No SSH launchd plist (com.openssh.sshd.plist) and no sshd/dropbear binary could be started. "
+                    @"Is OpenSSH installed (Sileo -> openssh)?";
+    return NO;
+}
+
+#pragma mark - Accessibility (libAccessibility.dylib)
+
+static void *SWAXHandle(void) {
+    static void *h;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        h = dlopen("/usr/lib/libAccessibility.dylib", RTLD_NOW);
+        if (!h) h = RTLD_DEFAULT;
+    });
+    return h;
+}
+
+static BOOL SWAXGet(NSDictionary<NSString *, NSString *> *item, BOOL *out) {
+    NSString *nm = item[@"get"];
+    void *f = dlsym(SWAXHandle(), nm.UTF8String);
+    if (!f) return NO;
+    if (out) *out = ((unsigned char (*)(void))f)() != 0;
+    return YES;
+}
+
+static BOOL SWAXSet(NSDictionary<NSString *, NSString *> *item, BOOL on) {
+    NSString *nm = item[@"set"];
+    void *f = dlsym(SWAXHandle(), nm.UTF8String);
+    if (!f) return NO;
+    ((void (*)(unsigned char))f)(on ? 1 : 0);
+    return YES;
+}
+
+// Chay block voi euid = user "mobile" (neu dang la root nhung ruid/suid cho phep quay lai).
+// Dung khi cai dat accessibility ghi nham vao domain preferences cua root thay vi cua mobile.
+static BOOL SWRunAsMobile(void (^blk)(void)) {
+    struct passwd *pw = getpwnam("mobile");
+    uid_t mu = pw ? pw->pw_uid : 501;
+    uid_t saved = geteuid();
+    if (saved == mu) {
+        blk();
+        return YES;
+    }
+    if (seteuid(mu) != 0) return NO;
+    blk();
+    (void)seteuid(saved);
+    return geteuid() == saved;
+}
+
+#pragma mark - /var/tmp/metal.args
+
+static NSString *SWTokenKey(NSString *t) {
+    NSRange r = [t rangeOfString:@"="];
+    return r.location == NSNotFound ? t : [t substringToIndex:r.location];
+}
+
+// Doc file hien tai. *info la mo ta de hien thi. File chua ton tai -> mang rong.
+static NSMutableArray<NSString *> *SWReadMetalTokens(NSString **info) {
+    NSMutableArray<NSString *> *tokens = [NSMutableArray array];
+    NSError *err = nil;
+    NSData *d = [NSData dataWithContentsOfFile:kMetalArgsPath options:0 error:&err];
+    if (!d) {
+        if (![NSFileManager.defaultManager fileExistsAtPath:kMetalArgsPath]) {
+            if (info) *info = @"(file does not exist)";
+        } else {
+            if (info) *info = [NSString stringWithFormat:@"N/A (%@)", err.localizedDescription ?: @"read error"];
+        }
+        return tokens;
+    }
+    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
+    for (NSString *t in [s componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]) {
+        if (t.length) [tokens addObject:t];
+    }
+    if (info) *info = tokens.count ? [tokens componentsJoinedByString:@" "] : @"(empty)";
+    return tokens;
+}
+
+static BOOL SWFlagOn(NSArray<NSString *> *tokens, NSString *key) {
+    BOOL on = NO;
+    for (NSString *t in tokens) {
+        if (![SWTokenKey(t) isEqualToString:key]) continue;
+        NSRange r = [t rangeOfString:@"="];
+        NSString *val = (r.location == NSNotFound) ? @"1" : [t substringFromIndex:r.location + 1];
+        on = !(val.length == 0 || [val isEqualToString:@"0"]);   // lan xuat hien cuoi cung thang
+    }
+    return on;
+}
+
+static BOOL SWWriteMetalTokens(NSArray<NSString *> *tokens, NSString **msg) {
+    NSString *content = tokens.count ? [[tokens componentsJoinedByString:@" "] stringByAppendingString:@"\n"] : @"";
+    NSData *data = [content dataUsingEncoding:NSUTF8StringEncoding];
+    NSError *e = nil;
+    BOOL ok = [data writeToFile:kMetalArgsPath options:NSDataWritingAtomic error:&e];
+    if (!ok) {
+        e = nil;
+        ok = [data writeToFile:kMetalArgsPath options:0 error:&e];   // /var/tmp co sticky bit: rename co the bi tu choi
+    }
+    if (ok) {
+        chmod(kMetalArgsPath.fileSystemRepresentation, 0644);
+        return YES;
+    }
+    if (msg) {
+        *msg = [NSString stringWithFormat:@"%@ (%@ %ld)", e.localizedDescription ?: @"write error",
+                e.domain ?: @"", (long)e.code];
+    }
+    return NO;
+}
+
+// Doi mot co key=1 / bo key; giu nguyen cac token la va doc lai file moi nhat truoc khi ghi.
+static BOOL SWSetMetalFlag(NSString *key, BOOL on, NSString **msg) {
+    NSMutableArray<NSString *> *tokens = SWReadMetalTokens(NULL);
+    NSIndexSet *idx = [tokens indexesOfObjectsPassingTest:^BOOL(NSString *t, NSUInteger i, BOOL *stop) {
+        return [SWTokenKey(t) isEqualToString:key];
+    }];
+    [tokens removeObjectsAtIndexes:idx];
+    if (on) [tokens addObject:[key stringByAppendingString:@"=1"]];
+    return SWWriteMetalTokens(tokens, msg);
+}
+
+#pragma mark - Log / snapshot helpers
 
 static NSString *SWReadTailOfFile(NSString *path, NSUInteger maxBytes) {
     NSData *d = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:NULL];
@@ -519,11 +1155,11 @@ static NSArray<NSString *> *SWTailLines(NSString *text, BOOL filtered, NSUIntege
     return out;
 }
 
-// Doc 80 dong cuoi tu /var/log/sweetlog.txt, neu khong co thi tu dmesg.
-static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
+// Doc `count` dong cuoi tu /var/log/sweetlog.txt, neu khong co thi tu dmesg.
+static NSString *SWFetchKernelLog(BOOL filtered, NSUInteger count, NSString **sourceOut) {
     NSString *fileText = SWReadTailOfFile(kSweetLogPath, 1024 * 1024);
     if (fileText) {
-        NSArray<NSString *> *lines = SWTailLines(fileText, filtered, kLogLines);
+        NSArray<NSString *> *lines = SWTailLines(fileText, filtered, count);
         if (lines.count > 0) {
             if (sourceOut) *sourceOut = kSweetLogPath;
             return [lines componentsJoinedByString:@"\n"];
@@ -535,7 +1171,7 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
     int rc = SWRunFirst(@[@"/sbin/dmesg", @"/usr/sbin/dmesg", @"/usr/bin/dmesg", @"/bin/dmesg"],
                         @[@"dmesg"], &dmesg, &err);
     if (rc >= 0 && dmesg) {
-        NSArray<NSString *> *lines = SWTailLines(dmesg, filtered, kLogLines);
+        NSArray<NSString *> *lines = SWTailLines(dmesg, filtered, count);
         if (sourceOut) *sourceOut = @"dmesg";
         if (lines.count > 0) return [lines componentsJoinedByString:@"\n"];
         return filtered ? @"(no matching SWEET FB / SWEET TOUCH / SWEET MEM / hakios lines in dmesg)"
@@ -552,12 +1188,103 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
             kSweetLogPath, SWErrText(err ? err : ENOENT)];
 }
 
+static NSString *SWUptimeString(void) {
+    struct timeval bt;
+    size_t l = sizeof(bt);
+    int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+    if (sysctl(mib, 2, &bt, &l, NULL, 0) != 0 || bt.tv_sec == 0) return @"N/A";
+    return SWFormatDuration([NSDate date].timeIntervalSince1970 - (double)bt.tv_sec);
+}
+
+static NSDateFormatter *SWPosixFormatter(NSString *fmt) {
+    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+    f.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    f.dateFormat = fmt;
+    return f;
+}
+
+// Anh chup toan bo thong tin debug thanh mot chuoi van ban (chay o thread nen).
+// uiInfo: phan thong tin chi lay duoc tu UI (man hinh, thermal, SSH, accessibility) do thread chinh chuan bi.
+static NSString *SWBuildSnapshot(NSString *uiInfo) {
+    NSMutableString *s = [NSMutableString string];
+    NSString *ver = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+    [s appendFormat:@"SapphireTools v%@ debug snapshot\n", ver];
+    [s appendFormat:@"date: %@\n", [SWPosixFormatter(@"yyyy-MM-dd HH:mm:ss Z") stringFromDate:[NSDate date]]];
+    [s appendFormat:@"uid=%d euid=%d gid=%d egid=%d\n\n", (int)getuid(), (int)geteuid(), (int)getgid(), (int)getegid()];
+
+    [s appendString:@"== Device ==\n"];
+    for (NSString *k in @[@"hw.machine", @"hw.model", @"kern.osversion", @"kern.osrelease", @"kern.bootargs"]) {
+        [s appendFormat:@"%@ = %@\n", k, SWSysctlDisplay(k)];
+    }
+    NSString *kv = SWSysctlDisplay(@"kern.version");
+    NSRange nl = [kv rangeOfString:@"\n"];
+    if (nl.location != NSNotFound) kv = [kv substringToIndex:nl.location];
+    [s appendFormat:@"kern.version = %@\n", kv];
+    [s appendFormat:@"uptime = %@\n\n", SWUptimeString()];
+
+    [s appendString:@"== UI / display / thermal / ssh ==\n"];
+    [s appendString:uiInfo.length ? uiInfo : @"(n/a)"];
+    [s appendString:@"\n\n== kern.sweet_* sysctls ==\n"];
+    NSArray<NSDictionary *> *entries = SWEnumerateSysctls(kSweetPrefix);
+    if (entries.count == 0) [s appendString:@"(none found - is this the sapphire kernel?)\n"];
+    for (NSDictionary *e in entries) {
+        NSString *name = e[@"name"];
+        [s appendFormat:@"%@ = %@   [%@ %@]\n", name, SWSysctlDisplay(name), e[@"access"], e[@"type"]];
+    }
+
+    [s appendFormat:@"\n== %@ ==\n", kMetalArgsPath];
+    NSString *info = nil;
+    SWReadMetalTokens(&info);
+    [s appendFormat:@"%@\n", info ?: @"(n/a)"];
+
+    [s appendString:@"\n== Services ==\n"];
+    NSDictionary *procs = SWProcessMap();
+    for (NSArray<NSString *> *svc in SWServiceList()) {
+        [s appendFormat:@"%-14s %@\n", svc[0].UTF8String, SWDescribeProcs(procs[svc[0]])];
+    }
+    for (NSString *extra in @[@"sshd", @"dropbear"]) {
+        if (procs[extra]) [s appendFormat:@"%-14s %@\n", extra.UTF8String, SWDescribeProcs(procs[extra])];
+    }
+
+    [s appendString:@"\n== Network ==\n"];
+    NSArray<NSString *> *ips = SWInterfaceAddresses(NULL);
+    [s appendString:ips.count ? [ips componentsJoinedByString:@"\n"] : @"(no IPv4 address)"];
+
+    NSString *src = nil;
+    NSString *log = SWFetchKernelLog(NO, kSnapshotLogLines, &src);
+    [s appendFormat:@"\n\n== log: last %lu lines of %@ ==\n%@\n", (unsigned long)kSnapshotLogLines, src ?: @"N/A", log];
+    return s;
+}
+
+// Luu snapshot vao /var/tmp (de scp ve PC), chi giu 5 file moi nhat. Tra ve duong dan hoac nil.
+static NSString *SWSaveSnapshot(NSString *text) {
+    NSString *stamp = [SWPosixFormatter(@"yyyyMMdd-HHmmss") stringFromDate:[NSDate date]];
+    NSString *path = [kSnapshotDir stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"%@%@.txt", kSnapshotPrefix, stamp]];
+    NSError *e = nil;
+    if (![text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&e]) return nil;
+    chmod(path.fileSystemRepresentation, 0644);
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSMutableArray<NSString *> *old = [NSMutableArray array];
+    for (NSString *f in [fm contentsOfDirectoryAtPath:kSnapshotDir error:NULL]) {
+        if ([f hasPrefix:kSnapshotPrefix] && [f hasSuffix:@".txt"]) [old addObject:f];
+    }
+    [old sortUsingSelector:@selector(compare:)];   // ten co timestamp nen sap xep chu cai = theo thoi gian
+    while (old.count > 5) {
+        [fm removeItemAtPath:[kSnapshotDir stringByAppendingPathComponent:old.firstObject] error:NULL];
+        [old removeObjectAtIndex:0];
+    }
+    return path;
+}
+
 #pragma mark - Log viewer
 
 @interface SWLogViewController : UIViewController
 @property (nonatomic, strong) UITextView *textView;
 @property (nonatomic, strong) UILabel *sourceLabel;
 @property (nonatomic, strong) UISegmentedControl *filterControl;
+@property (nonatomic, assign) NSUInteger generation;
 @end
 
 @implementation SWLogViewController
@@ -622,19 +1349,232 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 
 - (void)reload {
     BOOL filtered = (self.filterControl.selectedSegmentIndex == 0);
+    NSUInteger gen = ++self.generation;   // bo qua ket qua cu neu nguoi dung doi bo loc lien tuc
     self.sourceLabel.text = @"Loading…";
     __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSString *src = nil;
-        NSString *text = SWFetchKernelLog(filtered, &src);
+        NSString *text = SWFetchKernelLog(filtered, kLogLines, &src);
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(ws) s = ws;
-            if (!s) return;
+            if (!s || s.generation != gen) return;
             s.textView.text = text;
             s.sourceLabel.text = [NSString stringWithFormat:@"Source: %@ • last %lu lines%@",
                                   src ?: @"N/A", (unsigned long)kLogLines, filtered ? @" (filtered)" : @""];
             [s.textView layoutIfNeeded];
             [s.textView scrollRangeToVisible:NSMakeRange(s.textView.text.length, 0)];
+        });
+    });
+}
+
+@end
+
+#pragma mark - Sysctl Explorer
+
+// Liet ke + sua moi kern.sweet_* (ke ca sysctl moi them sau nay, khong can sua app).
+@interface SWSysctlExplorerViewController : UITableViewController
+@property (nonatomic, copy) NSArray<NSDictionary *> *entries;
+@property (nonatomic, copy) NSDictionary<NSString *, NSString *> *values;
+@property (nonatomic, copy) NSDictionary<NSString *, NSNumber *> *deltas;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *prevNums;
+@property (nonatomic, strong) NSTimer *timer;
+@property (nonatomic, assign) BOOL loading;
+@end
+
+@implementation SWSysctlExplorerViewController
+
+- (instancetype)init {
+    self = [super initWithStyle:UITableViewStyleInsetGrouped];
+    if (self) {
+        _entries = @[];
+        _values = @{};
+        _deltas = @{};
+        _prevNums = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"kern.sweet_*";
+    self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeNever;
+    UIBarButtonItem *copy = [[UIBarButtonItem alloc] initWithTitle:@"Copy all"
+                                                             style:UIBarButtonItemStylePlain
+                                                            target:self action:@selector(copyAll)];
+    UIBarButtonItem *refresh =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+                                                      target:self action:@selector(fullReload)];
+    self.navigationItem.rightBarButtonItems = @[refresh, copy];
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+    self.tableView.estimatedRowHeight = 56;
+    [self reloadFull:YES];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    if (!self.timer) {
+        __weak typeof(self) ws = self;
+        self.timer = [NSTimer scheduledTimerWithTimeInterval:2.0 repeats:YES block:^(NSTimer *t) {
+            [ws reloadFull:NO];
+        }];
+        self.timer.tolerance = 0.3;
+    }
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self.timer invalidate];
+    self.timer = nil;
+}
+
+- (void)fullReload { [self reloadFull:YES]; }
+
+- (void)reloadFull:(BOOL)full {
+    if (self.loading) return;
+    self.loading = YES;
+    NSArray<NSDictionary *> *known = self.entries;
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSArray<NSDictionary *> *entries = (full || known.count == 0) ? SWEnumerateSysctls(kSweetPrefix) : known;
+        NSMutableDictionary<NSString *, NSString *> *vals = [NSMutableDictionary dictionary];
+        for (NSDictionary *e in entries) {
+            NSString *name = e[@"name"];
+            int err = 0;
+            NSString *v = SWReadSysctlGuarded(name, &err);
+            vals[name] = v ? (v.length ? v : @"(empty)") : SWNAText(err);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            NSMutableDictionary<NSString *, NSNumber *> *deltas = [NSMutableDictionary dictionary];
+            for (NSDictionary *e in entries) {
+                NSString *name = e[@"name"];
+                long long n = 0;
+                if (![e[@"type"] isEqualToString:@"string"] && SWParseInt(vals[name], &n)) {
+                    NSNumber *prev = s.prevNums[name];
+                    if (prev && prev.longLongValue != n) deltas[name] = @(n - prev.longLongValue);
+                    s.prevNums[name] = @(n);
+                }
+            }
+            s.entries = entries;
+            s.values = vals;
+            s.deltas = deltas;
+            s.loading = NO;
+            [s.tableView reloadData];
+        });
+    });
+}
+
+- (NSString *)plainText {
+    NSMutableString *t = [NSMutableString string];
+    for (NSDictionary *e in self.entries) {
+        [t appendFormat:@"%@ = %@   [%@ %@]\n", e[@"name"], self.values[e[@"name"]] ?: @"?", e[@"access"], e[@"type"]];
+    }
+    return t;
+}
+
+- (void)copyAll {
+    UIPasteboard.generalPasteboard.string = [self plainText];
+    SWToast(self.view, @"All sysctls copied");
+}
+
+#pragma mark Table
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
+    return (NSInteger)self.entries.count;
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)section {
+    if (self.entries.count == 0) {
+        return @"No kern.sweet_* sysctls found. Is the sapphire kernel running?";
+    }
+    return @"Tap a row to copy or (if RW) edit. *_await sysctls block in the kernel and are never read. "
+           @"(+n) = change since the previous refresh.";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:@"x"];
+    if (!c) {
+        c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"x"];
+        c.textLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightMedium];
+        c.textLabel.numberOfLines = 0;
+        c.detailTextLabel.font = [UIFont monospacedDigitSystemFontOfSize:14 weight:UIFontWeightRegular];
+        c.detailTextLabel.numberOfLines = 0;
+    }
+    NSDictionary *e = self.entries[(NSUInteger)ip.row];
+    NSString *name = e[@"name"];
+    c.textLabel.text = [NSString stringWithFormat:@"%@  [%@ %@]", name, e[@"access"], e[@"type"]];
+    NSNumber *d = self.deltas[name];
+    NSString *v = self.values[name] ?: @"…";
+    c.detailTextLabel.text = d ? [NSString stringWithFormat:@"%@   (%+lld)", v, d.longLongValue] : v;
+    c.detailTextLabel.textColor = d ? UIColor.systemOrangeColor : UIColor.secondaryLabelColor;
+    return c;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    NSDictionary *e = self.entries[(NSUInteger)ip.row];
+    NSString *name = e[@"name"];
+    NSString *cur = self.values[name] ?: @"";
+    BOOL writable = [e[@"writable"] boolValue] && !SWSysctlLooksBlocking(name);
+    BOOL isString = [e[@"type"] isEqualToString:@"string"];
+    BOOL isInt = [e[@"type"] isEqualToString:@"int"] || [e[@"type"] isEqualToString:@"quad"];
+
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:name message:cur
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    if (writable && (isString || isInt)) {
+        [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.text = cur;
+            tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+            tf.autocorrectionType = UITextAutocorrectionTypeNo;
+            tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+            if (isInt) tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+        }];
+    }
+    __weak typeof(self) ws = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"Copy" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        UIPasteboard.generalPasteboard.string = [NSString stringWithFormat:@"%@ = %@", name, cur];
+        SWToast(ws.view, @"Copied");
+    }]];
+    if (writable && (isString || isInt)) {
+        __weak UIAlertController *wa = a;
+        [a addAction:[UIAlertAction actionWithTitle:@"Set" style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *x) {
+            NSString *txt = wa.textFields.firstObject.text ?: @"";
+            [ws applyValue:txt toName:name asString:isString];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)applyValue:(NSString *)txt toName:(NSString *)name asString:(BOOL)isString {
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int err = 0;
+        BOOL ok;
+        long long v = 0;
+        if (isString) {
+            ok = [SWSysctl setString:txt name:name errorCode:&err];
+        } else if (SWParseInt(txt, &v)) {
+            ok = [SWSysctl setInteger:v name:name errorCode:&err];
+        } else {
+            ok = NO;
+            err = EINVAL;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            if (!ok) {
+                UIAlertController *a = [UIAlertController alertControllerWithTitle:
+                                        [NSString stringWithFormat:@"Cannot write %@", name]
+                                                                           message:SWErrText(err)
+                                                                    preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                [s presentViewController:a animated:YES completion:nil];
+            }
+            [s reloadFull:NO];
         });
     });
 }
@@ -647,6 +1587,7 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) NSMutableArray<NSMutableArray<UITableViewCell *> *> *sections;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, void (^)(void)> *actions;
+@property (nonatomic, strong) dispatch_queue_t ioQueue;   // serial: doc/ghi sysctl theo thu tu, khong chan main thread
 
 // Graphics & Metal
 @property (nonatomic, strong) UISegmentedControl *metalSeg;
@@ -658,6 +1599,20 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 @property (nonatomic, strong) NSArray<UISwitch *> *metalSwitches;
 @property (nonatomic, strong) UILabel *metalArgsLabel;
 
+// Display
+@property (nonatomic, strong) UILabel *screenLabel;
+@property (nonatomic, strong) UILabel *thermalLabel;
+@property (nonatomic, strong) UISwitch *fpsSwitch;
+@property (nonatomic, strong) UILabel *fpsLabel;
+@property (nonatomic, strong) UIView *fpsBar;
+@property (nonatomic, strong) CALayer *fpsDot;
+@property (nonatomic, strong) CADisplayLink *link;
+@property (nonatomic, assign) CFTimeInterval fpsLast;
+@property (nonatomic, assign) CFTimeInterval fpsWinStart;
+@property (nonatomic, assign) double fpsWorst;
+@property (nonatomic, assign) NSUInteger fpsFrames;
+@property (nonatomic, assign) NSUInteger fpsDrops;
+
 // Touch
 @property (nonatomic, strong) UISegmentedControl *tapSeg;
 @property (nonatomic, strong) UILabel *tapValue;
@@ -666,6 +1621,7 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 @property (nonatomic, strong) UISlider *staleSlider;
 @property (nonatomic, strong) UILabel *staleValue;
 @property (nonatomic, strong) UILabel *touchRateLabel;
+@property (nonatomic, strong) UILabel *touchCountersLabel;
 
 // Diagnostics
 @property (nonatomic, strong) UILabel *frameStatsLabel;
@@ -676,18 +1632,28 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 @property (nonatomic, copy) NSString *surfaceFull;
 @property (nonatomic, copy) NSString *bootargsFull;
 
-// Network, Accessibility & Services (v2)
-@property (nonatomic, strong) UILabel *wifiIpLabel;
-@property (nonatomic, copy) NSString *wifiIpFull;
+// Services
+@property (nonatomic, strong) NSMutableArray<UILabel *> *svcLabels;
+@property (nonatomic, copy) NSDictionary<NSString *, NSArray<NSDictionary *> *> *procMap;
+
+// SSH
 @property (nonatomic, strong) UISwitch *sshSwitch;
 @property (nonatomic, strong) UILabel *sshStatusLabel;
-@property (nonatomic, strong) UISwitch *reduceTransSwitch;
-@property (nonatomic, strong) UISwitch *reduceMotionSwitch;
-@property (nonatomic, strong) UILabel *servicesLabel;
+@property (nonatomic, strong) UILabel *ipLabel;
+@property (nonatomic, copy) NSString *primaryIP;
+@property (nonatomic, assign) uint16_t sshPort;
+@property (nonatomic, assign) BOOL sshBusy;
+
+// Accessibility
+@property (nonatomic, strong) NSArray<UISwitch *> *axSwitches;
+@property (nonatomic, strong) NSArray<UILabel *> *axLabels;
+@property (nonatomic, strong) UISwitch *axMobileSwitch;
 
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) BOOL visible;
 @property (nonatomic, assign) BOOL appActive;
+@property (nonatomic, assign) BOOL liveBusy;
+@property (nonatomic, assign) BOOL shownRootWarning;
 @end
 
 @implementation SWMainViewController
@@ -702,6 +1668,7 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
                                                       target:self action:@selector(refreshTapped)];
     self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
     self.appActive = YES;
+    self.ioQueue = dispatch_queue_create("com.sapphire.tools.io", DISPATCH_QUEUE_SERIAL);
 
     self.table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
     self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
@@ -713,22 +1680,38 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
     [self.view addSubview:self.table];
 
     [self buildSections];
-    [self refreshControls];
-    [self refreshLive];
+    [self refreshDisplayInfo];
+    [self refreshAX];
 
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
     [nc addObserver:self selector:@selector(appBecameActive)
                name:UIApplicationDidBecomeActiveNotification object:nil];
     [nc addObserver:self selector:@selector(appResigned)
                name:UIApplicationWillResignActiveNotification object:nil];
+    [nc addObserver:self selector:@selector(refreshAX)
+               name:UIAccessibilityReduceMotionStatusDidChangeNotification object:nil];
+    [nc addObserver:self selector:@selector(refreshAX)
+               name:UIAccessibilityReduceTransparencyStatusDidChangeNotification object:nil];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
     self.visible = YES;
-    [self refreshControls];
-    [self refreshLive];
+    [self refreshAll];
     [self updateTimer];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    if (!self.shownRootWarning && geteuid() != 0) {
+        self.shownRootWarning = YES;
+        [self alertTitle:@"Not running as root"
+                 message:[NSString stringWithFormat:
+                          @"uid=%d euid=%d. Writing sysctl values, SSH/daemon control and reboot will fail.\n\n"
+                          @"Fix: chown root:wheel + chmod 6755 on the app binary (make install does this), "
+                          @"and make sure /Applications is not mounted nosuid.",
+                          (int)getuid(), (int)geteuid()]];
+    }
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
@@ -739,10 +1722,7 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 
 - (void)appBecameActive {
     self.appActive = YES;
-    if (self.visible) {
-        [self refreshControls];
-        [self refreshLive];
-    }
+    if (self.visible) [self refreshAll];
     [self updateTimer];
 }
 
@@ -751,6 +1731,7 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
     [self updateTimer];
 }
 
+// Timer 2 s + CADisplayLink chi chay khi man hinh dang hien va app active.
 - (void)updateTimer {
     BOOL want = self.visible && self.appActive && self.autoSwitch.isOn;
     if (want && !self.timer) {
@@ -763,6 +1744,15 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
         [self.timer invalidate];
         self.timer = nil;
     }
+    [self updateFPSLink];
+}
+
+- (void)refreshAll {
+    [self refreshControls];
+    [self refreshLive];
+    [self refreshSSH];
+    [self refreshAX];
+    [self refreshDisplayInfo];
 }
 
 #pragma mark Building the UI
@@ -789,14 +1779,22 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 
     UILabel *t = SWMakeLabel([UIFont systemFontOfSize:16], UIColor.labelColor, 0);
     t.text = title;
-    [t setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
-    [t setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    UIView *titleView = t;
+    NSString *hint = SWHintForTitle(title);
+    if (hint) {
+        UIStackView *ts = [[UIStackView alloc] initWithArrangedSubviews:@[t, SWHintLabel(hint)]];
+        ts.axis = UILayoutConstraintAxisVertical;
+        ts.spacing = 2;
+        titleView = ts;
+    }
+    [titleView setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    [titleView setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
 
     UIStackView *top = [[UIStackView alloc] init];
     top.axis = UILayoutConstraintAxisHorizontal;
     top.alignment = UIStackViewAlignmentCenter;
     top.spacing = 8;
-    [top addArrangedSubview:t];
+    [top addArrangedSubview:titleView];
     if (value) {
         [value setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
         [value setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
@@ -828,7 +1826,15 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 }
 
 - (UITableViewCell *)buttonCellWithTitle:(NSString *)title color:(UIColor *)color {
-    UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+    NSString *hint = SWHintForTitle(title);
+    if (hint) {
+        c.detailTextLabel.text = hint;
+        c.detailTextLabel.font = [UIFont systemFontOfSize:12];
+        c.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+        c.detailTextLabel.textAlignment = NSTextAlignmentCenter;
+        c.detailTextLabel.numberOfLines = 0;
+    }
     c.textLabel.text = title;
     c.textLabel.textAlignment = NSTextAlignmentCenter;
     c.textLabel.textColor = color;
@@ -846,143 +1852,209 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
     [rows addObject:cell];
 }
 
+- (UISwitch *)makeSwitch:(SEL)sel tag:(NSInteger)tag {
+    UISwitch *s = [[UISwitch alloc] init];
+    s.tag = tag;
+    [s addTarget:self action:sel forControlEvents:UIControlEventValueChanged];
+    return s;
+}
+
 - (void)buildSections {
     __weak typeof(self) ws = self;
     self.sections = [NSMutableArray array];
-    for (int i = 0; i < 5; i++) [self.sections addObject:[NSMutableArray array]];
+    for (int i = 0; i < SecCount; i++) [self.sections addObject:[NSMutableArray array]];
     self.actions = [NSMutableDictionary dictionary];
+    UIColor *blue = UIColor.systemBlueColor;
 
-    // ---------- Section 0: Graphics & Metal ----------
+    // ---------- Graphics & Metal ----------
     self.metalSeg = [[UISegmentedControl alloc] initWithItems:@[@"Off", @"SapphireMetal", @"HakiosMetal"]];
     [self.metalSeg addTarget:self action:@selector(metalChanged:) forControlEvents:UIControlEventValueChanged];
     self.metalValue = SWValueLabel();
     [self addCell:[self cellWithTitle:@"Metal mode (kern.sweet_metal)" value:self.metalValue
-                              control:self.metalSeg below:YES] toSection:0 action:nil];
+                              control:self.metalSeg below:YES] toSection:SecGraphics action:nil];
 
     self.rscaleSlider = [self makeSliderMin:400 max:1000 tag:kTagRScale];
     self.rscaleValue = SWValueLabel();
     [self addCell:[self cellWithTitle:@"FB render scale (kern.sweet_fb_rscale)" value:self.rscaleValue
-                              control:self.rscaleSlider below:YES] toSection:0 action:nil];
+                              control:self.rscaleSlider below:YES] toSection:SecGraphics action:nil];
 
-    self.flushSwitch = [[UISwitch alloc] init];
-    [self.flushSwitch addTarget:self action:@selector(flushChanged:) forControlEvents:UIControlEventValueChanged];
+    self.flushSwitch = [self makeSwitch:@selector(flushChanged:) tag:0];
     self.flushValue = SWValueLabel();
     [self addCell:[self cellWithTitle:@"FB flip flush (kern.sweet_fb_flipflush)" value:self.flushValue
-                              control:self.flushSwitch below:NO] toSection:0 action:nil];
+                              control:self.flushSwitch below:NO] toSection:SecGraphics action:nil];
 
     NSMutableArray<UISwitch *> *sw = [NSMutableArray array];
     NSArray<NSString *> *keys = SWMetalKeys();
     for (NSUInteger i = 0; i < keys.count; i++) {
-        UISwitch *s = [[UISwitch alloc] init];
-        s.tag = (NSInteger)i;
-        [s addTarget:self action:@selector(metalFlagChanged:) forControlEvents:UIControlEventValueChanged];
+        UISwitch *s = [self makeSwitch:@selector(metalFlagChanged:) tag:(NSInteger)i];
         [sw addObject:s];
         [self addCell:[self cellWithTitle:[NSString stringWithFormat:@"%@=1 (metal.args)", keys[i]]
-                                    value:nil control:s below:NO] toSection:0 action:nil];
+                                    value:nil control:s below:NO] toSection:SecGraphics action:nil];
     }
     self.metalSwitches = sw;
 
     self.metalArgsLabel = SWMonoLabel(0);
-    [self addCell:[self cellWithTitle:kMetalArgsPath value:nil control:self.metalArgsLabel below:YES]
-        toSection:0 action:nil];
+    [self addCell:[self cellWithTitle:[kMetalArgsPath stringByAppendingString:@"  (tap to edit)"]
+                                value:nil control:self.metalArgsLabel below:YES]
+        toSection:SecGraphics action:^{ [ws editMetalArgs]; }];
 
-    // ---------- Section 1: Touch ----------
+    // ---------- Display ----------
+    self.screenLabel = SWMonoLabel(0);
+    [self addCell:[self cellWithTitle:@"Screen (UIScreen)" value:nil control:self.screenLabel below:YES]
+        toSection:SecDisplay action:^{
+            UIPasteboard.generalPasteboard.string = ws.screenLabel.text ?: @"";
+            SWToast(ws.view, @"Copied");
+        }];
+
+    self.thermalLabel = SWValueLabel();
+    [self addCell:[self cellWithTitle:@"Thermal state" value:self.thermalLabel control:nil below:NO]
+        toSection:SecDisplay action:nil];
+
+    self.fpsSwitch = [self makeSwitch:@selector(fpsToggled:) tag:0];
+    [self addCell:[self cellWithTitle:@"FPS meter (CADisplayLink)" value:nil control:self.fpsSwitch below:NO]
+        toSection:SecDisplay action:nil];
+
+    self.fpsLabel = SWMonoLabel(0);
+    self.fpsLabel.text = @"off";
+    [self addCell:[self cellWithTitle:@"Measured (tap to reset)" value:nil control:self.fpsLabel below:YES]
+        toSection:SecDisplay action:^{ [ws resetFPS]; }];
+
+    self.fpsBar = [[UIView alloc] init];
+    self.fpsBar.backgroundColor = UIColor.tertiarySystemFillColor;
+    self.fpsBar.layer.cornerRadius = 7;
+    [self.fpsBar.heightAnchor constraintEqualToConstant:14].active = YES;
+    [self addCell:[self cellWithTitle:@"Motion test" value:nil control:self.fpsBar below:YES]
+        toSection:SecDisplay action:nil];
+
+    // ---------- Touch ----------
     self.tapSeg = [[UISegmentedControl alloc] initWithItems:@[@"Off", @"Single Tap", @"Double Tap"]];
     [self.tapSeg addTarget:self action:@selector(tapWakeChanged:) forControlEvents:UIControlEventValueChanged];
     self.tapValue = SWValueLabel();
     [self addCell:[self cellWithTitle:@"Tap to wake (kern.sweet_tap_wake)" value:self.tapValue
-                              control:self.tapSeg below:YES] toSection:1 action:nil];
+                              control:self.tapSeg below:YES] toSection:SecTouch action:nil];
 
     self.quietSlider = [self makeSliderMin:0 max:200 tag:kTagQuiet];
     self.quietValue = SWValueLabel();
     [self addCell:[self cellWithTitle:@"Touch quiet (kern.sweet_touch_quiet_ms)" value:self.quietValue
-                              control:self.quietSlider below:YES] toSection:1 action:nil];
+                              control:self.quietSlider below:YES] toSection:SecTouch action:nil];
 
     self.staleSlider = [self makeSliderMin:1000 max:10000 tag:kTagStale];
     self.staleValue = SWValueLabel();
     [self addCell:[self cellWithTitle:@"Touch stale (kern.sweet_touch_stale_ms)" value:self.staleValue
-                              control:self.staleSlider below:YES] toSection:1 action:nil];
+                              control:self.staleSlider below:YES] toSection:SecTouch action:nil];
 
     self.touchRateLabel = SWMonoLabel(0);
     [self addCell:[self cellWithTitle:@"Touch rate (kern.sweet_touch_rate)" value:nil
-                              control:self.touchRateLabel below:YES] toSection:1 action:nil];
+                              control:self.touchRateLabel below:YES] toSection:SecTouch action:nil];
 
-    [self addCell:[self buttonCellWithTitle:@"Reset Touch Rate" color:UIColor.systemBlueColor]
-        toSection:1 action:^{ [ws resetTouchRate]; }];
+    self.touchCountersLabel = SWMonoLabel(0);
+    [self addCell:[self cellWithTitle:@"FOD / tap-wake counters" value:nil
+                              control:self.touchCountersLabel below:YES] toSection:SecTouch action:nil];
 
-    // ---------- Section 2: Live Diagnostics ----------
+    [self addCell:[self buttonCellWithTitle:@"Reset Touch Rate" color:blue]
+        toSection:SecTouch action:^{ [ws resetTouchRate]; }];
+
+    // ---------- Live Diagnostics ----------
     self.frameStatsLabel = SWMonoLabel(0);
     [self addCell:[self cellWithTitle:@"Frame stats (kern.sweet_fb_frame_stats)" value:nil
                               control:self.frameStatsLabel below:YES]
-        toSection:2 action:^{ [ws showValueTitle:kSysFrameStats text:ws.frameStatsFull]; }];
+        toSection:SecDiag action:^{ [ws showValueTitle:kSysFrameStats text:ws.frameStatsFull]; }];
 
     self.surfaceLabel = SWMonoLabel(0);
     [self addCell:[self cellWithTitle:@"FB surface (kern.sweet_fb_surface)" value:nil
                               control:self.surfaceLabel below:YES]
-        toSection:2 action:^{ [ws showValueTitle:kSysSurface text:ws.surfaceFull]; }];
+        toSection:SecDiag action:^{ [ws showValueTitle:kSysSurface text:ws.surfaceFull]; }];
 
     self.bootargsLabel = SWMonoLabel(3);
     [self addCell:[self cellWithTitle:@"Boot args (kern.bootargs)" value:nil
                               control:self.bootargsLabel below:YES]
-        toSection:2 action:^{ [ws showValueTitle:kSysBootargs text:ws.bootargsFull]; }];
+        toSection:SecDiag action:^{ [ws showValueTitle:kSysBootargs text:ws.bootargsFull]; }];
 
-    self.autoSwitch = [[UISwitch alloc] init];
+    self.autoSwitch = [self makeSwitch:@selector(autoToggled:) tag:0];
     self.autoSwitch.on = YES;
-    [self.autoSwitch addTarget:self action:@selector(autoToggled:) forControlEvents:UIControlEventValueChanged];
     [self addCell:[self cellWithTitle:@"Auto refresh (every 2 s)" value:nil control:self.autoSwitch below:NO]
-        toSection:2 action:nil];
+        toSection:SecDiag action:nil];
 
-    [self addCell:[self buttonCellWithTitle:@"Refresh now" color:UIColor.systemBlueColor]
-        toSection:2 action:^{ [ws refreshTapped]; }];
+    [self addCell:[self buttonCellWithTitle:@"Refresh now" color:blue]
+        toSection:SecDiag action:^{ [ws refreshTapped]; }];
 
-    [self addCell:[self buttonCellWithTitle:@"View Recent Kernel Log" color:UIColor.systemBlueColor]
-        toSection:2 action:^{ [ws showKernelLog]; }];
+    [self addCell:[self buttonCellWithTitle:@"View Recent Kernel Log" color:blue]
+        toSection:SecDiag action:^{ [ws showKernelLog]; }];
 
-    [self addCell:[self buttonCellWithTitle:@"Export / Share Full Snapshot" color:UIColor.systemBlueColor]
-        toSection:2 action:^{ [ws exportSnapshot]; }];
+    // ---------- Services ----------
+    self.svcLabels = [NSMutableArray array];
+    for (NSArray<NSString *> *svc in SWServiceList()) {
+        UILabel *v = SWValueLabel();
+        [self.svcLabels addObject:v];
+        NSString *name = svc[0];
+        [self addCell:[self cellWithTitle:[NSString stringWithFormat:@"%@ (%@)", name, svc[1]]
+                                    value:v control:nil below:NO]
+            toSection:SecServices action:^{ [ws confirmRestartService:name]; }];
+    }
 
-    // ---------- Section 3: Network, Accessibility & Services ----------
-    self.wifiIpLabel = SWValueLabel();
-    [self addCell:[self cellWithTitle:@"Wi-Fi IP (en0)" value:self.wifiIpLabel control:nil below:NO]
-        toSection:3 action:^{
-            if (ws.wifiIpFull.length > 0 && ![ws.wifiIpFull isEqualToString:@"N/A"]) {
-                UIPasteboard.generalPasteboard.string = ws.wifiIpFull;
-                [ws alertTitle:@"Copied" message:[NSString stringWithFormat:@"ssh root@%@", ws.wifiIpFull]];
-            }
-        }];
-
-    self.sshSwitch = [[UISwitch alloc] init];
-    [self.sshSwitch addTarget:self action:@selector(sshToggled:) forControlEvents:UIControlEventValueChanged];
+    // ---------- SSH ----------
+    self.sshSwitch = [self makeSwitch:@selector(sshToggled:) tag:0];
     self.sshStatusLabel = SWValueLabel();
-    [self addCell:[self cellWithTitle:@"SSH Daemon (sshd)" value:self.sshStatusLabel
-                              control:self.sshSwitch below:NO] toSection:3 action:nil];
+    self.sshStatusLabel.text = @"…";
+    [self addCell:[self cellWithTitle:@"SSH daemon" value:self.sshStatusLabel control:self.sshSwitch below:NO]
+        toSection:SecSSH action:nil];
 
-    self.reduceTransSwitch = [[UISwitch alloc] init];
-    [self.reduceTransSwitch addTarget:self action:@selector(reduceTransChanged:) forControlEvents:UIControlEventValueChanged];
-    [self addCell:[self cellWithTitle:@"Reduce Transparency (live)" value:nil
-                              control:self.reduceTransSwitch below:NO] toSection:3 action:nil];
+    self.ipLabel = SWMonoLabel(0);
+    self.ipLabel.text = @"…";
+    [self addCell:[self cellWithTitle:@"Device IP (tap: copy ssh command)" value:nil
+                              control:self.ipLabel below:YES]
+        toSection:SecSSH action:^{ [ws copySSHCommandScp:NO]; }];
 
-    self.reduceMotionSwitch = [[UISwitch alloc] init];
-    [self.reduceMotionSwitch addTarget:self action:@selector(reduceMotionChanged:) forControlEvents:UIControlEventValueChanged];
-    [self addCell:[self cellWithTitle:@"Reduce Motion (live)" value:nil
-                              control:self.reduceMotionSwitch below:NO] toSection:3 action:nil];
+    [self addCell:[self buttonCellWithTitle:@"Copy scp command" color:blue]
+        toSection:SecSSH action:^{ [ws copySSHCommandScp:YES]; }];
 
-    self.servicesLabel = SWMonoLabel(0);
-    [self addCell:[self cellWithTitle:@"Services (tap to restart)" value:nil
-                              control:self.servicesLabel below:YES]
-        toSection:3 action:^{ [ws showServicesMenu]; }];
+    [self addCell:[self buttonCellWithTitle:@"Refresh SSH / IP" color:blue]
+        toSection:SecSSH action:^{ [ws refreshSSH]; }];
 
-    // ---------- Section 4: Power & Actions ----------
-    [self addCell:[self buttonCellWithTitle:@"Respring" color:UIColor.systemBlueColor]
-        toSection:4 action:^{
+    // ---------- Accessibility ----------
+    NSMutableArray<UISwitch *> *axs = [NSMutableArray array];
+    NSMutableArray<UILabel *> *axl = [NSMutableArray array];
+    NSArray<NSDictionary<NSString *, NSString *> *> *items = SWAXItems();
+    for (NSUInteger i = 0; i < items.count; i++) {
+        UISwitch *s = [self makeSwitch:@selector(axToggled:) tag:(NSInteger)i];
+        UILabel *l = SWValueLabel();
+        [axs addObject:s];
+        [axl addObject:l];
+        [self addCell:[self cellWithTitle:items[i][@"title"] value:l control:s below:NO]
+            toSection:SecAccess action:nil];
+    }
+    self.axSwitches = axs;
+    self.axLabels = axl;
+    self.axMobileSwitch = [[UISwitch alloc] init];
+    [self addCell:[self cellWithTitle:@"Apply as user “mobile”" value:nil control:self.axMobileSwitch below:NO]
+        toSection:SecAccess action:nil];
+
+    // ---------- Tools ----------
+    UITableViewCell *explorer = [self buttonCellWithTitle:@"Sysctl Explorer (kern.sweet_*)" color:blue];
+    explorer.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    [self addCell:explorer toSection:SecTools action:^{
+        [ws.navigationController pushViewController:[[SWSysctlExplorerViewController alloc] init] animated:YES];
+    }];
+    [self addCell:[self buttonCellWithTitle:@"Edit metal.args…" color:blue]
+        toSection:SecTools action:^{ [ws editMetalArgs]; }];
+    [self addCell:[self buttonCellWithTitle:@"Copy debug snapshot" color:blue]
+        toSection:SecTools action:^{ [ws copySnapshot]; }];
+    [self addCell:[self buttonCellWithTitle:@"Share debug snapshot…" color:blue]
+        toSection:SecTools action:^{ [ws shareSnapshot]; }];
+    [self addCell:[self buttonCellWithTitle:@"Share sweetlog.txt…" color:blue]
+        toSection:SecTools action:^{ [ws shareSweetlog]; }];
+
+    // ---------- Power & Actions ----------
+    [self addCell:[self buttonCellWithTitle:@"Respring" color:blue]
+        toSection:SecPower action:^{
             [ws runKill:@[@"backboardd", @"SpringBoard"] title:@"Respring failed"];
         }];
-    [self addCell:[self buttonCellWithTitle:@"Restart SpringBoard only" color:UIColor.systemBlueColor]
-        toSection:4 action:^{
+    [self addCell:[self buttonCellWithTitle:@"Restart SpringBoard only" color:blue]
+        toSection:SecPower action:^{
             [ws runKill:@[@"SpringBoard"] title:@"Restart SpringBoard failed"];
         }];
     [self addCell:[self buttonCellWithTitle:@"Reboot" color:UIColor.systemRedColor]
-        toSection:4 action:^{ [ws confirmReboot]; }];
+        toSection:SecPower action:^{ [ws confirmReboot]; }];
 }
 
 #pragma mark Table data source / delegate
@@ -1001,27 +2073,45 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)section {
     switch (section) {
-        case 0: return @"Graphics & Metal";
-        case 1: return @"Touch";
-        case 2: return @"Live Diagnostics";
-        case 3: return @"Network, Accessibility & Services";
-        default: return @"Power & Actions";
+        case SecGraphics: return @"Graphics & Metal";
+        case SecDisplay:  return @"Display";
+        case SecTouch:    return @"Touch";
+        case SecDiag:     return @"Live Diagnostics";
+        case SecServices: return @"Services";
+        case SecSSH:      return @"SSH";
+        case SecAccess:   return @"Accessibility";
+        case SecTools:    return @"Tools & Export";
+        default:          return @"Power & Actions";
     }
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)section {
     switch (section) {
-        case 0:
+        case SecGraphics:
             return @"kern.sweet_* values are applied immediately. metal.args is read when a Metal client starts, "
                    @"so respring or relaunch the app to apply changes.";
-        case 1:
+        case SecDisplay:
+            return @"Screen is UIKit's view of the display: compare native px and max Hz with FB surface below. "
+                   @"The FPS meter only runs while this screen is visible and draws a moving bar so the GPU path is exercised.";
+        case SecTouch:
             return @"Touch parameters are applied by the kernel immediately.";
-        case 2:
+        case SecDiag:
             return @"Auto refresh runs while this screen is visible. Tap a value to view or copy it in full.";
-        case 3:
-            return @"Tap Wi-Fi IP to copy ssh command. Tap Services to restart individual daemons.";
+        case SecServices:
+            return @"Tap to restart (SIGKILL; launchd should respawn it). The new PID is reported after about 1.5 s. "
+                   @"A daemon that is not part of this build simply shows “not running”.";
+        case SecSSH:
+            return @"Start = launchctl load -w on the OpenSSH plist (survives reboot). Stop = unload until next boot. "
+                   @"If you still use the default password (usually “alpine”), change it with passwd. "
+                   @"Probing the port may briefly spawn sshd -i when launchd owns the socket.";
+        case SecAccess:
+            return @"Resolved at runtime from libAccessibility.dylib. If SpringBoard does not react, enable "
+                   @"“Apply as user mobile” (the preference may have been written to root's domain).";
+        case SecTools:
+            return @"Snapshots are also saved to /var/tmp/sapphire-snapshot-*.txt (last 5 kept): "
+                   @"scp root@<ip>:/var/tmp/sapphire-snapshot-*.txt . from your PC.";
         default:
-            return [NSString stringWithFormat:@"SapphireTools v2.0 • Running as uid=%d euid=%d. Writing sysctl values and rebooting "
+            return [NSString stringWithFormat:@"Running as uid=%d euid=%d. Writing sysctl values and rebooting "
                                               @"need root (the binary must be setuid-root).",
                     (int)getuid(), (int)geteuid()];
     }
@@ -1061,12 +2151,18 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
     [SWTopViewController(self) presentViewController:a animated:YES completion:nil];
 }
 
-#pragma mark Reading values
+#pragma mark Reading values (background -> main)
 
-- (void)loadSegment:(UISegmentedControl *)seg label:(UILabel *)l name:(NSString *)name {
+static NSDictionary *SWReadIntResult(NSString *name) {
     long long v = 0;
     int e = 0;
-    if ([SWSysctl getInteger:&v name:name errnoOut:&e]) {
+    if ([SWSysctl getInteger:&v name:name errorCode:&e]) return @{ @"ok": @YES, @"v": @(v) };
+    return @{ @"ok": @NO, @"e": @(e) };
+}
+
+- (void)loadSegment:(UISegmentedControl *)seg label:(UILabel *)l result:(NSDictionary *)r {
+    if ([r[@"ok"] boolValue]) {
+        long long v = [r[@"v"] longLongValue];
         BOOL ok = (v >= 0 && v < (long long)seg.numberOfSegments);
         seg.enabled = YES;
         seg.selectedSegmentIndex = ok ? (NSInteger)v : UISegmentedControlNoSegment;
@@ -1075,287 +2171,140 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
     } else {
         seg.enabled = NO;
         seg.selectedSegmentIndex = UISegmentedControlNoSegment;
-        SWSetValue(l, SWNAText(e));
+        SWSetValue(l, SWNAText([r[@"e"] intValue]));
     }
 }
 
-- (void)loadSlider:(UISlider *)s label:(UILabel *)l name:(NSString *)name unit:(NSString *)unit {
-    long long v = 0;
-    int e = 0;
-    if ([SWSysctl getInteger:&v name:name errnoOut:&e]) {
+- (void)loadSlider:(UISlider *)s label:(UILabel *)l result:(NSDictionary *)r unit:(NSString *)unit {
+    if (s.isTracking) return;   // khong ghi de gia tri khi nguoi dung dang keo
+    if ([r[@"ok"] boolValue]) {
+        long long v = [r[@"v"] longLongValue];
         s.enabled = YES;
         s.value = (float)v;
         SWSetValue(l, [NSString stringWithFormat:@"%lld%@", v, unit]);
     } else {
         s.enabled = NO;
-        SWSetValue(l, SWNAText(e));
+        SWSetValue(l, SWNAText([r[@"e"] intValue]));
     }
 }
 
-- (void)loadSwitch:(UISwitch *)s label:(UILabel *)l name:(NSString *)name {
-    long long v = 0;
-    int e = 0;
-    if ([SWSysctl getInteger:&v name:name errnoOut:&e]) {
+- (void)loadSwitch:(UISwitch *)s label:(UILabel *)l result:(NSDictionary *)r {
+    if ([r[@"ok"] boolValue]) {
         s.enabled = YES;
-        [s setOn:(v != 0) animated:NO];
+        [s setOn:([r[@"v"] longLongValue] != 0) animated:NO];
         SWSetValue(l, @"");
     } else {
         s.enabled = NO;
         [s setOn:NO animated:NO];
-        SWSetValue(l, SWNAText(e));
+        SWSetValue(l, SWNAText([r[@"e"] intValue]));
     }
 }
 
-static NSString *SWWiFiIP(void) {
-    struct ifaddrs *addrs = NULL;
-    NSString *result = @"N/A";
-    if (getifaddrs(&addrs) == 0 && addrs) {
-        for (struct ifaddrs *a = addrs; a != NULL; a = a->ifa_next) {
-            if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
-            if (a->ifa_name && strcmp(a->ifa_name, "en0") == 0) {
-                char buf[INET_ADDRSTRLEN] = {0};
-                struct sockaddr_in *sin = (struct sockaddr_in *)a->ifa_addr;
-                if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) {
-                    result = [NSString stringWithUTF8String:buf];
-                    break;
-                }
-            }
-        }
-        freeifaddrs(addrs);
-    }
-    return result;
-}
-
-static pid_t SWFindPid(NSString *procName) {
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
-    size_t sz = 0;
-    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return -1;
-    struct kinfo_proc *procs = (struct kinfo_proc *)malloc(sz);
-    if (!procs) return -1;
-    pid_t found = -1;
-    if (sysctl(mib, 4, procs, &sz, NULL, 0) == 0) {
-        size_t n = sz / sizeof(struct kinfo_proc);
-        const char *want = procName.UTF8String;
-        for (size_t i = 0; i < n; i++) {
-            if (strncmp(procs[i].kp_proc.p_comm, want, MAXCOMLEN) == 0) {
-                found = procs[i].kp_proc.p_pid;
-                break;
-            }
-        }
-    }
-    free(procs);
-    return found;
-}
-
-static void *SWAxHandle(void) {
-    static void *h = NULL;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        h = dlopen("/usr/lib/libAccessibility.dylib", RTLD_LAZY);
-    });
-    return h;
-}
-
-static BOOL SWAxGet(const char *sym, BOOL *ok) {
-    void *h = SWAxHandle();
-    Boolean (*fn)(void) = h ? (Boolean (*)(void))dlsym(h, sym) : NULL;
-    if (!fn) {
-        if (ok) *ok = NO;
-        return NO;
-    }
-    if (ok) *ok = YES;
-    return fn() ? YES : NO;
-}
-
-static BOOL SWAxSet(const char *sym, BOOL val) {
-    void *h = SWAxHandle();
-    void (*fn)(Boolean) = h ? (void (*)(Boolean))dlsym(h, sym) : NULL;
-    if (!fn) return NO;
-    fn(val ? true : false);
-    return YES;
-}
-
-static NSArray<NSString *> *SWServiceNames(void) {
-    return @[@"backboardd", @"SpringBoard", @"fpd", @"btmonitor", @"vibd", @"thermald", @"sensord"];
-}
-
-static NSString *SWServicesText(void) {
-    NSMutableArray<NSString *> *parts = [NSMutableArray array];
-    for (NSString *name in SWServiceNames()) {
-        pid_t p = SWFindPid(name);
-        if (p > 0) {
-            [parts addObject:[NSString stringWithFormat:@"%@: ON (%d)", name, (int)p]];
-        } else {
-            [parts addObject:[NSString stringWithFormat:@"%@: off", name]];
-        }
-    }
-    return [parts componentsJoinedByString:@"\n"];
-}
-
-// Doc cac control co the chinh sua (khong goi tu timer de khong lam gian doan khi dang keo slider).
+// Cac control co the chinh sua: doc o thread nen, ap dung o main (khong goi tu timer de khong
+// lam gian doan khi dang keo slider).
 - (void)refreshControls {
-    [self loadSegment:self.metalSeg label:self.metalValue name:kSysMetal];
-    [self loadSlider:self.rscaleSlider label:self.rscaleValue name:kSysRScale unit:@""];
-    [self loadSwitch:self.flushSwitch label:self.flushValue name:kSysFlipFlush];
-    [self loadSegment:self.tapSeg label:self.tapValue name:kSysTapWake];
-    [self loadSlider:self.quietSlider label:self.quietValue name:kSysQuietMs unit:@" ms"];
-    [self loadSlider:self.staleSlider label:self.staleValue name:kSysStaleMs unit:@" ms"];
-    [self loadMetalArgs];
+    __weak typeof(self) ws = self;
+    dispatch_async(self.ioQueue, ^{
+        NSMutableDictionary<NSString *, NSDictionary *> *res = [NSMutableDictionary dictionary];
+        for (NSString *n in @[kSysMetal, kSysRScale, kSysFlipFlush, kSysTapWake, kSysQuietMs, kSysStaleMs]) {
+            res[n] = SWReadIntResult(n);
+        }
+        NSString *info = nil;
+        NSArray<NSString *> *tokens = SWReadMetalTokens(&info);
+        NSString *boot = SWSysctlDisplay(kSysBootargs);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [ws applyControls:res metalInfo:info tokens:tokens bootargs:boot];
+        });
+    });
+}
 
-    BOOL ok = NO;
-    BOOL rt = SWAxGet("_AXSEnhanceBackgroundContrastEnabled", &ok);
-    self.reduceTransSwitch.enabled = ok;
-    [self.reduceTransSwitch setOn:rt animated:NO];
+- (void)applyControls:(NSDictionary<NSString *, NSDictionary *> *)res
+            metalInfo:(NSString *)info
+               tokens:(NSArray<NSString *> *)tokens
+             bootargs:(NSString *)boot {
+    [self loadSegment:self.metalSeg label:self.metalValue result:res[kSysMetal]];
+    [self loadSlider:self.rscaleSlider label:self.rscaleValue result:res[kSysRScale] unit:@""];
+    [self loadSwitch:self.flushSwitch label:self.flushValue result:res[kSysFlipFlush]];
+    [self loadSegment:self.tapSeg label:self.tapValue result:res[kSysTapWake]];
+    [self loadSlider:self.quietSlider label:self.quietValue result:res[kSysQuietMs] unit:@" ms"];
+    [self loadSlider:self.staleSlider label:self.staleValue result:res[kSysStaleMs] unit:@" ms"];
 
-    BOOL rm = SWAxGet("_AXSReduceMotionEnabled", &ok);
-    self.reduceMotionSwitch.enabled = ok;
-    [self.reduceMotionSwitch setOn:rm animated:NO];
-
+    self.metalArgsLabel.text = info;
+    NSArray<NSString *> *keys = SWMetalKeys();
+    for (NSUInteger i = 0; i < keys.count && i < self.metalSwitches.count; i++) {
+        [self.metalSwitches[i] setOn:SWFlagOn(tokens, keys[i]) animated:NO];
+    }
+    self.bootargsFull = boot;
+    self.bootargsLabel.text = boot;
     [self relayoutTable];
 }
 
-- (NSString *)readString:(NSString *)name into:(UILabel *)l changed:(BOOL *)changed {
-    int e = 0;
-    NSString *s = [SWSysctl stringForName:name errnoOut:&e];
-    NSString *shown;
-    if (!s) {
-        shown = SWNAText(e);
-        s = nil;
-    } else if (s.length == 0) {
-        shown = @"(empty)";
-    } else {
-        shown = s;
-    }
-    if (![l.text isEqualToString:shown]) {
-        l.text = shown;
-        if (changed) *changed = YES;
-    }
-    return s ?: shown;
+// Cac gia tri "song": cap nhat moi 2 giay (doc o thread nen, bo qua neu lan truoc chua xong).
+- (void)refreshLive {
+    if (self.liveBusy) return;
+    self.liveBusy = YES;
+    __weak typeof(self) ws = self;
+    dispatch_async(self.ioQueue, ^{
+        NSString *frame = SWSysctlDisplay(kSysFrameStats);
+        NSString *surface = SWSysctlDisplay(kSysSurface);
+        NSString *rate = SWSysctlDisplay(kSysTouchRate);
+        NSString *counters = [NSString stringWithFormat:@"fod_press=%@  fod_seq=%@  tap_wakes=%@",
+                              SWSysctlDisplay(kSysFodPress), SWSysctlDisplay(kSysFodSeq),
+                              SWSysctlDisplay(kSysTapWakes)];
+        NSDictionary *procs = SWProcessMap();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            s.liveBusy = NO;
+            [s applyLiveFrame:frame surface:surface rate:rate counters:counters procs:procs];
+        });
+    });
 }
 
-// Cac gia tri "song": cap nhat moi 2 giay.
-- (void)refreshLive {
+- (void)applyLiveFrame:(NSString *)frame surface:(NSString *)surface rate:(NSString *)rate
+              counters:(NSString *)counters procs:(NSDictionary *)procs {
     BOOL changed = NO;
-    self.frameStatsFull = [self readString:kSysFrameStats into:self.frameStatsLabel changed:&changed];
-    self.surfaceFull = [self readString:kSysSurface into:self.surfaceLabel changed:&changed];
-    self.bootargsFull = [self readString:kSysBootargs into:self.bootargsLabel changed:&changed];
-    [self readString:kSysTouchRate into:self.touchRateLabel changed:&changed];
+    self.frameStatsFull = frame;
+    self.surfaceFull = surface;
+    SWSetText(self.frameStatsLabel, frame, &changed);
+    SWSetText(self.surfaceLabel, surface, &changed);
+    SWSetText(self.touchRateLabel, rate, &changed);
+    SWSetText(self.touchCountersLabel, counters, &changed);
 
-    NSString *ip = SWWiFiIP();
-    if (![self.wifiIpFull isEqualToString:ip]) {
-        self.wifiIpFull = ip;
-        SWSetValue(self.wifiIpLabel, ip);
-        changed = YES;
+    self.procMap = procs;
+    NSArray<NSArray<NSString *> *> *svcs = SWServiceList();
+    for (NSUInteger i = 0; i < svcs.count && i < self.svcLabels.count; i++) {
+        NSArray<NSDictionary *> *list = procs[svcs[i][0]];
+        UILabel *l = self.svcLabels[i];
+        SWSetText(l, SWDescribeProcs(list), &changed);
+        l.textColor = list.count ? UIColor.systemGreenColor : UIColor.systemRedColor;
     }
-    pid_t sshPid = SWFindPid(@"sshd");
-    if (sshPid <= 0) sshPid = SWFindPid(@"dropbear");
-    NSString *sshText = sshPid > 0 ? [NSString stringWithFormat:@"ON (%d)", (int)sshPid] : @"Off";
-    if (![self.sshStatusLabel.text isEqualToString:sshText]) {
-        SWSetValue(self.sshStatusLabel, sshText);
-        changed = YES;
-    }
-    [self.sshSwitch setOn:(sshPid > 0) animated:NO];
 
-    NSString *svc = SWServicesText();
-    if (![self.servicesLabel.text isEqualToString:svc]) {
-        self.servicesLabel.text = svc;
-        changed = YES;
+    static NSArray<NSString *> *names;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ names = @[@"Nominal", @"Fair", @"Serious", @"Critical"]; });
+    NSProcessInfo *pi = NSProcessInfo.processInfo;
+    NSInteger ts = (NSInteger)pi.thermalState;
+    NSString *thermal = (ts >= 0 && ts < (NSInteger)names.count) ? names[(NSUInteger)ts] : @"?";
+    if (pi.isLowPowerModeEnabled) thermal = [thermal stringByAppendingString:@" · LPM"];
+    SWSetText(self.thermalLabel, thermal, &changed);
+    switch (ts) {
+        case 0:  self.thermalLabel.textColor = UIColor.systemGreenColor; break;
+        case 1:  self.thermalLabel.textColor = UIColor.systemYellowColor; break;
+        default: self.thermalLabel.textColor = UIColor.systemRedColor; break;
     }
     if (changed) [self relayoutTable];
 }
 
-- (void)sshToggled:(UISwitch *)sw {
-    if (sw.isOn) {
-        NSArray<NSString *> *bins = @[
-            @"/var/jb/usr/sbin/sshd",
-            @"/usr/sbin/sshd",
-            @"/var/jb/usr/sbin/dropbear",
-            @"/usr/sbin/dropbear"
-        ];
-        NSString *found = nil;
-        for (NSString *p in bins) {
-            if (access(p.UTF8String, X_OK) == 0) { found = p; break; }
-        }
-        if (!found) {
-            [sw setOn:NO animated:YES];
-            [self alertTitle:@"SSH not found" message:@"Install OpenSSH from Sileo first."];
-            return;
-        }
-        pid_t pid = 0;
-        char *argv[] = {(char *)found.UTF8String, NULL};
-        int r = posix_spawn(&pid, found.UTF8String, NULL, NULL, argv, environ);
-        if (r != 0) {
-            [sw setOn:NO animated:YES];
-            [self alertTitle:@"Failed to start SSH" message:SWErrText(r)];
-            return;
-        }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self refreshLive];
-        });
-    } else {
-        [self runKill:@[@"sshd", @"dropbear"] title:@"Stop SSH failed"];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            [self refreshLive];
-        });
-    }
-}
-
-- (void)reduceTransChanged:(UISwitch *)sw {
-    if (!SWAxSet("_AXSSetEnhanceBackgroundContrastEnabled", sw.isOn)) {
-        [self alertTitle:@"Accessibility" message:@"libAccessibility symbol unavailable"];
-    }
-}
-
-- (void)reduceMotionChanged:(UISwitch *)sw {
-    if (!SWAxSet("_AXSSetReduceMotionEnabled", sw.isOn)) {
-        [self alertTitle:@"Accessibility" message:@"libAccessibility symbol unavailable"];
-    }
-}
-
-- (void)showServicesMenu {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Restart Service"
-                                                                   message:@"Select a daemon to send SIGKILL (launchd will respawn it)"
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-    __weak typeof(self) ws = self;
-    for (NSString *name in SWServiceNames()) {
-        pid_t p = SWFindPid(name);
-        NSString *title = p > 0 ? [NSString stringWithFormat:@"Restart %@ (pid %d)", name, (int)p]
-                                : [NSString stringWithFormat:@"%@ (not running)", name];
-        [sheet addAction:[UIAlertAction actionWithTitle:title
-                                                  style:(p > 0 ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault)
-                                                handler:^(UIAlertAction *a) {
-            [ws runKill:@[name] title:[NSString stringWithFormat:@"Restart %@ failed", name]];
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                [ws refreshLive];
-            });
-        }]];
-    }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [SWTopViewController(self) presentViewController:sheet animated:YES completion:nil];
-}
-
-- (void)exportSnapshot {
-    NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"=== SapphireTools v2.0 Snapshot ===\n"];
-    [out appendFormat:@"UID/EUID: %d/%d | Wi-Fi IP: %@\n", (int)getuid(), (int)geteuid(), SWWiFiIP()];
-    [out appendFormat:@"boot-args: %@\n", self.bootargsFull ?: @"N/A"];
-    [out appendFormat:@"metal.args: %@\n", self.metalArgsLabel.text ?: @"(empty)"];
-    [out appendFormat:@"frame_stats: %@\n", self.frameStatsFull ?: @"N/A"];
-    [out appendFormat:@"fb_surface: %@\n", self.surfaceFull ?: @"N/A"];
-    [out appendFormat:@"touch_rate: %@\n", self.touchRateLabel.text ?: @"N/A"];
-    [out appendFormat:@"\n=== Services ===\n%@\n", SWServicesText()];
-
-    NSString *logText = [NSString stringWithContentsOfFile:@"/var/log/sweetlog.txt" encoding:NSUTF8StringEncoding error:nil];
-    if (logText.length > 0) {
-        NSArray<NSString *> *lines = [logText componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet];
-        NSUInteger start = lines.count > 60 ? lines.count - 60 : 0;
-        NSArray<NSString *> *tail = [lines subarrayWithRange:NSMakeRange(start, lines.count - start)];
-        [out appendFormat:@"\n=== sweetlog.txt (last %lu lines) ===\n%@\n", (unsigned long)tail.count, [tail componentsJoinedByString:@"\n"]];
-    }
-
-    UIPasteboard.generalPasteboard.string = out;
-    UIActivityViewController *avc = [[UIActivityViewController alloc] initWithActivityItems:@[out] applicationActivities:nil];
-    [SWTopViewController(self) presentViewController:avc animated:YES completion:nil];
+- (void)refreshDisplayInfo {
+    UIScreen *sc = UIScreen.mainScreen;
+    CGSize pt = sc.bounds.size, px = sc.nativeBounds.size;
+    NSString *t = [NSString stringWithFormat:@"%.0f×%.0f pt @%.1fx · native %.0f×%.0f px (scale %.2f)\nmax %ld Hz",
+                   pt.width, pt.height, sc.scale, px.width, px.height, sc.nativeScale,
+                   (long)sc.maximumFramesPerSecond];
+    BOOL changed = NO;
+    SWSetText(self.screenLabel, t, &changed);
+    if (changed) [self relayoutTable];
 }
 
 - (void)relayoutTable {
@@ -1366,8 +2315,7 @@ static NSString *SWServicesText(void) {
 }
 
 - (void)refreshTapped {
-    [self refreshControls];
-    [self refreshLive];
+    [self refreshAll];
 }
 
 - (void)autoToggled:(UISwitch *)s {
@@ -1375,13 +2323,108 @@ static NSString *SWServicesText(void) {
     if (s.isOn) [self refreshLive];
 }
 
+#pragma mark FPS meter
+
+- (void)fpsToggled:(UISwitch *)s {
+    [self resetFPS];
+    [self updateFPSLink];
+}
+
+- (void)resetFPS {
+    self.fpsLast = 0;
+    self.fpsWinStart = 0;
+    self.fpsFrames = 0;
+    self.fpsWorst = 0;
+    self.fpsDrops = 0;
+    if (!self.fpsSwitch.isOn) self.fpsLabel.text = @"off";
+}
+
+- (void)updateFPSLink {
+    BOOL want = self.visible && self.appActive && self.fpsSwitch.isOn;
+    if (want && !self.link) {
+        CADisplayLink *l = [CADisplayLink displayLinkWithTarget:self selector:@selector(fpsTick:)];
+        float mx = (float)UIScreen.mainScreen.maximumFramesPerSecond;
+        if (mx < 30) mx = 60;
+        l.preferredFrameRateRange = CAFrameRateRangeMake(30, mx, mx);
+        [l addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+        self.link = l;
+        self.fpsLast = 0;
+        self.fpsWinStart = 0;
+        self.fpsFrames = 0;
+        [self startBarAnimation];
+    } else if (!want && self.link) {
+        [self.link invalidate];   // CADisplayLink giu target manh: bat buoc invalidate de khong ro ri
+        self.link = nil;
+        [self stopBarAnimation];
+        if (!self.fpsSwitch.isOn) self.fpsLabel.text = @"off";
+    }
+}
+
+- (void)fpsTick:(CADisplayLink *)l {
+    CFTimeInterval now = l.timestamp;
+    if (self.fpsLast > 0) {
+        double dt = now - self.fpsLast;
+        double expected = l.targetTimestamp - l.timestamp;
+        if (expected < 1.0 / 240.0) expected = 1.0 / 240.0;
+        if (dt > self.fpsWorst) self.fpsWorst = dt;
+        if (dt > expected * 1.5) {
+            double missed = round(dt / expected) - 1.0;
+            self.fpsDrops += (NSUInteger)(missed < 1.0 ? 1.0 : missed);
+        }
+    }
+    self.fpsLast = now;
+    self.fpsFrames++;
+    if (self.fpsWinStart == 0) self.fpsWinStart = now;
+    if (now - self.fpsWinStart >= 0.5) {
+        double fps = (double)self.fpsFrames / (now - self.fpsWinStart);
+        self.fpsLabel.text = [NSString stringWithFormat:@"%.1f fps · worst %.1f ms · drops %lu",
+                              fps, self.fpsWorst * 1000.0, (unsigned long)self.fpsDrops];
+        self.fpsFrames = 0;
+        self.fpsWinStart = now;
+    }
+}
+
+- (void)startBarAnimation {
+    if (!self.fpsDot) {
+        CALayer *d = [CALayer layer];
+        d.bounds = CGRectMake(0, 0, 28, 14);
+        d.cornerRadius = 7;
+        d.backgroundColor = UIColor.systemBlueColor.CGColor;
+        [self.fpsBar.layer addSublayer:d];
+        self.fpsDot = d;
+    }
+    CGFloat w = self.fpsBar.bounds.size.width;
+    if (w < 60) w = 300;
+    self.fpsDot.position = CGPointMake(14, 7);
+    CABasicAnimation *a = [CABasicAnimation animationWithKeyPath:@"position.x"];
+    a.fromValue = @14;
+    a.toValue = @(w - 14);
+    a.duration = 0.8;
+    a.autoreverses = YES;
+    a.repeatCount = HUGE_VALF;
+    a.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+    [self.fpsDot addAnimation:a forKey:@"slide"];
+}
+
+- (void)stopBarAnimation {
+    [self.fpsDot removeAllAnimations];
+}
+
 #pragma mark Writing sysctl values
 
 - (void)writeInt:(long long)v name:(NSString *)name {
-    int e = 0;
-    if (![SWSysctl setInteger:v name:name errnoOut:&e]) [self alertWriteFailure:name errorCode:e];
-    [self refreshControls];
-    [self refreshLive];
+    __weak typeof(self) ws = self;
+    dispatch_async(self.ioQueue, ^{
+        int e = 0;
+        BOOL ok = [SWSysctl setInteger:v name:name errorCode:&e];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            if (!ok) [s alertWriteFailure:name errorCode:e];
+            [s refreshControls];
+            [s refreshLive];
+        });
+    });
 }
 
 - (void)metalChanged:(UISegmentedControl *)s {
@@ -1445,103 +2488,321 @@ static NSString *SWServicesText(void) {
 }
 
 - (void)resetTouchRate {
-    int e = 0;
-    if ([SWSysctl setInteger:0 name:kSysTouchRate errnoOut:&e]) {
-        SWToast(self.view, @"Touch rate reset");
-    } else {
-        [self alertWriteFailure:kSysTouchRate errorCode:e];
-    }
-    [self refreshLive];
+    __weak typeof(self) ws = self;
+    dispatch_async(self.ioQueue, ^{
+        int e = 0;
+        BOOL ok = [SWSysctl setInteger:0 name:kSysTouchRate errorCode:&e];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            if (ok) SWToast(s.view, @"Touch rate reset");
+            else [s alertWriteFailure:kSysTouchRate errorCode:e];
+            [s refreshLive];
+        });
+    });
 }
 
 #pragma mark /var/tmp/metal.args
-
-static NSString *SWTokenKey(NSString *t) {
-    NSRange r = [t rangeOfString:@"="];
-    return r.location == NSNotFound ? t : [t substringToIndex:r.location];
-}
-
-// Doc file hien tai. Tra ve YES neu file doc duoc hoac chua ton tai; *info la mo ta de hien thi.
-- (NSMutableArray<NSString *> *)readMetalTokensInfo:(NSString **)info {
-    NSMutableArray<NSString *> *tokens = [NSMutableArray array];
-    NSError *err = nil;
-    NSData *d = [NSData dataWithContentsOfFile:kMetalArgsPath options:0 error:&err];
-    if (!d) {
-        if (![NSFileManager.defaultManager fileExistsAtPath:kMetalArgsPath]) {
-            if (info) *info = @"(file does not exist)";
-        } else {
-            if (info) *info = [NSString stringWithFormat:@"N/A (%@)", err.localizedDescription ?: @"read error"];
-        }
-        return tokens;
-    }
-    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] ?: @"";
-    for (NSString *t in [s componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]) {
-        if (t.length) [tokens addObject:t];
-    }
-    if (info) *info = tokens.count ? [tokens componentsJoinedByString:@" "] : @"(empty)";
-    return tokens;
-}
-
-static BOOL SWFlagOn(NSArray<NSString *> *tokens, NSString *key) {
-    BOOL on = NO;
-    for (NSString *t in tokens) {
-        if (![SWTokenKey(t) isEqualToString:key]) continue;
-        NSRange r = [t rangeOfString:@"="];
-        NSString *val = (r.location == NSNotFound) ? @"1" : [t substringFromIndex:r.location + 1];
-        on = !(val.length == 0 || [val isEqualToString:@"0"]);   // lan xuat hien cuoi cung thang
-    }
-    return on;
-}
-
-- (void)loadMetalArgs {
-    NSString *info = nil;
-    NSArray<NSString *> *tokens = [self readMetalTokensInfo:&info];
-    self.metalArgsLabel.text = info;
-    NSArray<NSString *> *keys = SWMetalKeys();
-    for (NSUInteger i = 0; i < keys.count && i < self.metalSwitches.count; i++) {
-        [self.metalSwitches[i] setOn:SWFlagOn(tokens, keys[i]) animated:NO];
-    }
-}
-
-- (BOOL)setMetalFlag:(NSString *)key on:(BOOL)on error:(NSString **)msg {
-    // Doc lai file moi nhat de khong ghi de thay doi tu ben ngoai; giu nguyen cac token la.
-    NSMutableArray<NSString *> *tokens = [self readMetalTokensInfo:NULL];
-    NSIndexSet *idx = [tokens indexesOfObjectsPassingTest:^BOOL(NSString *t, NSUInteger i, BOOL *stop) {
-        return [SWTokenKey(t) isEqualToString:key];
-    }];
-    [tokens removeObjectsAtIndexes:idx];
-    if (on) [tokens addObject:[key stringByAppendingString:@"=1"]];
-
-    NSString *content = tokens.count ? [[tokens componentsJoinedByString:@" "] stringByAppendingString:@"\n"] : @"";
-    NSData *data = [content dataUsingEncoding:NSUTF8StringEncoding];
-    NSError *e = nil;
-    BOOL ok = [data writeToFile:kMetalArgsPath options:NSDataWritingAtomic error:&e];
-    if (!ok) {
-        e = nil;
-        ok = [data writeToFile:kMetalArgsPath options:0 error:&e];   // /var/tmp co sticky bit: rename co the bi tu choi
-    }
-    if (ok) {
-        chmod(kMetalArgsPath.fileSystemRepresentation, 0644);
-        return YES;
-    }
-    if (msg) {
-        *msg = [NSString stringWithFormat:@"%@ (%@ %ld)", e.localizedDescription ?: @"write error",
-                e.domain ?: @"", (long)e.code];
-    }
-    return NO;
-}
 
 - (void)metalFlagChanged:(UISwitch *)sw {
     NSArray<NSString *> *keys = SWMetalKeys();
     if (sw.tag < 0 || (NSUInteger)sw.tag >= keys.count) return;
     NSString *msg = nil;
-    if ([self setMetalFlag:keys[(NSUInteger)sw.tag] on:sw.isOn error:&msg]) {
+    if (SWSetMetalFlag(keys[(NSUInteger)sw.tag], sw.isOn, &msg)) {
         SWToast(self.view, @"metal.args saved");
     } else {
         [self alertTitle:@"Cannot write /var/tmp/metal.args" message:msg ?: @"Unknown error"];
     }
-    [self loadMetalArgs];
-    [self relayoutTable];
+    [self refreshControls];
+}
+
+// Sua tu do: metal_gmem_draws=…, metal_defer=… va moi key khac ma Hakios doc.
+- (void)editMetalArgs {
+    NSString *info = nil;
+    NSArray<NSString *> *tokens = SWReadMetalTokens(&info);
+    NSString *cur = [tokens componentsJoinedByString:@" "];
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Edit metal.args"
+        message:@"Space-separated key=value tokens, e.g.\nmetal_gmem=1 metal_defer=1 metal_gmem_draws=64\nEmpty text clears the file."
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = cur;
+        tf.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    }];
+    __weak typeof(self) ws = self;
+    __weak UIAlertController *wa = a;
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault
+                                        handler:^(UIAlertAction *x) {
+        NSMutableArray<NSString *> *toks = [NSMutableArray array];
+        NSString *text = wa.textFields.firstObject.text ?: @"";
+        for (NSString *t in [text componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]) {
+            if (t.length) [toks addObject:t];
+        }
+        NSString *msg = nil;
+        if (SWWriteMetalTokens(toks, &msg)) SWToast(ws.view, @"metal.args saved");
+        else [ws alertTitle:@"Cannot write /var/tmp/metal.args" message:msg ?: @"Unknown error"];
+        [ws refreshControls];
+    }]];
+    [SWTopViewController(self) presentViewController:a animated:YES completion:nil];
+}
+
+#pragma mark Services
+
+- (void)confirmRestartService:(NSString *)name {
+    BOOL critical = [name isEqualToString:@"SpringBoard"] || [name isEqualToString:@"backboardd"];
+    NSString *msg = critical
+        ? @"The screen will go black for a few seconds and this app will be closed."
+        : @"The process is killed (SIGKILL); launchd should start it again.";
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Restart %@?", name]
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Restart" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *x) { [ws restartService:name]; }]];
+    [SWTopViewController(self) presentViewController:a animated:YES completion:nil];
+}
+
+- (void)restartService:(NSString *)name {
+    NSArray<NSDictionary *> *before = self.procMap[name];
+    int oldPid = before.count ? [before.firstObject[@"pid"] intValue] : 0;
+    __weak typeof(self) ws = self;
+    dispatch_async(self.ioQueue, ^{
+        int e = 0;
+        int k = SWKillByName(name, SIGKILL, &e);
+        NSDictionary *after = nil;
+        if (k > 0) {
+            usleep(1500 * 1000);
+            after = SWProcessMap();
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            if (k < 0) {
+                [s alertTitle:[NSString stringWithFormat:@"Cannot restart %@", name] message:SWErrText(e)];
+            } else if (k == 0) {
+                [s alertTitle:[NSString stringWithFormat:@"%@ is not running", name]
+                      message:@"Nothing to kill. If it should be running, check launchd."];
+            } else {
+                NSArray<NSDictionary *> *now = after[name];
+                if (now.count) {
+                    SWToast(s.view, [NSString stringWithFormat:@"%@ restarted: PID %d → %d", name, oldPid,
+                                     [now.firstObject[@"pid"] intValue]]);
+                } else {
+                    [s alertTitle:[NSString stringWithFormat:@"%@ did not come back", name]
+                          message:@"Not running 1.5 s after the kill. It may need more time, or launchd may not manage it."];
+                }
+            }
+            [s refreshLive];
+        });
+    });
+}
+
+#pragma mark SSH
+
+- (void)refreshSSH {
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *ip = nil;
+        NSArray<NSString *> *lines = SWInterfaceAddresses(&ip);
+        uint16_t port = SWDetectSSHPort();
+        NSDictionary *procs = SWProcessMap();
+        NSString *daemon = procs[@"sshd"] ? @"sshd" : (procs[@"dropbear"] ? @"dropbear" : nil);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s || s.sshBusy) return;
+            s.primaryIP = ip;
+            s.sshPort = port;
+            [s.sshSwitch setOn:(port != 0) animated:NO];
+            NSString *st = port ? [NSString stringWithFormat:@"listening :%u", (unsigned)port]
+                                : (daemon ? [NSString stringWithFormat:@"stopped (%@ sessions only)", daemon] : @"stopped");
+            BOOL changed = NO;
+            SWSetText(s.sshStatusLabel, st, &changed);
+            s.sshStatusLabel.textColor = port ? UIColor.systemGreenColor : UIColor.secondaryLabelColor;
+            SWSetText(s.ipLabel, lines.count ? [lines componentsJoinedByString:@"\n"]
+                                             : @"No IPv4 address (Wi-Fi off?)", &changed);
+            if (changed) [s relayoutTable];
+        });
+    });
+}
+
+- (void)sshToggled:(UISwitch *)sw {
+    if (sw.isOn) {
+        [self setSSH:YES];
+        return;
+    }
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Stop SSH?"
+        message:@"Active SSH sessions (including scp transfers) will be closed."
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) ws = self;
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel
+                                        handler:^(UIAlertAction *x) { [ws refreshSSH]; }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Stop" style:UIAlertActionStyleDestructive
+                                        handler:^(UIAlertAction *x) { [ws setSSH:NO]; }]];
+    [SWTopViewController(self) presentViewController:a animated:YES completion:nil];
+}
+
+- (void)setSSH:(BOOL)on {
+    self.sshBusy = YES;
+    self.sshSwitch.enabled = NO;
+    self.sshStatusLabel.text = on ? @"starting…" : @"stopping…";
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *msg = nil;
+        (void)SWSSHSetEnabled(on, &msg);
+        BOOL reached = NO;
+        for (int i = 0; i < 14; i++) {   // cho toi da ~4 s cho trang thai doi
+            usleep(300 * 1000);
+            if ((SWDetectSSHPort() != 0) == on) {
+                reached = YES;
+                break;
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            s.sshBusy = NO;
+            s.sshSwitch.enabled = YES;
+            [s refreshSSH];
+            if (reached) {
+                SWToast(s.view, on ? @"SSH started" : @"SSH stopped");
+            } else {
+                [s alertTitle:on ? @"SSH did not start" : @"SSH is still listening"
+                      message:msg ?: @"The daemon state did not change within 4 s."];
+            }
+        });
+    });
+}
+
+- (void)copySSHCommandScp:(BOOL)scp {
+    if (!self.primaryIP) {
+        SWToast(self.view, @"No IP address (Wi-Fi off?)");
+        return;
+    }
+    unsigned port = self.sshPort ? self.sshPort : 22;
+    NSString *cmd;
+    if (scp) {
+        cmd = [NSString stringWithFormat:@"scp%@ ./file root@%@:/var/tmp/",
+               port != 22 ? [NSString stringWithFormat:@" -P %u", port] : @"", self.primaryIP];
+    } else {
+        cmd = [NSString stringWithFormat:@"ssh%@ root@%@",
+               port != 22 ? [NSString stringWithFormat:@" -p %u", port] : @"", self.primaryIP];
+    }
+    UIPasteboard.generalPasteboard.string = cmd;
+    SWToast(self.view, [NSString stringWithFormat:@"Copied: %@", cmd]);
+}
+
+#pragma mark Accessibility
+
+- (void)refreshAX {
+    NSArray<NSDictionary<NSString *, NSString *> *> *items = SWAXItems();
+    for (NSUInteger i = 0; i < items.count && i < self.axSwitches.count; i++) {
+        BOOL on = NO;
+        UISwitch *sw = self.axSwitches[i];
+        UILabel *l = self.axLabels[i];
+        if (SWAXGet(items[i], &on)) {
+            sw.enabled = YES;
+            [sw setOn:on animated:NO];
+            SWSetValue(l, @"");
+        } else {
+            sw.enabled = NO;
+            [sw setOn:NO animated:NO];
+            SWSetValue(l, @"N/A (symbol missing)");
+        }
+    }
+}
+
+- (void)axToggled:(UISwitch *)sw {
+    NSArray<NSDictionary<NSString *, NSString *> *> *items = SWAXItems();
+    if (sw.tag < 0 || (NSUInteger)sw.tag >= items.count) return;
+    NSDictionary<NSString *, NSString *> *it = items[(NSUInteger)sw.tag];
+    BOOL on = sw.isOn;
+    __block BOOL ok = NO;
+    if (self.axMobileSwitch.isOn) {
+        BOOL ran = SWRunAsMobile(^{ ok = SWAXSet(it, on); });
+        if (!ran) {
+            [self alertTitle:@"Cannot switch to user mobile"
+                     message:@"seteuid() failed or the original euid could not be restored. "
+                             @"The binary must be setuid-root."];
+        }
+    } else {
+        ok = SWAXSet(it, on);
+    }
+    if (ok) {
+        SWToast(self.view, [NSString stringWithFormat:@"%@ %@", it[@"title"], on ? @"ON" : @"OFF"]);
+    } else {
+        [self alertTitle:@"Accessibility setter not found"
+                 message:[NSString stringWithFormat:@"%@ is not exported by libAccessibility.dylib on this build.",
+                          it[@"set"]]];
+    }
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        [ws refreshAX];
+    });
+}
+
+#pragma mark Snapshot / export
+
+// Phan thong tin chi lay duoc tu UI, ghep vao snapshot.
+- (NSString *)uiInfoString {
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"screen : %@\n", [self.screenLabel.text stringByReplacingOccurrencesOfString:@"\n" withString:@" | "] ?: @"?"];
+    [s appendFormat:@"thermal: %@\n", self.thermalLabel.text ?: @"?"];
+    [s appendFormat:@"fps    : %@\n", self.fpsLabel.text ?: @"?"];
+    for (NSDictionary<NSString *, NSString *> *it in SWAXItems()) {
+        BOOL on = NO;
+        [s appendFormat:@"ax     : %@ = %@\n", it[@"title"], SWAXGet(it, &on) ? (on ? @"ON" : @"OFF") : @"N/A"];
+    }
+    [s appendFormat:@"ssh    : %@ (port %u)\n", self.sshStatusLabel.text ?: @"?", (unsigned)self.sshPort];
+    [s appendFormat:@"ip     : %@", [self.ipLabel.text stringByReplacingOccurrencesOfString:@"\n" withString:@", "] ?: @"?"];
+    return s;
+}
+
+- (void)collectSnapshot:(void (^)(NSString *text, NSString *path))done {
+    NSString *ui = [self uiInfoString];
+    SWToast(self.view, @"Collecting snapshot…");
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *text = SWBuildSnapshot(ui);
+        NSString *path = SWSaveSnapshot(text);
+        dispatch_async(dispatch_get_main_queue(), ^{ done(text, path); });
+    });
+}
+
+- (void)copySnapshot {
+    __weak typeof(self) ws = self;
+    [self collectSnapshot:^(NSString *text, NSString *path) {
+        UIPasteboard.generalPasteboard.string = text;
+        SWToast(ws.view, path ? [NSString stringWithFormat:@"Copied. Saved %@", path.lastPathComponent]
+                              : @"Copied (could not save the file to /var/tmp)");
+    }];
+}
+
+- (void)presentShareItems:(NSArray *)items {
+    UIActivityViewController *vc = [[UIActivityViewController alloc] initWithActivityItems:items
+                                                                     applicationActivities:nil];
+    vc.popoverPresentationController.sourceView = self.view;
+    vc.popoverPresentationController.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds),
+                                                             CGRectGetMidY(self.view.bounds), 1, 1);
+    [SWTopViewController(self) presentViewController:vc animated:YES completion:nil];
+}
+
+- (void)shareSnapshot {
+    __weak typeof(self) ws = self;
+    [self collectSnapshot:^(NSString *text, NSString *path) {
+        // Neu share sheet khong chay duoc tren ban port nay: dung "Copy debug snapshot" hoac scp file trong /var/tmp.
+        [ws presentShareItems:path ? @[[NSURL fileURLWithPath:path]] : @[text]];
+    }];
+}
+
+- (void)shareSweetlog {
+    if (access(kSweetLogPath.fileSystemRepresentation, R_OK) != 0) {
+        [self alertTitle:@"Cannot read sweetlog.txt" message:SWErrText(errno)];
+        return;
+    }
+    [self presentShareItems:@[[NSURL fileURLWithPath:kSweetLogPath]]];
 }
 
 #pragma mark Power & log actions
@@ -1587,399 +2848,6 @@ static BOOL SWFlagOn(NSArray<NSString *> *tokens, NSString *key) {
 
 @end
 
-#pragma mark - System Check (Health) tab
-
-typedef NS_ENUM(NSInteger, SWHealthState) {
-    SWHealthGreen = 0,
-    SWHealthYellow,
-    SWHealthRed
-};
-
-@interface SWHealthItem : NSObject
-@property (nonatomic, copy) NSString *name;
-@property (nonatomic, copy) NSString *summary;
-@property (nonatomic, copy) NSString *details;
-@property (nonatomic, assign) SWHealthState state;
-@end
-
-@implementation SWHealthItem
-@end
-
-static NSString *SWFilterLogLines(NSArray<NSString *> *allLines, NSArray<NSString *> *patterns) {
-    NSMutableArray<NSString *> *matched = [NSMutableArray array];
-    for (NSString *line in allLines) {
-        for (NSString *p in patterns) {
-            if ([line rangeOfString:p options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                [matched addObject:line];
-                break;
-            }
-        }
-    }
-    if (matched.count == 0) return @"(No matching kernel log lines found)";
-    NSUInteger start = matched.count > 40 ? matched.count - 40 : 0;
-    return [[matched subarrayWithRange:NSMakeRange(start, matched.count - start)] componentsJoinedByString:@"\n"];
-}
-
-@interface SWHealthDetailViewController : UIViewController
-@property (nonatomic, strong) SWHealthItem *item;
-@end
-
-@implementation SWHealthDetailViewController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = self.item.name;
-    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
-    self.navigationItem.leftBarButtonItem =
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
-                                                      target:self action:@selector(closeTapped)];
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"Copy" style:UIBarButtonItemStylePlain
-                                        target:self action:@selector(copyTapped)];
-
-    UIView *box = [[UIView alloc] init];
-    box.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
-    box.layer.cornerRadius = 14;
-    box.layer.borderWidth = 1.0;
-    box.layer.borderColor = UIColor.separatorColor.CGColor;
-    box.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.view addSubview:box];
-
-    UITextView *tv = [[UITextView alloc] init];
-    tv.editable = NO;
-    tv.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
-    tv.backgroundColor = UIColor.clearColor;
-    tv.textColor = UIColor.labelColor;
-    tv.text = self.item.details ?: @"(no details)";
-    tv.translatesAutoresizingMaskIntoConstraints = NO;
-    [box addSubview:tv];
-
-    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
-    [NSLayoutConstraint activateConstraints:@[
-        [box.topAnchor constraintEqualToAnchor:g.topAnchor constant:14],
-        [box.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-14],
-        [box.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:14],
-        [box.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-14],
-        [tv.topAnchor constraintEqualToAnchor:box.topAnchor constant:10],
-        [tv.bottomAnchor constraintEqualToAnchor:box.bottomAnchor constant:-10],
-        [tv.leadingAnchor constraintEqualToAnchor:box.leadingAnchor constant:10],
-        [tv.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-10],
-    ]];
-}
-
-- (void)closeTapped { [self dismissViewControllerAnimated:YES completion:nil]; }
-- (void)copyTapped { UIPasteboard.generalPasteboard.string = self.item.details ?: @""; }
-
-@end
-
-@interface SWHealthViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
-@property (nonatomic, strong) UITableView *table;
-@property (nonatomic, strong) NSArray<SWHealthItem *> *items;
-@end
-
-@implementation SWHealthViewController
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"System Check";
-    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
-                                                      target:self action:@selector(runChecks)];
-    self.table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
-    self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.table.dataSource = self;
-    self.table.delegate = self;
-    [self.view addSubview:self.table];
-    [self runChecks];
-}
-
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self runChecks];
-}
-
-- (void)runChecks {
-    __weak typeof(self) ws = self;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *bootargs = [SWSysctl stringForName:kSysBootargs errnoOut:nil] ?: @"";
-        NSString *rawLog = [NSString stringWithContentsOfFile:@"/var/log/sweetlog.txt" encoding:NSUTF8StringEncoding error:nil];
-        NSArray<NSString *> *logLines = rawLog.length > 0
-            ? [rawLog componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]
-            : @[];
-
-        NSMutableArray<SWHealthItem *> *list = [NSMutableArray array];
-        SWHealthItem *(^makeItem)(NSString *, SWHealthState, NSString *, NSString *, NSArray<NSString *> *) =
-        ^SWHealthItem *(NSString *name, SWHealthState st, NSString *sum, NSString *info, NSArray<NSString *> *pats) {
-            SWHealthItem *it = [[SWHealthItem alloc] init];
-            it.name = name;
-            it.state = st;
-            it.summary = sum;
-            NSString *stStr = st == SWHealthGreen ? @"OK (Green)" : (st == SWHealthYellow ? @"WARNING (Yellow)" : @"OFF / ERROR (Red)");
-            NSString *logs = SWFilterLogLines(logLines, pats);
-            it.details = [NSString stringWithFormat:@"Feature: %@\nStatus: %@\nSummary: %@\n\n--- Diagnostics ---\n%@\n\n--- Matching Kernel Log ---\n%@",
-                          name, stStr, sum, info, logs];
-            return it;
-        };
-
-        // 1. Display & Framebuffer
-        {
-            NSString *fstats = [SWSysctl stringForName:kSysFrameStats errnoOut:nil];
-            NSString *surf = [SWSysctl stringForName:kSysSurface errnoOut:nil];
-            pid_t bb = SWFindPid(@"backboardd");
-            SWHealthState st = (bb > 0 && surf != nil) ? SWHealthGreen : (bb > 0 ? SWHealthYellow : SWHealthRed);
-            NSString *sum = bb > 0 ? [NSString stringWithFormat:@"backboardd ON (%d), surface %@", (int)bb, surf ?: @"N/A"] : @"backboardd not running";
-            NSString *info = [NSString stringWithFormat:@"backboardd PID: %d\nkern.sweet_fb_surface: %@\nkern.sweet_fb_frame_stats: %@",
-                              (int)bb, surf ?: @"N/A", fstats ?: @"N/A"];
-            [list addObject:makeItem(@"Display & Framebuffer", st, sum, info, @[@"SWEET FB", @"SWEET INTF1", @"AppleCLCD"])];
-        }
-
-        // 2. GPU & Metal
-        {
-            long long m = -1;
-            BOOL hasM = [SWSysctl getInteger:&m name:kSysMetal errnoOut:nil];
-            BOOL hasBundle = (access("/System/Library/Extensions/HakiosMetal.bundle/HakiosMetal", F_OK) == 0);
-            NSString *margs = [NSString stringWithContentsOfFile:kMetalArgsPath encoding:NSUTF8StringEncoding error:nil] ?: @"(none)";
-            SWHealthState st = (hasM && m == 2 && hasBundle) ? SWHealthGreen : ((hasM && m > 0) ? SWHealthYellow : SWHealthRed);
-            NSString *sum = hasM ? [NSString stringWithFormat:@"sweet_metal=%lld (%@)", m, m == 2 ? @"HakiosMetal" : (m == 1 ? @"SapphireMetal" : @"Off")] : @"GPU sysctl N/A";
-            NSString *info = [NSString stringWithFormat:@"kern.sweet_metal: %@\nHakiosMetal.bundle: %@\n%s:\n%@",
-                              hasM ? [@(m) stringValue] : @"N/A", hasBundle ? @"Present" : @"Missing", kMetalArgsPath.UTF8String, margs];
-            [list addObject:makeItem(@"GPU & Metal", st, sum, info, @[@"GPU", @"Adreno", @"hakios-metal", @"HakiosMetal"])];
-        }
-
-        // 3. Touchscreen
-        {
-            NSString *rate = [SWSysctl stringForName:kSysTouchRate errnoOut:nil];
-            long long stale = 0, quiet = 0;
-            [SWSysctl getInteger:&stale name:@"kern.sweet_touch_stale" errnoOut:nil];
-            [SWSysctl getInteger:&quiet name:@"kern.sweet_touch_quiet" errnoOut:nil];
-            SWHealthState st = rate ? ((stale > 0 || quiet > 5) ? SWHealthYellow : SWHealthGreen) : SWHealthRed;
-            NSString *sum = rate ? [NSString stringWithFormat:@"Active (stale=%lld, quiet=%lld)", stale, quiet] : @"Touch driver N/A";
-            NSString *info = [NSString stringWithFormat:@"kern.sweet_touch_rate: %@\nstale releases: %lld\nquiet releases: %lld",
-                              rate ?: @"N/A", stale, quiet];
-            [list addObject:makeItem(@"Touchscreen (FocalTech)", st, sum, info, @[@"SWEET TOUCH"])];
-        }
-
-        // 4. Wi-Fi
-        {
-            NSString *ip = SWWiFiIP();
-            BOOL hasWifiArg = ([bootargs rangeOfString:@"wifi=1"].location != NSNotFound);
-            SWHealthState st = ![ip isEqualToString:@"N/A"] ? SWHealthGreen : (hasWifiArg ? SWHealthYellow : SWHealthRed);
-            NSString *sum = ![ip isEqualToString:@"N/A"] ? [NSString stringWithFormat:@"Connected (%@)", ip] : (hasWifiArg ? @"Enabled, no IP" : @"Disabled");
-            NSString *info = [NSString stringWithFormat:@"en0 IPv4: %@\nboot-arg wifi=1: %@", ip, hasWifiArg ? @"Yes" : @"No"];
-            [list addObject:makeItem(@"Wi-Fi", st, sum, info, @[@"WLAN", @"WIFI", @"WCN3988"])];
-        }
-
-        // 5. Cellular / Modem
-        {
-            BOOL hasModem = ([bootargs rangeOfString:@"modem=1"].location != NSNotFound);
-            BOOL hasLog = [SWFilterLogLines(logLines, @[@"MODEM", @"QMI"]) rangeOfString:@"No matching"].location == NSNotFound;
-            SWHealthState st = (hasModem && hasLog) ? SWHealthGreen : (hasModem ? SWHealthYellow : SWHealthRed);
-            NSString *sum = hasModem ? (hasLog ? @"Modem up (QMI active)" : @"Enabled, no QMI log") : @"Disabled";
-            NSString *info = [NSString stringWithFormat:@"boot-arg modem=1: %@", hasModem ? @"Yes" : @"No"];
-            [list addObject:makeItem(@"Cellular / Modem", st, sum, info, @[@"MODEM", @"QMI", @"MPSS"])];
-        }
-
-        // 6. Audio
-        {
-            BOOL hasAudio = ([bootargs rangeOfString:@"audio="].location != NSNotFound);
-            pid_t ms = SWFindPid(@"mediaserverd");
-            SWHealthState st = (hasAudio && ms > 0) ? SWHealthGreen : ((hasAudio || ms > 0) ? SWHealthYellow : SWHealthRed);
-            NSString *sum = (hasAudio && ms > 0) ? [NSString stringWithFormat:@"OK (mediaserverd %d)", (int)ms] : (hasAudio ? @"mediaserverd off" : @"Disabled in boot-args");
-            NSString *info = [NSString stringWithFormat:@"boot-arg audio=: %@\nmediaserverd PID: %d", hasAudio ? @"Yes" : @"No", (int)ms];
-            [list addObject:makeItem(@"Audio", st, sum, info, @[@"AUDIO", @"ADSP", @"SWEET AUDIO"])];
-        }
-
-        // 7. Bluetooth
-        {
-            pid_t bt = SWFindPid(@"btmonitor");
-            SWHealthState st = bt > 0 ? SWHealthGreen : SWHealthRed;
-            NSString *sum = bt > 0 ? [NSString stringWithFormat:@"btmonitor ON (%d)", (int)bt] : @"btmonitor not running";
-            NSString *info = [NSString stringWithFormat:@"btmonitor PID: %d", (int)bt];
-            [list addObject:makeItem(@"Bluetooth", st, sum, info, @[@"BT", @"BLUETOOTH", @"btmonitor"])];
-        }
-
-        // 8. Fingerprint (FOD)
-        {
-            pid_t fpd = SWFindPid(@"fpd");
-            long long seq = -1;
-            BOOL hasFod = [SWSysctl getInteger:&seq name:@"kern.sweet_fod_seq" errnoOut:nil];
-            SWHealthState st = (fpd > 0 && hasFod) ? SWHealthGreen : ((fpd > 0 || hasFod) ? SWHealthYellow : SWHealthRed);
-            NSString *sum = fpd > 0 ? [NSString stringWithFormat:@"fpd ON (%d), presses=%lld", (int)fpd, seq] : (hasFod ? @"Kernel FOD ready, fpd off" : @"Unavailable");
-            NSString *info = [NSString stringWithFormat:@"fpd PID: %d\nkern.sweet_fod_seq: %@", (int)fpd, hasFod ? [@(seq) stringValue] : @"N/A"];
-            [list addObject:makeItem(@"Fingerprint (FOD)", st, sum, info, @[@"FOD", @"QSEE", @"fingerprint"])];
-        }
-
-        // 9. Haptics & Vibration
-        {
-            pid_t vib = SWFindPid(@"vibd");
-            SWHealthState st = vib > 0 ? SWHealthGreen : SWHealthRed;
-            NSString *sum = vib > 0 ? [NSString stringWithFormat:@"vibd ON (%d)", (int)vib] : @"vibd not running";
-            NSString *info = [NSString stringWithFormat:@"vibd PID: %d", (int)vib];
-            [list addObject:makeItem(@"Haptics & Vibration", st, sum, info, @[@"VIB", @"HAPTIC"])];
-        }
-
-        // 10. Thermal & Sensors
-        {
-            pid_t th = SWFindPid(@"thermald");
-            pid_t sn = SWFindPid(@"sensord");
-            SWHealthState st = (th > 0 && sn > 0) ? SWHealthGreen : ((th > 0 || sn > 0) ? SWHealthYellow : SWHealthRed);
-            NSString *sum = [NSString stringWithFormat:@"thermald: %@, sensord: %@", th > 0 ? @"ON" : @"off", sn > 0 ? @"ON" : @"off"];
-            NSString *info = [NSString stringWithFormat:@"thermald PID: %d\nsensord PID: %d", (int)th, (int)sn];
-            [list addObject:makeItem(@"Thermal & Sensors", st, sum, info, @[@"THERMAL", @"SENSOR"])];
-        }
-
-        // 11. SSH & Jailbreak -> split into Storage, Jailbreak & Tweaks, SSH Server, USB Networking, Battery, Brightness, Sleep, Calls/SMS, Camera
-
-        // 11. Brightness & Backlight
-        {
-            BOOL hasBl = ([bootargs rangeOfString:@"sweetbl=1"].location != NSNotFound);
-            BOOL hasBlLog = [SWFilterLogLines(logLines, @[@"SWEET BL", @"AppleARMBacklight"]) rangeOfString:@"No matching"].location == NSNotFound;
-            SWHealthState st = (hasBl && hasBlLog) ? SWHealthGreen : (hasBl ? SWHealthYellow : SWHealthRed);
-            NSString *sum = hasBl ? (hasBlLog ? @"Backlight active (sweetbl=1)" : @"Enabled, no log yet") : @"Disabled (sweetbl=0)";
-            NSString *info = [NSString stringWithFormat:@"boot-arg sweetbl=1: %@", hasBl ? @"Yes" : @"No"];
-            [list addObject:makeItem(@"Brightness & Backlight", st, sum, info, @[@"SWEET BL", @"AppleARMBacklight", @"DCS 0x51"])];
-        }
-
-        // 12. Screen Sleep & Tap-to-Wake
-        {
-            long long tw = -1, tws = 0;
-            BOOL hasTw = [SWSysctl getInteger:&tw name:kSysTapWake errnoOut:nil];
-            [SWSysctl getInteger:&tws name:@"kern.sweet_tap_wakes" errnoOut:nil];
-            SWHealthState st = (hasTw && tw > 0) ? SWHealthGreen : (hasTw ? SWHealthYellow : SWHealthRed);
-            NSString *sum = hasTw ? [NSString stringWithFormat:@"tap_wake=%lld, wakes=%lld", tw, tws] : @"Unavailable";
-            NSString *info = [NSString stringWithFormat:@"kern.sweet_tap_wake: %@\nkern.sweet_tap_wakes: %lld",
-                              hasTw ? [@(tw) stringValue] : @"N/A", tws];
-            [list addObject:makeItem(@"Screen Sleep & Wake", st, sum, info, @[@"tap to wake", @"RequestPowerChange", @"panel display"])];
-        }
-
-        // 13. Battery & Charging
-        {
-            long long soc = -1, chg = -1;
-            BOOL hasBat = [SWSysctl getInteger:&soc name:@"kern.hakios.battery_soc" errnoOut:nil];
-            [SWSysctl getInteger:&chg name:@"kern.hakios.battery_charging" errnoOut:nil];
-            BOOL hasBatLog = [SWFilterLogLines(logLines, @[@"BATTERY", @"QG", @"FG"]) rangeOfString:@"No matching"].location == NSNotFound;
-            SWHealthState st = hasBat ? SWHealthGreen : (hasBatLog ? SWHealthYellow : SWHealthRed);
-            NSString *sum = hasBat ? [NSString stringWithFormat:@"%lld%% (%@)", soc, chg > 0 ? @"Charging" : @"Discharging"]
-                                   : (hasBatLog ? @"Kernel log only (no sysctl)" : @"Battery driver N/A");
-            NSString *info = [NSString stringWithFormat:@"battery_soc: %@\ncharging: %@",
-                              hasBat ? [@(soc) stringValue] : @"N/A", chg >= 0 ? [@(chg) stringValue] : @"N/A"];
-            [list addObject:makeItem(@"Battery & Charging", st, sum, info, @[@"BATTERY", @"QG", @"charger"])];
-        }
-
-        // 14. Calls & SMS (CommCenter)
-        {
-            pid_t cc = SWFindPid(@"CommCenter");
-            pid_t im = SWFindPid(@"imagent");
-            SWHealthState st = (cc > 0 && im > 0) ? SWHealthGreen : (cc > 0 ? SWHealthYellow : SWHealthRed);
-            NSString *sum = [NSString stringWithFormat:@"CommCenter: %@, imagent: %@", cc > 0 ? @"ON" : @"off", im > 0 ? @"ON" : @"off"];
-            NSString *info = [NSString stringWithFormat:@"CommCenter PID: %d\nimagent PID: %d", (int)cc, (int)im];
-            [list addObject:makeItem(@"Calls, SMS & IMEI", st, sum, info, @[@"CommCenter", @"MODEM", @"QMI"])];
-        }
-
-        // 15. Camera
-        {
-            pid_t cam = SWFindPid(@"cameracaptured");
-            if (cam <= 0) cam = SWFindPid(@"applecamerad");
-            SWHealthState st = cam > 0 ? SWHealthGreen : SWHealthRed;
-            NSString *sum = cam > 0 ? [NSString stringWithFormat:@"Camera daemon ON (%d)", (int)cam] : @"Camera daemon not running";
-            NSString *info = [NSString stringWithFormat:@"cameracaptured/applecamerad PID: %d", (int)cam];
-            [list addObject:makeItem(@"Camera", st, sum, info, @[@"CAMERA", @"ISP", @"CSI"])];
-        }
-
-        // 16. Storage Free Space
-        {
-            NSDictionary *attrs = [NSFileManager.defaultManager attributesOfFileSystemForPath:@"/" error:nil];
-            unsigned long long freeB = [attrs[NSFileSystemFreeSize] unsignedLongLongValue];
-            unsigned long long totalB = [attrs[NSFileSystemSize] unsignedLongLongValue];
-            double freeGB = freeB / (1024.0 * 1024.0 * 1024.0);
-            double totalGB = totalB / (1024.0 * 1024.0 * 1024.0);
-            SWHealthState st = freeGB >= 2.0 ? SWHealthGreen : (freeGB >= 0.5 ? SWHealthYellow : SWHealthRed);
-            NSString *sum = [NSString stringWithFormat:@"%.1f GB free / %.1f GB total", freeGB, totalGB];
-            NSString *info = [NSString stringWithFormat:@"Free bytes: %llu\nTotal bytes: %llu", freeB, totalB];
-            [list addObject:makeItem(@"Storage Space", st, sum, info, @[@"UFS", @"HFS", @"ufsroot"])];
-        }
-
-        // 17. Jailbreak & Tweaks
-        {
-            BOOL hasJB = (access("/var/jb", F_OK) == 0);
-            BOOL hasTweak = (access("/var/jb/usr/lib/TweakInject", F_OK) == 0);
-            SWHealthState st = (hasJB && hasTweak) ? SWHealthGreen : (hasJB ? SWHealthYellow : SWHealthRed);
-            NSString *sum = (hasJB && hasTweak) ? @"Procursus + TweakInject OK" : (hasJB ? @"/var/jb OK, no TweakInject" : @"No /var/jb");
-            NSString *info = [NSString stringWithFormat:@"/var/jb: %@\nTweakInject: %@\nuid=%d euid=%d",
-                              hasJB ? @"Present" : @"Missing", hasTweak ? @"Present" : @"Missing", (int)getuid(), (int)geteuid()];
-            [list addObject:makeItem(@"Jailbreak & Tweaks", st, sum, info, @[@"ElleKit", @"TweakInject", @"Sileo", @"jb"])];
-        }
-
-        // 18. SSH Server
-        {
-            pid_t ssh = SWFindPid(@"sshd");
-            if (ssh <= 0) ssh = SWFindPid(@"dropbear");
-            NSString *ip = SWWiFiIP();
-            SWHealthState st = ssh > 0 ? SWHealthGreen : SWHealthRed;
-            NSString *sum = ssh > 0 ? [NSString stringWithFormat:@"ON (pid %d) • %@", (int)ssh, ip] : @"SSH daemon off";
-            NSString *info = [NSString stringWithFormat:@"SSH PID: %d\nWi-Fi IP: %@", (int)ssh, ip];
-            [list addObject:makeItem(@"SSH Server", st, sum, info, @[@"sshd", @"dropbear", @"ssh"])];
-        }
-
-        // 19. USB Networking
-        {
-            BOOL hasUsb = ([bootargs rangeOfString:@"sweetusb=2"].location != NSNotFound);
-            SWHealthState st = hasUsb ? SWHealthGreen : SWHealthRed;
-            NSString *sum = hasUsb ? @"CDC-ECM enabled (sweetusb=2)" : @"Disabled";
-            NSString *info = [NSString stringWithFormat:@"boot-arg sweetusb=2: %@", hasUsb ? @"Yes" : @"No"];
-            [list addObject:makeItem(@"USB Networking", st, sum, info, @[@"SWEET USB", @"DWC3", @"CDC-ECM"])];
-        }
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            ws.items = list;
-            [ws.table reloadData];
-        });
-    });
-}
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return (NSInteger)self.items.count; }
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"iOS Subsystem Health"; }
-- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
-    return @"Green = OK • Yellow = Warning / Partial • Red = Off / Error. Tap any row to view diagnostics and kernel logs.";
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
-    static NSString *cid = @"SWHealthCell";
-    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:cid];
-    if (!cell) {
-        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
-        cell.detailTextLabel.font = [UIFont systemFontOfSize:13];
-        cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-    }
-    SWHealthItem *it = self.items[(NSUInteger)ip.row];
-    cell.textLabel.text = it.name;
-    cell.detailTextLabel.text = it.summary;
-
-    UIColor *dotColor = it.state == SWHealthGreen ? UIColor.systemGreenColor
-                      : (it.state == SWHealthYellow ? UIColor.systemYellowColor : UIColor.systemRedColor);
-    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(16, 16)];
-    cell.imageView.image = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        [dotColor setFill];
-        [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(1, 1, 14, 14)] fill];
-    }];
-    return cell;
-}
-
-- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
-    [tv deselectRowAtIndexPath:ip animated:YES];
-    SWHealthDetailViewController *vc = [[SWHealthDetailViewController alloc] init];
-    vc.item = self.items[(NSUInteger)ip.row];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    [self presentViewController:nav animated:YES completion:nil];
-}
-
-@end
-
 #pragma mark - App delegate / main
 
 @interface SWAppDelegate : UIResponder <UIApplicationDelegate>
@@ -1990,24 +2858,10 @@ static NSString *SWFilterLogLines(NSArray<NSString *> *allLines, NSArray<NSStrin
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-
-    SWMainViewController *controls = [[SWMainViewController alloc] init];
-    UINavigationController *nav1 = [[UINavigationController alloc] initWithRootViewController:controls];
-    nav1.navigationBar.prefersLargeTitles = YES;
-    nav1.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Controls"
-                                                    image:[UIImage systemImageNamed:@"slider.horizontal.3"]
-                                                      tag:0];
-
-    SWHealthViewController *health = [[SWHealthViewController alloc] init];
-    UINavigationController *nav2 = [[UINavigationController alloc] initWithRootViewController:health];
-    nav2.navigationBar.prefersLargeTitles = YES;
-    nav2.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"System Check"
-                                                    image:[UIImage systemImageNamed:@"checkmark.shield"]
-                                                      tag:1];
-
-    UITabBarController *tabs = [[UITabBarController alloc] init];
-    tabs.viewControllers = @[nav1, nav2];
-    self.window.rootViewController = tabs;
+    SWMainViewController *root = [[SWMainViewController alloc] init];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:root];
+    nav.navigationBar.prefersLargeTitles = YES;
+    self.window.rootViewController = nav;
     [self.window makeKeyAndVisible];
     return YES;
 }
@@ -2016,12 +2870,17 @@ static NSString *SWFilterLogLines(NSArray<NSString *> *allLines, NSArray<NSStrin
 
 int main(int argc, char *argv[]) {
     @autoreleasepool {
-        // Neu binary duoc cai setuid-root thi nang quyen de ghi sysctl / reboot. Neu khong, bo qua.
-        if (geteuid() != 0) {
-            (void)setuid(0);
-            (void)setgid(0);
-        }
         signal(SIGPIPE, SIG_IGN);
+#ifdef SW_FULL_ROOT
+        // Tuy chon (make FULL_ROOT=1): bien ruid/rgid thanh root luon, de cac tool duoc spawn (launchctl...)
+        // thay uid=0 that su. Doi lai HOME/prefs cua app chuyen sang /var/root.
+        if (geteuid() == 0 && getuid() != 0) {
+            (void)setgid(0);
+            (void)setuid(0);
+        }
+#endif
+        // Mac dinh KHONG goi setuid(0): neu binary la setuid-root thi euid da la 0 (du de ghi sysctl/reboot);
+        // neu khong phai thi setuid(0) luon that bai (EPERM) nen khong co tac dung.
         return UIApplicationMain(argc, argv, nil, NSStringFromClass([SWAppDelegate class]));
     }
 }
