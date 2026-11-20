@@ -39,6 +39,7 @@ $(BIN): main.m Info.plist entitlements.plist | check-sdk
 	@mkdir -p $(APP_DIR)
 	$(CLANG) $(CFLAGS) main.m -o $(BIN) $(LDFLAGS)
 	cp Info.plist $(APP_DIR)/Info.plist
+	cp -f AppIcon60x60@2x.png AppIcon60x60@3x.png $(APP_DIR)/ 2>/dev/null || true
 	printf 'APPL????' > $(APP_DIR)/PkgInfo
 	$(LDID) -Sentitlements.plist $(BIN)
 	@echo "Built $(APP_DIR)"
