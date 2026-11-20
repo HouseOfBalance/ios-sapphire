@@ -26,7 +26,7 @@ DEVICE      ?= root@192.168.1.100
 
 CFLAGS      := -target $(TARGET) -isysroot $(SDK) -fobjc-arc -O2 \
 	           -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations $(EXTRA_CFLAGS)
-LDFLAGS     := -framework UIKit -framework Foundation -framework QuartzCore -Wl,-dead_strip $(EXTRA_LDFLAGS)
+LDFLAGS     := -framework UIKit -framework Foundation -framework QuartzCore -framework CoreGraphics -Wl,-dead_strip $(EXTRA_LDFLAGS)
 
 ifdef FULL_ROOT
 CFLAGS += -DSW_FULL_ROOT=1
