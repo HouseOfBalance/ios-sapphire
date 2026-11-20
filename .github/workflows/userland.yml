@@ -71,6 +71,14 @@ jobs:
           SDK="$SDK_PATH" LDID="$LDID_BIN" bash build.sh ../obj || true
           cd ..
 
+          # 5. Build SapphireTools.app
+          echo "Building SapphireTools.app..."
+          cd apps/SapphireTools
+          make SDK="$SDK_PATH" LDID="$LDID_BIN"
+          codesign --force --sign - --entitlements entitlements.plist build/SapphireTools.app/SapphireTools
+          cp -R build/SapphireTools.app ../../obj/
+          cd ../..
+
           ls -la obj/
 
       - uses: actions/upload-artifact@v4
