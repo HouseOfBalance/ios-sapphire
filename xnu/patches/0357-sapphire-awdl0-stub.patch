@@ -1,0 +1,115 @@
+From 5077765c32574ab9e1c526b057c4283457ad882a Mon Sep 17 00:00:00 2001
+From: Sapphire Port <sapphire@xiaomi>
+Date: Sat, 21 Nov 2026 00:39:18 +0700
+Subject: [PATCH] sapphire: add stub awdl0 interface on VIRTUAL_IF_CREATE for
+ AirDrop bring-up
+
+---
+ bsd/dev/sapphire_apple80211.c | 84 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 84 insertions(+)
+
+diff --git a/bsd/dev/sapphire_apple80211.c b/bsd/dev/sapphire_apple80211.c
+index e9c92f3..a897816 100644
+--- a/bsd/dev/sapphire_apple80211.c
++++ b/bsd/dev/sapphire_apple80211.c
+@@ -456,6 +456,86 @@ get(struct apple80211req *request)
+ 	return error;
+ }
+ 
++#include <net/if.h>
++#include <net/if_ether.h>
++#include <net/if_types.h>
++#include <net/kpi_interface.h>
++
++static ifnet_t awdl_ifp;
++
++static errno_t
++awdl_output(ifnet_t ifp __unused, mbuf_t m)
++{
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++awdl_ioctl(ifnet_t ifp __unused, unsigned long cmd, void *data)
++{
++	if (cmd == SIOCSIFFLAGS || cmd == SIOCAIFADDR || cmd == SIOCGIFMEDIA) {
++		return 0;
++	}
++	if (cmd == SIOCGA80211 || cmd == SIOCSA80211) {
++		return sapphire_apple80211_ioctl(cmd, data);
++	}
++	return EOPNOTSUPP;
++}
++
++static int
++awdl_create(void)
++{
++	if (awdl_ifp != NULL) {
++		return 0;
++	}
++	static const uint8_t mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++	struct ifnet_init_eparams init = {
++		.ver = IFNET_INIT_CURRENT_VERSION,
++		.len = sizeof(init),
++		.name = "awdl",
++		.unit = 0,
++		.type = IFT_ETHER,
++		.family = IFNET_FAMILY_ETHERNET,
++		.output = awdl_output,
++		.ioctl = awdl_ioctl,
++		.broadcast_addr = etherbroadcastaddr,
++		.broadcast_len = ETHER_ADDR_LEN,
++	};
++	ifnet_t ifp = NULL;
++	errno_t err = ifnet_allocate_extended(&init, &ifp);
++	if (err != 0) {
++		printf("apple80211: awdl0 allocate failed: %d\n", err);
++		return err;
++	}
++	ifnet_set_lladdr(ifp, mac, ETHER_ADDR_LEN);
++	ifnet_set_mtu(ifp, 1484);
++	ifnet_set_flags(ifp, IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
++	ifnet_set_eflags(ifp, IFEF_AWDL, 0);
++	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);
++	err = ifnet_attach(ifp, NULL);
++	if (err != 0) {
++		printf("apple80211: awdl0 attach failed: %d\n", err);
++		ifnet_release(ifp);
++		return err;
++	}
++	awdl_ifp = ifp;
++	printf("apple80211: awdl0 stub interface created (IFEF_AWDL)\n");
++	return 0;
++}
++
++static int
++awdl_delete(void)
++{
++	if (awdl_ifp == NULL) {
++		return 0;
++	}
++	ifnet_detach(awdl_ifp);
++	ifnet_release(awdl_ifp);
++	awdl_ifp = NULL;
++	printf("apple80211: awdl0 stub interface deleted\n");
++	return 0;
++}
++
+ /* ---- set ---------------------------------------------------------------------------------------------- */
+ 
+ static int
+@@ -593,6 +673,10 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+ 	}
+ 	case 10:
+ 		return set_scan(request, said, said_size);
++	case 94:                                /* VIRTUAL_IF_CREATE: stub awdl0 for sharingd/mDNSResponder */
++		return awdl_create();
++	case 95:                                /* VIRTUAL_IF_DELETE */
++		return awdl_delete();
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
+-- 
+2.56.0.windows.4
+
