@@ -21,7 +21,25 @@ jobs:
       - name: Install dependencies & SDK
         run: |
           mkdir -p /usr/local/bin $HOME/sdks
-          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/ldid >/dev/null
+          cat <<'EOF' | sudo tee /usr/local/bin/ldid >/dev/null
+          #!/bin/sh
+          ent=""
+          target=""
+          for arg in "$@"; do
+            case "$arg" in
+              -S) ;;
+              -S*) ent="${arg#-S}" ;;
+              *) target="$arg" ;;
+            esac
+          done
+          if [ -n "$target" ] && [ -e "$target" ]; then
+            if [ -n "$ent" ] && [ -f "$ent" ]; then
+              codesign --force --sign - --entitlements "$ent" "$target"
+            else
+              codesign --force --sign - "$target"
+            fi
+          fi
+          EOF
           sudo chmod +x /usr/local/bin/ldid
           git clone --depth 1 https://github.com/theos/sdks.git $HOME/sdks/theos-sdks
 
@@ -88,7 +106,10 @@ jobs:
           codesign --force --sign - --entitlements entitlements.plist build/SapphireTools.app/SapphireTools
           cp -R build/SapphireTools.app ../../obj/
           clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o ../../obj/sapphire-toolsd toolsd.c
-          $LDID_BIN -S ../../obj/sapphire-toolsd
+          codesign --force --sign - --entitlements entitlements.plist ../../obj/sapphire-toolsd
+          codesign --force --sign - --entitlements entitlements.plist ../../obj/camd
+          codesign --force --sign - --entitlements entitlements.plist ../../obj/camctl
+          codesign --force --sign - ../../obj/SapphireNoCamera.dylib
           cp com.sapphire.toolsd.plist ../../obj/
           cd ../..
 
