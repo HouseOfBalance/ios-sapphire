@@ -212,8 +212,12 @@ driver (Mesa freedreno) behind CoreAnimation.
 | Path | What |
 | --- | --- |
 | `shim/` | Bare-metal boot shim (C + asm), boot image v4, Gold hand-off, GIC setup, payload loader |
-| `xnu/patches/` | XNU patch series, applied in order: sweet's 0001–0079, topaz's 0080–0139, sapphire's 0140+ |
-| `codemagic.yaml`, `.github/workflows/xnu.yml` | Kernel builds |
+| `xnu/patches/` | XNU patch series, applied in order: sweet's 0001–0079, topaz's 0080–0139, sapphire's 0140–0356 |
+| `hakios-metal/` | HakiOS 2.3.4 Metal engine adapted for Adreno 610 (`0x06010001`, 128 KB GMEM at `0x100000`, `SapphireGPU`) |
+| `devices/sapphire/metal.args` | Per-device Metal configuration (`metal_defer=1`, `metal_gmem=0`) installed to `/var/tmp/metal.args` |
+| `userland/apps/SapphireTools/` | On-device iOS control & diagnostics app (`SapphireTools.app` v2.0, Objective-C/UIKit) |
+| `installer/update/files/Applications/SapphireTools.app` | Prebuilt `SapphireTools.app` v2.0 bundled automatically into rootfs updates |
+| `codemagic.yaml`, `.github/workflows/xnu-4k.yml`, `.github/workflows/userland.yml` | Kernel (4K) and userland CI builds |
 | `tools/` | ADT, payload, root image, boot image, log, modem and HFS+ tools |
 | `NOTES.md` | Engineering log (sweet, topaz, sapphire) |
 | `RECOVERY.md` | Getting back to recovery / Android on sapphire |
@@ -228,6 +232,20 @@ Not in git: partition dumps, live device trees, Apple firmware and root images, 
 - Touch: FocalTech FT3519T at `0x38` on QUP0 SE2 (IRQ GPIO80, reset GPIO86), raw range 2160×2400.
 - USB: DWC3 at `0x4e00000` (QSCRATCH `+0xf8800`), Synopsys femto HS PHY at `0x1613000`, USB30_PRIM GDSC at GCC `0x1400000` + `0x1a004`.
 - Modem carve-out `0x4ab00000`+`0x6900000`, WLAN MSA `0x51900000`+`0x100000`, SMEM `0x46000000`; WCN3988 (`chip_id 150`) behind the modem.
+
+## HakiOS 2.3.4 Integration & SapphireTools.app
+
+Recent upgrades integrated into this repository:
+
+- **In-tree Metal Engine (`hakios-metal/`)**: Adapted from HakiOS 2.3.4 for Sapphire's Adreno 610 (`kChipId = 0x06010001`, 128 KiB GMEM at `0x100000`, 1 SP / 1 CCU, `SapphireGPU` IOKit service fallback) with per-device settings in `devices/sapphire/metal.args`.
+- **Graphics & Status Bar (`userland/src/HakiosMetalCA.m`, `userland/src/inject_sb.c`, `userland/tweaks/statusbar/SapphireStatusBar.c`)**: Nearest-shader variant fallback (`hm_ca_nearest()`) and `_UIStatusBarVisualProvider_Fallback` → `Split1125` class-method + `alloc` replacement.
+- **Kernel Patch `0356-sapphire-hakios-234-fb-touch.patch`**:
+  - Triple-buffered flip pool (`SWEET_FB_FLIPS = 3`) in the 48 MB low-DDR pool (`SweetFramebuffer.cpp`), fixing multi-layer `fScale2` presentation and exporting `kern.sweet_fb_surface`.
+  - Faster FocalTech FT5452 touch polling (4 ms active / 8 ms idle) and 8-stroke latency summary (`touch_feel_add()` in `sweet_touch.c`).
+- **On-Device Control Panel (`SapphireTools.app` v2.0)**:
+  - Source: `userland/apps/SapphireTools/` (built and codesigned automatically by `.github/workflows/userland.yml`).
+  - Pre-installed automatically via `installer/update/files/Applications/SapphireTools.app` (setuid-root `chmod 6755`).
+  - Features: live `kern.sweet_*` sysctl controls (`sweet_metal`, `sweet_fb_rscale`, `sweet_fb_flipflush`, `sweet_tap_wake`, `sweet_touch_quiet_ms`, `sweet_touch_stale_ms`), `/var/tmp/metal.args` editor, Wi-Fi IP (`en0`) + SSH daemon toggle, live Accessibility toggles (Reduce Transparency / Reduce Motion), Services status & per-daemon restart (`backboardd`, `SpringBoard`, `fpd`, `btmonitor`, `vibd`, `thermald`, `sensord`), kernel log viewer, and 1-tap Full Snapshot export.
 
 ## Credits
 
