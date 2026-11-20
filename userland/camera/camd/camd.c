@@ -922,7 +922,7 @@ render_frame(const uint8_t *raw, int mode, uint64_t ts_ns, PvStats *out)
 	unsigned slot = (shm->latest + 1) % CAMD_SHM_SLOTS;
 	j.dst_stride = ((long)ow * 4 + 63) & ~63L;
 	IOSurfaceRef surf = ensure_pv_surface(slot, ow, oh, j.dst_stride);
-	if (surf != NULL && IOSurfaceLock(surf, 0, NULL) == kIOReturnSuccess) {
+	if (surf != NULL && IOSurfaceLock(surf, 0, NULL) == 0) {
 		j.dst = (uint8_t *)IOSurfaceGetBaseAddress(surf);
 		j.dst_stride = (long)IOSurfaceGetBytesPerRow(surf);
 	} else {
