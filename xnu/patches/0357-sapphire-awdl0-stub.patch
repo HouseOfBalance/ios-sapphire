@@ -1,18 +1,18 @@
-From 5077765c32574ab9e1c526b057c4283457ad882a Mon Sep 17 00:00:00 2001
+From 71db036066ae1d790c62955fffcb5e6f961631a0 Mon Sep 17 00:00:00 2001
 From: Sapphire Port <sapphire@xiaomi>
-Date: Sat, 21 Nov 2026 00:39:18 +0700
+Date: Sat, 21 Nov 2026 00:48:55 +0700
 Subject: [PATCH] sapphire: add stub awdl0 interface on VIRTUAL_IF_CREATE for
  AirDrop bring-up
 
 ---
- bsd/dev/sapphire_apple80211.c | 84 +++++++++++++++++++++++++++++++++++
- 1 file changed, 84 insertions(+)
+ bsd/dev/sapphire_apple80211.c | 85 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
 
 diff --git a/bsd/dev/sapphire_apple80211.c b/bsd/dev/sapphire_apple80211.c
-index e9c92f3..a897816 100644
+index e9c92f3..1561fdf 100644
 --- a/bsd/dev/sapphire_apple80211.c
 +++ b/bsd/dev/sapphire_apple80211.c
-@@ -456,6 +456,86 @@ get(struct apple80211req *request)
+@@ -456,6 +456,87 @@ get(struct apple80211req *request)
  	return error;
  }
  
@@ -48,7 +48,8 @@ index e9c92f3..a897816 100644
 +	if (awdl_ifp != NULL) {
 +		return 0;
 +	}
-+	static const uint8_t mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++	static const uint8_t mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++	static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 +	struct ifnet_init_eparams init = {
 +		.ver = IFNET_INIT_CURRENT_VERSION,
 +		.len = sizeof(init),
@@ -58,8 +59,8 @@ index e9c92f3..a897816 100644
 +		.family = IFNET_FAMILY_ETHERNET,
 +		.output = awdl_output,
 +		.ioctl = awdl_ioctl,
-+		.broadcast_addr = etherbroadcastaddr,
-+		.broadcast_len = ETHER_ADDR_LEN,
++		.broadcast_addr = bcast,
++		.broadcast_len = 6,
 +	};
 +	ifnet_t ifp = NULL;
 +	errno_t err = ifnet_allocate_extended(&init, &ifp);
@@ -67,11 +68,11 @@ index e9c92f3..a897816 100644
 +		printf("apple80211: awdl0 allocate failed: %d\n", err);
 +		return err;
 +	}
-+	ifnet_set_lladdr(ifp, mac, ETHER_ADDR_LEN);
++	ifnet_set_lladdr(ifp, mac, 6);
 +	ifnet_set_mtu(ifp, 1484);
 +	ifnet_set_flags(ifp, IFF_UP | IFF_RUNNING | IFF_BROADCAST | IFF_MULTICAST | IFF_SIMPLEX, 0xffff);
 +	ifnet_set_eflags(ifp, IFEF_AWDL, 0);
-+	ifnet_set_hdrlen(ifp, ETHER_HDR_LEN);
++	ifnet_set_hdrlen(ifp, 14);
 +	err = ifnet_attach(ifp, NULL);
 +	if (err != 0) {
 +		printf("apple80211: awdl0 attach failed: %d\n", err);
@@ -99,7 +100,7 @@ index e9c92f3..a897816 100644
  /* ---- set ---------------------------------------------------------------------------------------------- */
  
  static int
-@@ -593,6 +673,10 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+@@ -593,6 +674,10 @@ set(const struct apple80211req *request, char *said, size_t said_size)
  	}
  	case 10:
  		return set_scan(request, said, said_size);
