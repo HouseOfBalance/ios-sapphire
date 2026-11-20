@@ -1360,6 +1360,7 @@ typedef struct {
     SWCamdSlot slot[CAMD_SHM_SLOTS];
 } SWCamdShm;
 
+#include <pthread.h>
 static int gCamdSockFd = -1;
 static pthread_mutex_t gCamdSockMu = PTHREAD_MUTEX_INITIALIZER;
 
