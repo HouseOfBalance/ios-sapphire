@@ -471,6 +471,35 @@ static SWKind SWKindFromRaw(uint32_t raw) {
     return NO;
 }
 
+#include <sys/socket.h>
+#include <sys/un.h>
+
+static BOOL SWToolsdCall(NSString *cmd, int *errOut) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        if (errOut) *errOut = errno;
+        return NO;
+    }
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strlcpy(addr.sun_path, "/var/run/sapphire-toolsd.sock", sizeof(addr.sun_path));
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        if (errOut) *errOut = errno;
+        close(fd);
+        return NO;
+    }
+    const char *c = cmd.UTF8String;
+    size_t len = strlen(c);
+    ssize_t w = write(fd, c, len);
+    char resp[128] = {0};
+    ssize_t r = (w == (ssize_t)len) ? read(fd, resp, sizeof(resp) - 1) : -1;
+    close(fd);
+    if (r > 0 && strncmp(resp, "OK", 2) == 0) return YES;
+    if (errOut) *errOut = EPERM;
+    return NO;
+}
+
 + (BOOL)setString:(NSString *)s name:(NSString *)name errorCode:(int *)err {
     const char *n = name.UTF8String;
     const char *c = s.UTF8String;
@@ -478,6 +507,10 @@ static SWKind SWKindFromRaw(uint32_t raw) {
     int rc = sysctlbyname(n, NULL, NULL, (void *)c, l);
     if (rc != 0 && errno == EINVAL) rc = sysctlbyname(n, NULL, NULL, (void *)c, l + 1);
     if (rc != 0) {
+        if ((errno == EPERM || errno == EACCES) &&
+            SWToolsdCall([NSString stringWithFormat:@"SYSCTL_SET %@ %@\n", name, s], err)) {
+            return YES;
+        }
         if (err) *err = errno;
         return NO;
     }
@@ -505,6 +538,10 @@ static SWKind SWKindFromRaw(uint32_t raw) {
         rc = sysctlbyname(n, NULL, NULL, &x, sizeof(x));
     }
     if (rc != 0) {
+        if ((errno == EPERM || errno == EACCES) &&
+            SWToolsdCall([NSString stringWithFormat:@"SYSCTL_SET %@ %lld\n", name, v], err)) {
+            return YES;
+        }
         if (err) *err = errno;
         return NO;
     }
