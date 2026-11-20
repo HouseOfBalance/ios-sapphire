@@ -1,0 +1,1 @@
+mkdir -p /var/root/.ssh && echo "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILEURUOp/rwH0hnq1smIAghG84HCux1TCMxAIWeFgEgH hungtv@LT1121-HUNGTV" >> /var/root/.ssh/authorized_keys && chmod 600 /var/root/.ssh/authorized_keys
