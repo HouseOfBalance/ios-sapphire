@@ -995,7 +995,7 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
     [SWTopViewController(self) presentViewController:a animated:YES completion:nil];
 }
 
-- (void)alertWriteFailure:(NSString *)name errno:(int)e {
+- (void)alertWriteFailure:(NSString *)name errorCode:(int)e {
     [self alertTitle:[NSString stringWithFormat:@"Cannot write %@", name] message:SWErrText(e)];
 }
 
@@ -1120,7 +1120,7 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
 
 - (void)writeInt:(long long)v name:(NSString *)name {
     int e = 0;
-    if (![SWSysctl setInteger:v name:name errnoOut:&e]) [self alertWriteFailure:name errno:e];
+    if (![SWSysctl setInteger:v name:name errnoOut:&e]) [self alertWriteFailure:name errorCode:e];
     [self refreshControls];
     [self refreshLive];
 }
@@ -1190,7 +1190,7 @@ static NSString *SWFetchKernelLog(BOOL filtered, NSString **sourceOut) {
     if ([SWSysctl setInteger:0 name:kSysTouchRate errnoOut:&e]) {
         SWToast(self.view, @"Touch rate reset");
     } else {
-        [self alertWriteFailure:kSysTouchRate errno:e];
+        [self alertWriteFailure:kSysTouchRate errorCode:e];
     }
     [self refreshLive];
 }
