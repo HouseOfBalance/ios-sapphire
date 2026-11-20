@@ -65,6 +65,11 @@ jobs:
           SDK="$SDK_PATH" LDID="$LDID_BIN" CLANG="clang" bash build.sh ../../obj
           cd ../..
 
+          echo "Building SapphireFigShim (mediaserverd CMCapture shim)..."
+          cd tweaks/figshim
+          SDK="$SDK_PATH" LDID="$LDID_BIN" CLANG="clang" bash build.sh ../../obj
+          cd ../..
+
           echo "Building camd & camctl..."
           cd camera/camd
           SDK="$SDK_PATH" LDID="$LDID_BIN" CLANG="clang" bash build.sh ../../obj
@@ -110,6 +115,7 @@ jobs:
           codesign --force --sign - --entitlements entitlements.plist ../../obj/camd
           codesign --force --sign - --entitlements entitlements.plist ../../obj/camctl
           codesign --force --sign - ../../obj/SapphireNoCamera.dylib
+          codesign --force --sign - ../../obj/SapphireFigShim.dylib
           cp com.sapphire.toolsd.plist ../../obj/
           cd ../..
 

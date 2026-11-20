@@ -1,26 +1,27 @@
 /*
- * SapphireNoCamera -> SapphireAVCamera (Stock Apple Camera.app Native Integration):
+ * SapphireNoCamera -> SapphireAVCamera v3 (Zero-Copy IOSurface + Video Recording + Smooth Zoom):
  *
  * 1. Prevents InCallService / Camera.app / third-party apps from deadlocking in
- *    FigCaptureSourceRemoteCopyCaptureSources waiting for mediaserverd's non-existent
- *    AppleH10CamIn capture server.
+ *    FigCaptureSourceRemoteCopyCaptureSources waiting for mediaserverd's H10ISP server.
  * 2. Bridges AVCaptureDevice, AVCaptureDeviceDiscoverySession, AVCaptureSession,
  *    AVCaptureVideoPreviewLayer, and AVCaptureVideoDataOutput to camd using a
- *    persistent Unix socket (/var/run/camd.sock) so preview streams continuously
- *    at live FPS instead of stopping after 1 frame.
- * 3. Inside Apple's stock Camera.app (com.apple.camera), preserves 100% of Apple's
- *    real native UI (shutter ring, mode wheel, zoom wheel, flip button, flash/HDR,
- *    focus square, thumbnail well):
- *    - Injects live camd video directly at index 0 inside Apple's real CAMPreviewView
- *      (behind all of Apple's translucent controls).
- *    - Wires Apple's real shutter button (CAMDynamicShutterControl / CUShutterButton /
- *      CAMViewfinderViewController), real flip camera button (CAMFlipButton), real
- *      zoom wheel (0.6x UW / 1x / 2x), and real tap-to-focus directly to camd!
+ *    persistent Unix socket (/var/run/camd.sock) + Zero-Copy global IOSurface lookup.
+ * 3. Inside Apple's stock Camera.app (com.apple.camera):
+ *    - Zero-Copy GPU scanout: paints camd's global IOSurface directly onto a CALayer
+ *      at index 0 inside Apple's real CAMPreviewView (behind all real Apple controls).
+ *    - Photo capture: Apple's real shutter button -> camd CAPTURE -> Photos Library +
+ *      live CAMImageWell thumbnail update.
+ *    - Video recording: when Camera.app is in VIDEO mode, tapping Apple's real red shutter
+ *      starts/stops AVAssetWriter (.mov H.264 / JPEG fallback) fed directly from camd's
+ *      IOSurface-backed CVPixelBuffer and saves straight to Photos Library!
+ *    - Real Flip Camera (Back/Front), Smooth Pinch + Wheel Zoom (0.6x UW / 1x / 2x / 5x),
+ *      Tap-to-Focus (METER), and Drag-to-EV (EV).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
+#include <IOSurface/IOSurface.h>
 #include <QuartzCore/QuartzCore.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
@@ -39,6 +40,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CAMD_SOCK_PATH    "/var/run/camd.sock"
@@ -63,7 +65,7 @@ typedef struct {
 	uint32_t latest;
 	uint64_t seq;
 	uint32_t running;
-	uint32_t reserved[7];
+	uint32_t reserved[7]; /* reserved[0..2] = global IOSurfaceID per slot */
 	CamdSlot slot[CAMD_SHM_SLOTS];
 } CamdShm;
 
@@ -79,15 +81,30 @@ static bool g_capturing = false;
 static int g_camd_fd = -1;
 static pthread_mutex_t g_camd_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* Cached zero-copy IOSurface handles per shm slot */
+static IOSurfaceRef g_surf_cache[CAMD_SHM_SLOTS];
+static uint32_t g_surf_id_cache[CAMD_SHM_SLOTS];
+
 #define MAX_LAYERS  8
 #define MAX_OUTPUTS 8
 static id g_preview_layers[MAX_LAYERS];
 static id g_video_outputs[MAX_OUTPUTS];
 
-/* Native Apple Camera.app hooks (no overlay covering Apple's UI!) */
+/* Native Apple Camera.app hosts (zero opaque overlay) */
 static id g_cam_preview_host = nil; /* Apple's real CAMPreviewView */
-static id g_cam_img_view = nil;     /* Live UIImageView inserted at index 0 inside CAMPreviewView */
+static id g_cam_live_layer = nil;   /* Zero-copy CALayer inserted at index 0 of CAMPreviewView.layer */
 static id g_cam_image_well = nil;   /* Apple's real CAMImageWell thumbnail button */
+static double g_zoom_factor = 1.0;
+static long g_capture_mode = 0;     /* 0 = Photo, 1 = Video, 2 = Square, 3 = Pano, etc. */
+
+/* Video Recording state (AVAssetWriter) */
+static bool g_recording = false;
+static id g_asset_writer = nil;
+static id g_writer_input = nil;
+static id g_pixel_adaptor = nil;
+static char g_video_path[256];
+static uint64_t g_video_start_ns = 0;
+static pthread_mutex_t g_rec_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static void
 camd_cmd(const char *cmd, char *reply, size_t reply_cap, int timeout_ms)
@@ -181,6 +198,184 @@ shm_open_if_needed(void)
 	return true;
 }
 
+static IOSurfaceRef
+lookup_slot_surface(uint32_t idx)
+{
+	if (idx >= CAMD_SHM_SLOTS || g_shm == NULL) return NULL;
+	uint32_t sid = g_shm->reserved[idx];
+	if (sid == 0) return NULL;
+	if (g_surf_cache[idx] != NULL && g_surf_id_cache[idx] == sid) {
+		return g_surf_cache[idx];
+	}
+	if (g_surf_cache[idx] != NULL) {
+		CFRelease(g_surf_cache[idx]);
+		g_surf_cache[idx] = NULL;
+		g_surf_id_cache[idx] = 0;
+	}
+	IOSurfaceRef s = IOSurfaceLookup((IOSurfaceID)sid);
+	if (s != NULL) {
+		g_surf_cache[idx] = s;
+		g_surf_id_cache[idx] = sid;
+	}
+	return s;
+}
+
+/* ================================================================== Video Recording (AVAssetWriter) */
+static void
+video_start_recording(uint32_t w, uint32_t h)
+{
+	pthread_mutex_lock(&g_rec_mu);
+	if (g_recording) {
+		pthread_mutex_unlock(&g_rec_mu);
+		return;
+	}
+	if (w < 64 || h < 64) { w = 750; h = 1000; }
+	snprintf(g_video_path, sizeof(g_video_path), "/var/tmp/sapphire_vid_%ld.mov", (long)time(NULL));
+	unlink(g_video_path);
+
+	Class urlCls = objc_getClass("NSURL");
+	Class writerCls = objc_getClass("AVAssetWriter");
+	Class inputCls = objc_getClass("AVAssetWriterInput");
+	Class adaptCls = objc_getClass("AVAssetWriterInputPixelBufferAdaptor");
+	Class dictCls = objc_getClass("NSDictionary");
+	Class numCls = objc_getClass("NSNumber");
+	if (!urlCls || !writerCls || !inputCls || !adaptCls) {
+		pthread_mutex_unlock(&g_rec_mu);
+		return;
+	}
+
+	CFStringRef pathStr = CFStringCreateWithCString(NULL, g_video_path, kCFStringEncodingUTF8);
+	id url = ((id (*)(Class, SEL, id))objc_msgSend)(urlCls, sel_registerName("fileURLWithPath:"), (id)pathStr);
+	CFRelease(pathStr);
+
+	id err = nil;
+	id writer = ((id (*)(id, SEL, id, id, id *))objc_msgSend)(
+	    ((id (*)(Class, SEL))objc_msgSend)(writerCls, sel_registerName("alloc")),
+	    sel_registerName("initWithURL:fileType:error:"), url, (id)CFSTR("com.apple.quicktime-movie"), &err);
+	if (writer == nil) {
+		pthread_mutex_unlock(&g_rec_mu);
+		return;
+	}
+
+	/* Try H.264 first, fall back to JPEG if no hardware H.264 encoder */
+	id nW = ((id (*)(Class, SEL, unsigned int))objc_msgSend)(numCls, sel_registerName("numberWithUnsignedInt:"), w);
+	id nH = ((id (*)(Class, SEL, unsigned int))objc_msgSend)(numCls, sel_registerName("numberWithUnsignedInt:"), h);
+	const char *codecs[2] = { "avc1", "jpeg" };
+	id vinput = nil;
+	for (int ci = 0; ci < 2 && vinput == nil; ci++) {
+		CFStringRef cstr = CFStringCreateWithCString(NULL, codecs[ci], kCFStringEncodingUTF8);
+		id keys[3] = { (id)CFSTR("AVVideoCodecKey"), (id)CFSTR("AVVideoWidthKey"), (id)CFSTR("AVVideoHeightKey") };
+		id vals[3] = { (id)cstr, nW, nH };
+		id settings = ((id (*)(Class, SEL, const id *, const id *, unsigned long))objc_msgSend)(
+		    dictCls, sel_registerName("dictionaryWithObjects:forKeys:count:"), vals, keys, 3);
+		CFRelease(cstr);
+		id cand = ((id (*)(Class, SEL, id, id))objc_msgSend)(
+		    inputCls, sel_registerName("assetWriterInputWithMediaType:outputSettings:"), (id)CFSTR("vide"), settings);
+		if (cand && ((BOOL (*)(id, SEL, id))objc_msgSend)(writer, sel_registerName("canAddInput:"), cand)) {
+			((void (*)(id, SEL, BOOL))objc_msgSend)(cand, sel_registerName("setExpectsMediaDataInRealTime:"), YES);
+			((void (*)(id, SEL, id))objc_msgSend)(writer, sel_registerName("addInput:"), cand);
+			vinput = cand;
+		}
+	}
+	if (vinput == nil) {
+		pthread_mutex_unlock(&g_rec_mu);
+		return;
+	}
+
+	id nPF = ((id (*)(Class, SEL, unsigned int))objc_msgSend)(numCls, sel_registerName("numberWithUnsignedInt:"), kCVPixelFormatType_32BGRA);
+	id pkeys[3] = { (id)kCVPixelBufferPixelFormatTypeKey, (id)kCVPixelBufferWidthKey, (id)kCVPixelBufferHeightKey };
+	id pvals[3] = { nPF, nW, nH };
+	id pattrs = ((id (*)(Class, SEL, const id *, const id *, unsigned long))objc_msgSend)(
+	    dictCls, sel_registerName("dictionaryWithObjects:forKeys:count:"), pvals, pkeys, 3);
+	id adaptor = ((id (*)(Class, SEL, id, id))objc_msgSend)(
+	    adaptCls, sel_registerName("assetWriterInputPixelBufferAdaptorWithAssetWriterInput:sourcePixelBufferAttributes:"),
+	    vinput, pattrs);
+
+	if (((BOOL (*)(id, SEL))objc_msgSend)(writer, sel_registerName("startWriting"))) {
+		((void (*)(id, SEL, CMTime))objc_msgSend)(writer, sel_registerName("startSessionAtSourceTime:"), kCMTimeZero);
+		g_asset_writer = ((id (*)(id, SEL))objc_msgSend)(writer, sel_registerName("retain"));
+		g_writer_input = ((id (*)(id, SEL))objc_msgSend)(vinput, sel_registerName("retain"));
+		g_pixel_adaptor = ((id (*)(id, SEL))objc_msgSend)(adaptor, sel_registerName("retain"));
+		g_video_start_ns = 0;
+		g_recording = true;
+	}
+	pthread_mutex_unlock(&g_rec_mu);
+}
+
+static void
+video_stop_recording(void)
+{
+	pthread_mutex_lock(&g_rec_mu);
+	if (!g_recording || g_asset_writer == nil) {
+		pthread_mutex_unlock(&g_rec_mu);
+		return;
+	}
+	g_recording = false;
+	id writer = g_asset_writer;
+	id vinput = g_writer_input;
+	id adaptor = g_pixel_adaptor;
+	g_asset_writer = nil;
+	g_writer_input = nil;
+	g_pixel_adaptor = nil;
+	char outPath[256];
+	strlcpy(outPath, g_video_path, sizeof(outPath));
+	pthread_mutex_unlock(&g_rec_mu);
+
+	((void (*)(id, SEL))objc_msgSend)(vinput, sel_registerName("markAsFinished"));
+	CFStringRef pathStr = CFStringCreateWithCString(NULL, outPath, kCFStringEncodingUTF8);
+	((void (*)(id, SEL, void (^)(void)))objc_msgSend)(writer, sel_registerName("finishWritingWithCompletionHandler:"), ^{
+		void (*saveVid)(id, id, SEL, void *) = (void (*)(id, id, SEL, void *))dlsym(
+		    RTLD_DEFAULT, "UISaveVideoAtPathToSavedPhotosAlbum");
+		if (saveVid && pathStr) {
+			saveVid((id)pathStr, nil, NULL, NULL);
+		}
+		if (pathStr) CFRelease(pathStr);
+		((void (*)(id, SEL))objc_msgSend)(adaptor, sel_registerName("release"));
+		((void (*)(id, SEL))objc_msgSend)(vinput, sel_registerName("release"));
+		((void (*)(id, SEL))objc_msgSend)(writer, sel_registerName("release"));
+	});
+}
+
+static void
+video_append_frame(IOSurfaceRef surf, const uint8_t *pixels, const CamdSlot *s)
+{
+	pthread_mutex_lock(&g_rec_mu);
+	if (!g_recording || g_writer_input == nil || g_pixel_adaptor == nil) {
+		pthread_mutex_unlock(&g_rec_mu);
+		return;
+	}
+	if (!((BOOL (*)(id, SEL))objc_msgSend)(g_writer_input, sel_registerName("isReadyForMoreMediaData"))) {
+		pthread_mutex_unlock(&g_rec_mu);
+		return;
+	}
+	if (g_video_start_ns == 0) g_video_start_ns = s->ts_ns;
+	int64_t rel_ns = (int64_t)(s->ts_ns > g_video_start_ns ? s->ts_ns - g_video_start_ns : 0);
+	CMTime pts = CMTimeMake(rel_ns / 1000000, 1000);
+
+	CVPixelBufferRef pb = NULL;
+	if (surf != NULL) {
+		CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, surf, NULL, &pb);
+	}
+	if (pb == NULL && pixels != NULL) {
+		if (CVPixelBufferCreate(kCFAllocatorDefault, s->width, s->height, kCVPixelFormatType_32BGRA, NULL, &pb) == kCVReturnSuccess && pb) {
+			CVPixelBufferLockBaseAddress(pb, 0);
+			uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+			size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+			for (uint32_t y = 0; y < s->height; y++) {
+				memcpy(dst + y * bpr, pixels + y * s->stride, s->width * 4);
+			}
+			CVPixelBufferUnlockBaseAddress(pb, 0);
+		}
+	}
+	if (pb != NULL) {
+		((BOOL (*)(id, SEL, CVPixelBufferRef, CMTime))objc_msgSend)(
+		    g_pixel_adaptor, sel_registerName("appendPixelBuffer:withPresentationTime:"), pb, pts);
+		CVPixelBufferRelease(pb);
+	}
+	pthread_mutex_unlock(&g_rec_mu);
+}
+
+/* ================================================================== Zero-Copy Frame Delivery */
 static void
 deliver_latest_frame(void)
 {
@@ -192,44 +387,68 @@ deliver_latest_frame(void)
 	if (s.seq == 0 || s.seq == g_last_seq || s.width == 0 || s.height == 0) return;
 	size_t off = (size_t)g_shm->header_size + (size_t)idx * (size_t)g_shm->slot_size;
 	size_t need = (size_t)s.stride * (size_t)s.height;
-	if (off + need > g_shm_len) return;
+	const uint8_t *pixels = (off + need <= g_shm_len) ? ((const uint8_t *)g_shm + off) : NULL;
 	g_last_seq = s.seq;
 
-	const uint8_t *pixels = (const uint8_t *)g_shm + off;
+	/* Zero-Copy global IOSurface lookup! */
+	IOSurfaceRef surf = lookup_slot_surface(idx);
 
-	bool any_layer = (g_cam_img_view != nil);
+	/* 1. Paint directly onto CALayer.contents (Zero CPU copy when IOSurface is valid!) */
+	bool any_layer = (g_cam_live_layer != nil);
 	for (int i = 0; !any_layer && i < MAX_LAYERS; i++) {
 		if (g_preview_layers[i] != nil) any_layer = true;
 	}
 	if (any_layer) {
-		CFDataRef data = CFDataCreate(NULL, pixels, (CFIndex)need);
-		if (data != NULL) {
-			CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-			CGDataProviderRef prov = CGDataProviderCreateWithCFData(data);
-			CGBitmapInfo bi = (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | (CGBitmapInfo)kCGBitmapByteOrder32Little;
-			CGImageRef cg = CGImageCreate(s.width, s.height, 8, 32, s.stride, cs, bi, prov, NULL, false, kCGRenderingIntentDefault);
-			if (cg != NULL) {
-				if (g_cam_img_view != nil) {
-					id uiimg = ((id (*)(Class, SEL, CGImageRef))objc_msgSend)(
-					    objc_getClass("UIImage"), sel_registerName("imageWithCGImage:"), cg);
-					((void (*)(id, SEL, id))objc_msgSend)(
-					    g_cam_img_view, sel_registerName("setImage:"), uiimg);
-				}
-				for (int i = 0; i < MAX_LAYERS; i++) {
-					id layer = g_preview_layers[i];
-					if (layer != nil) {
-						((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setContents:"), (id)cg);
-					}
-				}
-				CGImageRelease(cg);
+		Class catCls = objc_getClass("CATransaction");
+		if (catCls) {
+			((void (*)(Class, SEL))objc_msgSend)(catCls, sel_registerName("begin"));
+			((void (*)(Class, SEL, BOOL))objc_msgSend)(catCls, sel_registerName("setDisableActions:"), YES);
+		}
+		if (surf != NULL) {
+			if (g_cam_live_layer != nil) {
+				((void (*)(id, SEL, id))objc_msgSend)(g_cam_live_layer, sel_registerName("setContents:"), (id)surf);
 			}
-			CGDataProviderRelease(prov);
-			CGColorSpaceRelease(cs);
-			CFRelease(data);
+			for (int i = 0; i < MAX_LAYERS; i++) {
+				id layer = g_preview_layers[i];
+				if (layer != nil) {
+					((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setContents:"), (id)surf);
+				}
+			}
+		} else if (pixels != NULL) {
+			CFDataRef data = CFDataCreate(NULL, pixels, (CFIndex)need);
+			if (data != NULL) {
+				CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+				CGDataProviderRef prov = CGDataProviderCreateWithCFData(data);
+				CGBitmapInfo bi = (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | (CGBitmapInfo)kCGBitmapByteOrder32Little;
+				CGImageRef cg = CGImageCreate(s.width, s.height, 8, 32, s.stride, cs, bi, prov, NULL, false, kCGRenderingIntentDefault);
+				if (cg != NULL) {
+					if (g_cam_live_layer != nil) {
+						((void (*)(id, SEL, id))objc_msgSend)(g_cam_live_layer, sel_registerName("setContents:"), (id)cg);
+					}
+					for (int i = 0; i < MAX_LAYERS; i++) {
+						id layer = g_preview_layers[i];
+						if (layer != nil) {
+							((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setContents:"), (id)cg);
+						}
+					}
+					CGImageRelease(cg);
+				}
+				CGDataProviderRelease(prov);
+				CGColorSpaceRelease(cs);
+				CFRelease(data);
+			}
+		}
+		if (catCls) {
+			((void (*)(Class, SEL))objc_msgSend)(catCls, sel_registerName("commit"));
 		}
 	}
 
-	/* Deliver CMSampleBuffer to any registered AVCaptureVideoDataOutput delegate */
+	/* 2. Feed active video recording if recording */
+	if (g_recording) {
+		video_append_frame(surf, pixels, &s);
+	}
+
+	/* 3. Deliver CMSampleBuffer to any registered AVCaptureVideoDataOutput delegate (QR / FaceTime / 3rd-party) */
 	for (int i = 0; i < MAX_OUTPUTS; i++) {
 		id out = g_video_outputs[i];
 		if (out == nil) continue;
@@ -239,15 +458,21 @@ deliver_latest_frame(void)
 		if (q == NULL) q = dispatch_get_main_queue();
 
 		CVPixelBufferRef pb = NULL;
-		if (CVPixelBufferCreate(kCFAllocatorDefault, s.width, s.height, kCVPixelFormatType_32BGRA, NULL, &pb) == kCVReturnSuccess && pb != NULL) {
-			CVPixelBufferLockBaseAddress(pb, 0);
-			uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
-			size_t dst_bpr = CVPixelBufferGetBytesPerRow(pb);
-			for (uint32_t y = 0; y < s.height; y++) {
-				memcpy(dst + y * dst_bpr, pixels + y * s.stride, s.width * 4);
+		if (surf != NULL) {
+			CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault, surf, NULL, &pb);
+		}
+		if (pb == NULL && pixels != NULL) {
+			if (CVPixelBufferCreate(kCFAllocatorDefault, s.width, s.height, kCVPixelFormatType_32BGRA, NULL, &pb) == kCVReturnSuccess && pb != NULL) {
+				CVPixelBufferLockBaseAddress(pb, 0);
+				uint8_t *dst = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+				size_t dst_bpr = CVPixelBufferGetBytesPerRow(pb);
+				for (uint32_t y = 0; y < s.height; y++) {
+					memcpy(dst + y * dst_bpr, pixels + y * s.stride, s.width * 4);
+				}
+				CVPixelBufferUnlockBaseAddress(pb, 0);
 			}
-			CVPixelBufferUnlockBaseAddress(pb, 0);
-
+		}
+		if (pb != NULL) {
 			CMVideoFormatDescriptionRef fmt = NULL;
 			if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pb, &fmt) == noErr && fmt != NULL) {
 				CMSampleTimingInfo timing = {
@@ -298,6 +523,7 @@ start_camd_mode(int mode)
 static void
 stop_camd(void)
 {
+	if (g_recording) video_stop_recording();
 	g_running = false;
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 		char rep[64];
@@ -306,17 +532,57 @@ stop_camd(void)
 }
 
 static void
-trigger_camd_capture(void)
+apply_smooth_zoom(double factor)
 {
+	if (factor < 0.5) factor = 0.5;
+	if (factor > 5.0) factor = 5.0;
+	g_zoom_factor = factor;
+
+	/* Hardware lens switching + smooth GPU sub-scale */
+	double digital = 1.0;
+	if (g_mode != 11) {
+		int want = (factor < 0.85) ? 12 : (factor >= 1.95 ? 4 : 1);
+		if (want != g_mode) {
+			start_camd_mode(want);
+		}
+		if (want == 12) digital = factor / 0.6;
+		else if (want == 4) digital = factor / 2.0;
+		else digital = factor;
+		if (digital < 1.0) digital = 1.0;
+	}
+	if (g_cam_live_layer != nil) {
+		CATransform3D t = CATransform3DMakeScale((CGFloat)digital, (CGFloat)digital, 1.0);
+		((void (*)(id, SEL, CATransform3D))objc_msgSend)(g_cam_live_layer, sel_registerName("setTransform:"), t);
+	}
+}
+
+static void
+trigger_shutter_action(void)
+{
+	/* In VIDEO mode (mode == 1): toggle real AVAssetWriter .mov recording */
+	if (g_capture_mode == 1) {
+		if (g_recording) {
+			video_stop_recording();
+		} else {
+			uint32_t w = 750, h = 1000;
+			if (g_shm != NULL && g_shm->latest < CAMD_SHM_SLOTS) {
+				w = g_shm->slot[g_shm->latest].width;
+				h = g_shm->slot[g_shm->latest].height;
+			}
+			video_start_recording(w, h);
+		}
+		return;
+	}
+
 	if (g_capturing) return;
 	g_capturing = true;
 
 	/* Native shutter blink feedback on Apple's CAMPreviewView */
-	if (g_cam_img_view != nil) {
-		((void (*)(id, SEL, CGFloat))objc_msgSend)(g_cam_img_view, sel_registerName("setAlpha:"), 0.15);
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-			if (g_cam_img_view != nil) {
-				((void (*)(id, SEL, CGFloat))objc_msgSend)(g_cam_img_view, sel_registerName("setAlpha:"), 1.0);
+	if (g_cam_live_layer != nil) {
+		((void (*)(id, SEL, float))objc_msgSend)(g_cam_live_layer, sel_registerName("setOpacity:"), 0.15f);
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+			if (g_cam_live_layer != nil) {
+				((void (*)(id, SEL, float))objc_msgSend)(g_cam_live_layer, sel_registerName("setOpacity:"), 1.0f);
 			}
 		});
 	}
@@ -456,30 +722,29 @@ static id hook_discovery_devices(id self, SEL sel) { (void)self; (void)sel; retu
 
 /* ================================================================== Native Apple Camera.app Viewfinder Integration */
 static void
-attach_live_view_to_preview(id previewView)
+attach_live_layer_to_preview(id previewView)
 {
 	if (previewView == nil) return;
 	CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(previewView, sel_registerName("bounds"));
 	if (b.size.width < 50 || b.size.height < 50) return;
 
-	if (g_cam_img_view == nil) {
-		Class ivCls = objc_getClass("UIImageView");
-		g_cam_img_view = ((id (*)(id, SEL, CGRect))objc_msgSend)(
-		    ((id (*)(Class, SEL))objc_msgSend)(ivCls, sel_registerName("alloc")),
-		    sel_registerName("initWithFrame:"), b);
-		/* UIViewContentModeScaleAspectFill = 2, clipsToBounds = YES, userInteractionEnabled = NO */
-		((void (*)(id, SEL, long))objc_msgSend)(g_cam_img_view, sel_registerName("setContentMode:"), 2);
-		((void (*)(id, SEL, BOOL))objc_msgSend)(g_cam_img_view, sel_registerName("setClipsToBounds:"), YES);
-		((void (*)(id, SEL, BOOL))objc_msgSend)(g_cam_img_view, sel_registerName("setUserInteractionEnabled:"), NO);
-		/* FlexibleWidth (1<<1) | FlexibleHeight (1<<4) = 18 */
-		((void (*)(id, SEL, unsigned long))objc_msgSend)(g_cam_img_view, sel_registerName("setAutoresizingMask:"), 18);
+	id hostLayer = ((id (*)(id, SEL))objc_msgSend)(previewView, sel_registerName("layer"));
+	if (hostLayer == nil) return;
+
+	if (g_cam_live_layer == nil) {
+		Class layerCls = objc_getClass("CALayer");
+		g_cam_live_layer = ((id (*)(Class, SEL))objc_msgSend)(layerCls, sel_registerName("layer"));
+		((id (*)(id, SEL))objc_msgSend)(g_cam_live_layer, sel_registerName("retain"));
+		((void (*)(id, SEL, id))objc_msgSend)(g_cam_live_layer, sel_registerName("setContentsGravity:"), (id)kCAGravityResizeAspectFill);
+		((void (*)(id, SEL, BOOL))objc_msgSend)(g_cam_live_layer, sel_registerName("setMasksToBounds:"), YES);
 	}
 	if (g_cam_preview_host != previewView) {
 		g_cam_preview_host = previewView;
-		((void (*)(id, SEL, CGRect))objc_msgSend)(g_cam_img_view, sel_registerName("setFrame:"), b);
-		((void (*)(id, SEL, id, long))objc_msgSend)(previewView, sel_registerName("insertSubview:atIndex:"), g_cam_img_view, 0);
+		((void (*)(id, SEL, BOOL))objc_msgSend)(hostLayer, sel_registerName("setMasksToBounds:"), YES);
+		((void (*)(id, SEL, CGRect))objc_msgSend)(g_cam_live_layer, sel_registerName("setFrame:"), b);
+		((void (*)(id, SEL, id, unsigned int))objc_msgSend)(hostLayer, sel_registerName("insertSublayer:atIndex:"), g_cam_live_layer, 0);
 	} else {
-		((void (*)(id, SEL, CGRect))objc_msgSend)(g_cam_img_view, sel_registerName("setFrame:"), b);
+		((void (*)(id, SEL, CGRect))objc_msgSend)(g_cam_live_layer, sel_registerName("setFrame:"), b);
 	}
 
 	if (!g_running) {
@@ -494,7 +759,7 @@ scan_camera_views(id view)
 	const char *cname = object_getClassName(view);
 	if (cname != NULL) {
 		if (strcmp(cname, "CAMPreviewView") == 0) {
-			attach_live_view_to_preview(view);
+			attach_live_layer_to_preview(view);
 		} else if (strcmp(cname, "CAMImageWell") == 0) {
 			g_cam_image_well = view;
 		}
@@ -537,7 +802,7 @@ static void
 hook_cam_preview_layout(id self, SEL sel)
 {
 	if (orig_cam_preview_layout) orig_cam_preview_layout(self, sel);
-	attach_live_view_to_preview(self);
+	attach_live_layer_to_preview(self);
 }
 
 static void (*orig_dyn_shutter_touches_ended)(id self, SEL sel, id touches, id event);
@@ -545,7 +810,7 @@ static void
 hook_dyn_shutter_touches_ended(id self, SEL sel, id touches, id event)
 {
 	if (orig_dyn_shutter_touches_ended) orig_dyn_shutter_touches_ended(self, sel, touches, event);
-	trigger_camd_capture();
+	trigger_shutter_action();
 }
 
 static void (*orig_cu_shutter_touches_ended)(id self, SEL sel, id touches, id event);
@@ -553,7 +818,7 @@ static void
 hook_cu_shutter_touches_ended(id self, SEL sel, id touches, id event)
 {
 	if (orig_cu_shutter_touches_ended) orig_cu_shutter_touches_ended(self, sel, touches, event);
-	trigger_camd_capture();
+	trigger_shutter_action();
 }
 
 static void (*orig_flip_touches_ended)(id self, SEL sel, id touches, id event);
@@ -565,16 +830,46 @@ hook_flip_touches_ended(id self, SEL sel, id touches, id event)
 	start_camd_mode(next_mode);
 }
 
+static void (*orig_mode_changed)(id self, SEL sel, long mode, BOOL animated);
+static void
+hook_mode_changed(id self, SEL sel, long mode, BOOL animated)
+{
+	if (orig_mode_changed) orig_mode_changed(self, sel, mode, animated);
+	g_capture_mode = mode;
+}
+
 static void (*orig_zoom_changed)(id self, SEL sel, id ctrl, double factor, long interaction);
 static void
 hook_zoom_changed(id self, SEL sel, id ctrl, double factor, long interaction)
 {
 	if (orig_zoom_changed) orig_zoom_changed(self, sel, ctrl, factor, interaction);
-	if (g_mode == 11) return; /* Front camera doesn't switch rear lenses */
-	int want = (factor < 0.85) ? 12 : (factor >= 1.8 ? 4 : 1);
-	if (want != g_mode) {
-		start_camd_mode(want);
+	apply_smooth_zoom(factor);
+}
+
+static void (*orig_pinch_zoom)(id self, SEL sel, id recognizer);
+static void
+hook_pinch_zoom(id self, SEL sel, id recognizer)
+{
+	if (orig_pinch_zoom) orig_pinch_zoom(self, sel, recognizer);
+	if (recognizer != nil) {
+		double scale = ((double (*)(id, SEL))objc_msgSend)(recognizer, sel_registerName("scale"));
+		if (scale > 0.1 && scale < 10.0) {
+			apply_smooth_zoom(g_zoom_factor * scale);
+			((void (*)(id, SEL, double))objc_msgSend)(recognizer, sel_registerName("setScale:"), 1.0);
+		}
 	}
+}
+
+static void (*orig_ev_changed)(id self, SEL sel, float bias);
+static void
+hook_ev_changed(id self, SEL sel, float bias)
+{
+	if (orig_ev_changed) orig_ev_changed(self, sel, bias);
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		char cmd[32], rep[64];
+		snprintf(cmd, sizeof(cmd), "EV %.2f\n", bias);
+		camd_cmd(cmd, rep, sizeof(rep), 1500);
+	});
 }
 
 static void (*orig_focus_tap)(id self, SEL sel, CGPoint pt);
@@ -598,20 +893,10 @@ hook_focus_tap(id self, SEL sel, CGPoint pt)
 	});
 }
 
-static void
-app_did_enter_bg(id self, SEL sel, id note)
-{
+static void app_did_enter_bg(id self, SEL sel, id note) { (void)self; (void)sel; (void)note; stop_camd(); }
+static void app_will_enter_fg(id self, SEL sel, id note) {
 	(void)self; (void)sel; (void)note;
-	stop_camd();
-}
-
-static void
-app_will_enter_fg(id self, SEL sel, id note)
-{
-	(void)self; (void)sel; (void)note;
-	if (g_cam_preview_host != nil) {
-		start_camd_mode(g_mode);
-	}
+	if (g_cam_preview_host != nil) start_camd_mode(g_mode);
 }
 
 static id no_input_devices(id self, SEL selector) {
@@ -665,36 +950,47 @@ static BOOL hook_session_is_running(id self, SEL sel) { (void)self; (void)sel; r
 static void
 install_camera_ui_hooks(void)
 {
+	static bool hooked = false;
+	if (hooked) return;
 	Class pv = objc_getClass("CAMPreviewView");
-	if (pv != Nil) {
-		Method m = class_getInstanceMethod(pv, sel_registerName("layoutSubviews"));
-		if (m) {
-			orig_cam_preview_layout = (void (*)(id, SEL))method_getImplementation(m);
-			method_setImplementation(m, (IMP)hook_cam_preview_layout);
-		}
+	if (pv == Nil) return;
+	hooked = true;
+
+	Method m = class_getInstanceMethod(pv, sel_registerName("layoutSubviews"));
+	if (m) {
+		orig_cam_preview_layout = (void (*)(id, SEL))method_getImplementation(m);
+		method_setImplementation(m, (IMP)hook_cam_preview_layout);
 	}
 	Class dynShutter = objc_getClass("CAMDynamicShutterControl");
 	if (dynShutter != Nil) {
-		Method m = class_getInstanceMethod(dynShutter, sel_registerName("touchesEnded:withEvent:"));
-		if (m) {
-			orig_dyn_shutter_touches_ended = (void (*)(id, SEL, id, id))method_getImplementation(m);
-			method_setImplementation(m, (IMP)hook_dyn_shutter_touches_ended);
+		Method ms = class_getInstanceMethod(dynShutter, sel_registerName("touchesEnded:withEvent:"));
+		if (ms) {
+			orig_dyn_shutter_touches_ended = (void (*)(id, SEL, id, id))method_getImplementation(ms);
+			method_setImplementation(ms, (IMP)hook_dyn_shutter_touches_ended);
 		}
 	}
 	Class cuShutter = objc_getClass("CUShutterButton");
 	if (cuShutter != Nil) {
-		Method m = class_getInstanceMethod(cuShutter, sel_registerName("touchesEnded:withEvent:"));
-		if (m) {
-			orig_cu_shutter_touches_ended = (void (*)(id, SEL, id, id))method_getImplementation(m);
-			method_setImplementation(m, (IMP)hook_cu_shutter_touches_ended);
+		Method mc = class_getInstanceMethod(cuShutter, sel_registerName("touchesEnded:withEvent:"));
+		if (mc) {
+			orig_cu_shutter_touches_ended = (void (*)(id, SEL, id, id))method_getImplementation(mc);
+			method_setImplementation(mc, (IMP)hook_cu_shutter_touches_ended);
 		}
 	}
 	Class flipBtn = objc_getClass("CAMFlipButton");
 	if (flipBtn != Nil) {
-		Method m = class_getInstanceMethod(flipBtn, sel_registerName("touchesEnded:withEvent:"));
-		if (m) {
-			orig_flip_touches_ended = (void (*)(id, SEL, id, id))method_getImplementation(m);
-			method_setImplementation(m, (IMP)hook_flip_touches_ended);
+		Method mf = class_getInstanceMethod(flipBtn, sel_registerName("touchesEnded:withEvent:"));
+		if (mf) {
+			orig_flip_touches_ended = (void (*)(id, SEL, id, id))method_getImplementation(mf);
+			method_setImplementation(mf, (IMP)hook_flip_touches_ended);
+		}
+	}
+	Class modeDial = objc_getClass("CAMModeDial");
+	if (modeDial != Nil) {
+		Method mm = class_getInstanceMethod(modeDial, sel_registerName("setSelectedMode:animated:"));
+		if (mm) {
+			orig_mode_changed = (void (*)(id, SEL, long, BOOL))method_getImplementation(mm);
+			method_setImplementation(mm, (IMP)hook_mode_changed);
 		}
 	}
 	Class vfVC = objc_getClass("CAMViewfinderViewController");
@@ -704,14 +1000,23 @@ install_camera_ui_hooks(void)
 			orig_zoom_changed = (void (*)(id, SEL, id, double, long))method_getImplementation(mz);
 			method_setImplementation(mz, (IMP)hook_zoom_changed);
 		}
-		Method mf = class_getInstanceMethod(vfVC, sel_registerName("_handleFocusAndExposureTapAtPoint:"));
-		if (mf) {
-			orig_focus_tap = (void (*)(id, SEL, CGPoint))method_getImplementation(mf);
-			method_setImplementation(mf, (IMP)hook_focus_tap);
+		Method mp = class_getInstanceMethod(vfVC, sel_registerName("_handleZoomPinchGestureRecognizer:"));
+		if (mp) {
+			orig_pinch_zoom = (void (*)(id, SEL, id))method_getImplementation(mp);
+			method_setImplementation(mp, (IMP)hook_pinch_zoom);
+		}
+		Method me = class_getInstanceMethod(vfVC, sel_registerName("_updateExposureTargetBias:"));
+		if (me) {
+			orig_ev_changed = (void (*)(id, SEL, float))method_getImplementation(me);
+			method_setImplementation(me, (IMP)hook_ev_changed);
+		}
+		Method mt = class_getInstanceMethod(vfVC, sel_registerName("_handleFocusAndExposureTapAtPoint:"));
+		if (mt) {
+			orig_focus_tap = (void (*)(id, SEL, CGPoint))method_getImplementation(mt);
+			method_setImplementation(mt, (IMP)hook_focus_tap);
 		}
 	}
 
-	/* Lifecycle observer to cleanly stop/resume camd when backgrounding/foregrounding Camera.app */
 	Class obsCls = objc_getClass("SapphireCamLifecycleObserver");
 	if (obsCls == Nil) {
 		obsCls = objc_allocateClassPair(objc_getClass("NSObject"), "SapphireCamLifecycleObserver", 0);
@@ -795,11 +1100,11 @@ install(void)
 	CFStringRef bundleID = mainBundle ? CFBundleGetIdentifier(mainBundle) : NULL;
 	if (bundleID != NULL && CFEqual(bundleID, CFSTR("com.apple.camera"))) {
 		install_camera_ui_hooks();
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			install_camera_ui_hooks();
 			attach_stock_camera_native();
 		});
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 			attach_stock_camera_native();
 		});
 	}

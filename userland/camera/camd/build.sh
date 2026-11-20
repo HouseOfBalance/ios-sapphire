@@ -32,7 +32,7 @@ fi
 
 out=${1:-/tmp}
 CC="$CLANG -target arm64-apple-ios15.0 -isysroot $SDK"
-$CC -O3 -std=gnu11 -mcpu=cortex-a73 -ffp-contract=fast -fno-math-errno $WARN -o "$out/camd" camd.c camk.c $OWN $LIB
+$CC -O3 -std=gnu11 -mcpu=cortex-a73 -ffp-contract=fast -fno-math-errno $WARN -o "$out/camd" camd.c camk.c $OWN $LIB -framework CoreFoundation -framework IOSurface
 $CC -O2 -Wall -o "$out/camctl" camctl.c
 for f in camd camctl; do "$LDID" -S "$out/$f"; done
 cp com.sapphire.camd.plist "$out/"

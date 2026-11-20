@@ -8,7 +8,7 @@ CLANG=${CLANG:-clang}
 out=${1:-/tmp}
 "$CLANG" -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall -dynamiclib \
 	-install_name /var/jb/usr/lib/TweakInject/SapphireNoCamera.dylib \
-	-framework CoreFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework QuartzCore \
+	-framework CoreFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework IOSurface -framework QuartzCore -framework AVFoundation \
 	-lobjc -o "$out/SapphireNoCamera.dylib" SapphireNoCamera.c
 "$LDID" -S "$out/SapphireNoCamera.dylib"
 cp SapphireNoCamera.plist "$out/SapphireNoCamera.plist"
