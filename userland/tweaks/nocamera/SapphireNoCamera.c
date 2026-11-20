@@ -509,20 +509,18 @@ cam_overlay_shutter(id self, SEL sel, id sender)
 				CFRelease(pathStr);
 			}
 		}
+		char msg[300];
+		snprintf(msg, sizeof(msg), "%s", jpg[0] ? jpg : (rep[0] ? rep : "Capture timeout"));
+		CFStringRef cfs = CFStringCreateWithCString(NULL, msg, kCFStringEncodingUTF8);
 		dispatch_async(dispatch_get_main_queue(), ^{
 			if (g_cam_shutter_btn != nil) {
 				((void (*)(id, SEL, BOOL))objc_msgSend)(g_cam_shutter_btn, sel_registerName("setEnabled:"), YES);
 				((void (*)(id, SEL, CGFloat))objc_msgSend)(g_cam_shutter_btn, sel_registerName("setAlpha:"), 1.0);
 			}
-			if (g_cam_hud_label != nil) {
-				char msg[300];
-				snprintf(msg, sizeof(msg), "%s", jpg[0] ? jpg : (rep[0] ? rep : "Capture timeout"));
-				CFStringRef cfs = CFStringCreateWithCString(NULL, msg, kCFStringEncodingUTF8);
-				if (cfs) {
-					((void (*)(id, SEL, id))objc_msgSend)(g_cam_hud_label, sel_registerName("setText:"), (id)cfs);
-					CFRelease(cfs);
-				}
+			if (g_cam_hud_label != nil && cfs != NULL) {
+				((void (*)(id, SEL, id))objc_msgSend)(g_cam_hud_label, sel_registerName("setText:"), (id)cfs);
 			}
+			if (cfs != NULL) CFRelease(cfs);
 		});
 	});
 }

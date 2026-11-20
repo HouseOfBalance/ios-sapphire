@@ -13,7 +13,6 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/un.h>
-#include <sys/reboot.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -21,6 +20,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+extern int reboot(int howto);
+#ifndef RB_AUTOBOOT
+#define RB_AUTOBOOT 0
+#endif
 
 #define SOCK_PATH "/var/run/sapphire-toolsd.sock"
 #define METAL_ARGS_PATH "/var/tmp/metal.args"
