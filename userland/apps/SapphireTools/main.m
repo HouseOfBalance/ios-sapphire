@@ -1360,22 +1360,40 @@ typedef struct {
     SWCamdSlot slot[CAMD_SHM_SLOTS];
 } SWCamdShm;
 
+static int gCamdSockFd = -1;
+static pthread_mutex_t gCamdSockMu = PTHREAD_MUTEX_INITIALIZER;
+
 static NSString *SWCamdCommand(NSString *cmd, double timeoutSec) {
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0) return nil;
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strlcpy(addr.sun_path, CAMD_SOCK_PATH, sizeof(addr.sun_path));
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-        close(fd);
-        return nil;
+    pthread_mutex_lock(&gCamdSockMu);
+    BOOL isStop = [cmd hasPrefix:@"STOP"];
+    if (gCamdSockFd < 0) {
+        if (isStop) {
+            pthread_mutex_unlock(&gCamdSockMu);
+            return @"OK";
+        }
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            pthread_mutex_unlock(&gCamdSockMu);
+            return nil;
+        }
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strlcpy(addr.sun_path, CAMD_SOCK_PATH, sizeof(addr.sun_path));
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            close(fd);
+            pthread_mutex_unlock(&gCamdSockMu);
+            return nil;
+        }
+        gCamdSockFd = fd;
     }
     NSString *line = [cmd hasSuffix:@"\n"] ? cmd : [cmd stringByAppendingString:@"\n"];
     const char *c = line.UTF8String;
     size_t len = strlen(c);
-    if (write(fd, c, len) != (ssize_t)len) {
-        close(fd);
+    if (write(gCamdSockFd, c, len) != (ssize_t)len) {
+        close(gCamdSockFd);
+        gCamdSockFd = -1;
+        pthread_mutex_unlock(&gCamdSockMu);
         return nil;
     }
     NSMutableString *out = [NSMutableString string];
@@ -1384,10 +1402,14 @@ static NSString *SWCamdCommand(NSString *cmd, double timeoutSec) {
     for (;;) {
         int64_t left = deadline - SWNowMs();
         if (left <= 0) break;
-        struct pollfd p = { fd, POLLIN, 0 };
+        struct pollfd p = { gCamdSockFd, POLLIN, 0 };
         if (poll(&p, 1, (int)left) <= 0) break;
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        if (n <= 0) break;
+        ssize_t n = read(gCamdSockFd, buf, sizeof(buf) - 1);
+        if (n <= 0) {
+            close(gCamdSockFd);
+            gCamdSockFd = -1;
+            break;
+        }
         buf[n] = '\0';
         [out appendFormat:@"%s", buf];
         if ([cmd hasPrefix:@"CAPTURE"]) {
@@ -1396,7 +1418,11 @@ static NSString *SWCamdCommand(NSString *cmd, double timeoutSec) {
             break;
         }
     }
-    close(fd);
+    if (isStop && gCamdSockFd >= 0) {
+        close(gCamdSockFd);
+        gCamdSockFd = -1;
+    }
+    pthread_mutex_unlock(&gCamdSockMu);
     return [out stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
 
