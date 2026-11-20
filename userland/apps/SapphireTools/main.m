@@ -1587,6 +1587,309 @@ static BOOL SWFlagOn(NSArray<NSString *> *tokens, NSString *key) {
 
 @end
 
+#pragma mark - System Check (Health) tab
+
+typedef NS_ENUM(NSInteger, SWHealthState) {
+    SWHealthGreen = 0,
+    SWHealthYellow,
+    SWHealthRed
+};
+
+@interface SWHealthItem : NSObject
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, copy) NSString *summary;
+@property (nonatomic, copy) NSString *details;
+@property (nonatomic, assign) SWHealthState state;
+@end
+
+@implementation SWHealthItem
+@end
+
+static NSString *SWFilterLogLines(NSArray<NSString *> *allLines, NSArray<NSString *> *patterns) {
+    NSMutableArray<NSString *> *matched = [NSMutableArray array];
+    for (NSString *line in allLines) {
+        for (NSString *p in patterns) {
+            if ([line rangeOfString:p options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                [matched addObject:line];
+                break;
+            }
+        }
+    }
+    if (matched.count == 0) return @"(No matching kernel log lines found)";
+    NSUInteger start = matched.count > 40 ? matched.count - 40 : 0;
+    return [[matched subarrayWithRange:NSMakeRange(start, matched.count - start)] componentsJoinedByString:@"\n"];
+}
+
+@interface SWHealthDetailViewController : UIViewController
+@property (nonatomic, strong) SWHealthItem *item;
+@end
+
+@implementation SWHealthDetailViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = self.item.name;
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+    self.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemClose
+                                                      target:self action:@selector(closeTapped)];
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"Copy" style:UIBarButtonItemStylePlain
+                                        target:self action:@selector(copyTapped)];
+
+    UIView *box = [[UIView alloc] init];
+    box.backgroundColor = UIColor.secondarySystemGroupedBackgroundColor;
+    box.layer.cornerRadius = 14;
+    box.layer.borderWidth = 1.0;
+    box.layer.borderColor = UIColor.separatorColor.CGColor;
+    box.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:box];
+
+    UITextView *tv = [[UITextView alloc] init];
+    tv.editable = NO;
+    tv.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    tv.backgroundColor = UIColor.clearColor;
+    tv.textColor = UIColor.labelColor;
+    tv.text = self.item.details ?: @"(no details)";
+    tv.translatesAutoresizingMaskIntoConstraints = NO;
+    [box addSubview:tv];
+
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [box.topAnchor constraintEqualToAnchor:g.topAnchor constant:14],
+        [box.bottomAnchor constraintEqualToAnchor:g.bottomAnchor constant:-14],
+        [box.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:14],
+        [box.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-14],
+        [tv.topAnchor constraintEqualToAnchor:box.topAnchor constant:10],
+        [tv.bottomAnchor constraintEqualToAnchor:box.bottomAnchor constant:-10],
+        [tv.leadingAnchor constraintEqualToAnchor:box.leadingAnchor constant:10],
+        [tv.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-10],
+    ]];
+}
+
+- (void)closeTapped { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)copyTapped { UIPasteboard.generalPasteboard.string = self.item.details ?: @""; }
+
+@end
+
+@interface SWHealthViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, strong) UITableView *table;
+@property (nonatomic, strong) NSArray<SWHealthItem *> *items;
+@end
+
+@implementation SWHealthViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"System Check";
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+                                                      target:self action:@selector(runChecks)];
+    self.table = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
+    self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.table.dataSource = self;
+    self.table.delegate = self;
+    [self.view addSubview:self.table];
+    [self runChecks];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self runChecks];
+}
+
+- (void)runChecks {
+    __weak typeof(self) ws = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *bootargs = [SWSysctl stringForName:kSysBootargs errnoOut:nil] ?: @"";
+        NSString *rawLog = [NSString stringWithContentsOfFile:@"/var/log/sweetlog.txt" encoding:NSUTF8StringEncoding error:nil];
+        NSArray<NSString *> *logLines = rawLog.length > 0
+            ? [rawLog componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]
+            : @[];
+
+        NSMutableArray<SWHealthItem *> *list = [NSMutableArray array];
+        SWHealthItem *(^makeItem)(NSString *, SWHealthState, NSString *, NSString *, NSArray<NSString *> *) =
+        ^SWHealthItem *(NSString *name, SWHealthState st, NSString *sum, NSString *info, NSArray<NSString *> *pats) {
+            SWHealthItem *it = [[SWHealthItem alloc] init];
+            it.name = name;
+            it.state = st;
+            it.summary = sum;
+            NSString *stStr = st == SWHealthGreen ? @"OK (Green)" : (st == SWHealthYellow ? @"WARNING (Yellow)" : @"OFF / ERROR (Red)");
+            NSString *logs = SWFilterLogLines(logLines, pats);
+            it.details = [NSString stringWithFormat:@"Feature: %@\nStatus: %@\nSummary: %@\n\n--- Diagnostics ---\n%@\n\n--- Matching Kernel Log ---\n%@",
+                          name, stStr, sum, info, logs];
+            return it;
+        };
+
+        // 1. Display & Framebuffer
+        {
+            NSString *fstats = [SWSysctl stringForName:kSysFrameStats errnoOut:nil];
+            NSString *surf = [SWSysctl stringForName:kSysSurface errnoOut:nil];
+            pid_t bb = SWFindPid(@"backboardd");
+            SWHealthState st = (bb > 0 && surf != nil) ? SWHealthGreen : (bb > 0 ? SWHealthYellow : SWHealthRed);
+            NSString *sum = bb > 0 ? [NSString stringWithFormat:@"backboardd ON (%d), surface %@", (int)bb, surf ?: @"N/A"] : @"backboardd not running";
+            NSString *info = [NSString stringWithFormat:@"backboardd PID: %d\nkern.sweet_fb_surface: %@\nkern.sweet_fb_frame_stats: %@",
+                              (int)bb, surf ?: @"N/A", fstats ?: @"N/A"];
+            [list addObject:makeItem(@"Display & Framebuffer", st, sum, info, @[@"SWEET FB", @"SWEET INTF1", @"AppleCLCD"])];
+        }
+
+        // 2. GPU & Metal
+        {
+            long long m = -1;
+            BOOL hasM = [SWSysctl getInteger:&m name:kSysMetal errnoOut:nil];
+            BOOL hasBundle = (access("/System/Library/Extensions/HakiosMetal.bundle/HakiosMetal", F_OK) == 0);
+            NSString *margs = [NSString stringWithContentsOfFile:kMetalArgsPath encoding:NSUTF8StringEncoding error:nil] ?: @"(none)";
+            SWHealthState st = (hasM && m == 2 && hasBundle) ? SWHealthGreen : ((hasM && m > 0) ? SWHealthYellow : SWHealthRed);
+            NSString *sum = hasM ? [NSString stringWithFormat:@"sweet_metal=%lld (%@)", m, m == 2 ? @"HakiosMetal" : (m == 1 ? @"SapphireMetal" : @"Off")] : @"GPU sysctl N/A";
+            NSString *info = [NSString stringWithFormat:@"kern.sweet_metal: %@\nHakiosMetal.bundle: %@\n%s:\n%@",
+                              hasM ? [@(m) stringValue] : @"N/A", hasBundle ? @"Present" : @"Missing", kMetalArgsPath.UTF8String, margs];
+            [list addObject:makeItem(@"GPU & Metal", st, sum, info, @[@"GPU", @"Adreno", @"hakios-metal", @"HakiosMetal"])];
+        }
+
+        // 3. Touchscreen
+        {
+            NSString *rate = [SWSysctl stringForName:kSysTouchRate errnoOut:nil];
+            long long stale = 0, quiet = 0;
+            [SWSysctl getInteger:&stale name:@"kern.sweet_touch_stale" errnoOut:nil];
+            [SWSysctl getInteger:&quiet name:@"kern.sweet_touch_quiet" errnoOut:nil];
+            SWHealthState st = rate ? ((stale > 0 || quiet > 5) ? SWHealthYellow : SWHealthGreen) : SWHealthRed;
+            NSString *sum = rate ? [NSString stringWithFormat:@"Active (stale=%lld, quiet=%lld)", stale, quiet] : @"Touch driver N/A";
+            NSString *info = [NSString stringWithFormat:@"kern.sweet_touch_rate: %@\nstale releases: %lld\nquiet releases: %lld",
+                              rate ?: @"N/A", stale, quiet];
+            [list addObject:makeItem(@"Touchscreen (FocalTech)", st, sum, info, @[@"SWEET TOUCH"])];
+        }
+
+        // 4. Wi-Fi
+        {
+            NSString *ip = SWWiFiIP();
+            BOOL hasWifiArg = ([bootargs rangeOfString:@"wifi=1"].location != NSNotFound);
+            SWHealthState st = ![ip isEqualToString:@"N/A"] ? SWHealthGreen : (hasWifiArg ? SWHealthYellow : SWHealthRed);
+            NSString *sum = ![ip isEqualToString:@"N/A"] ? [NSString stringWithFormat:@"Connected (%@)", ip] : (hasWifiArg ? @"Enabled, no IP" : @"Disabled");
+            NSString *info = [NSString stringWithFormat:@"en0 IPv4: %@\nboot-arg wifi=1: %@", ip, hasWifiArg ? @"Yes" : @"No"];
+            [list addObject:makeItem(@"Wi-Fi", st, sum, info, @[@"WLAN", @"WIFI", @"WCN3988"])];
+        }
+
+        // 5. Cellular / Modem
+        {
+            BOOL hasModem = ([bootargs rangeOfString:@"modem=1"].location != NSNotFound);
+            BOOL hasLog = [SWFilterLogLines(logLines, @[@"MODEM", @"QMI"]) rangeOfString:@"No matching"].location == NSNotFound;
+            SWHealthState st = (hasModem && hasLog) ? SWHealthGreen : (hasModem ? SWHealthYellow : SWHealthRed);
+            NSString *sum = hasModem ? (hasLog ? @"Modem up (QMI active)" : @"Enabled, no QMI log") : @"Disabled";
+            NSString *info = [NSString stringWithFormat:@"boot-arg modem=1: %@", hasModem ? @"Yes" : @"No"];
+            [list addObject:makeItem(@"Cellular / Modem", st, sum, info, @[@"MODEM", @"QMI", @"MPSS"])];
+        }
+
+        // 6. Audio
+        {
+            BOOL hasAudio = ([bootargs rangeOfString:@"audio="].location != NSNotFound);
+            pid_t ms = SWFindPid(@"mediaserverd");
+            SWHealthState st = (hasAudio && ms > 0) ? SWHealthGreen : ((hasAudio || ms > 0) ? SWHealthYellow : SWHealthRed);
+            NSString *sum = (hasAudio && ms > 0) ? [NSString stringWithFormat:@"OK (mediaserverd %d)", (int)ms] : (hasAudio ? @"mediaserverd off" : @"Disabled in boot-args");
+            NSString *info = [NSString stringWithFormat:@"boot-arg audio=: %@\nmediaserverd PID: %d", hasAudio ? @"Yes" : @"No", (int)ms];
+            [list addObject:makeItem(@"Audio", st, sum, info, @[@"AUDIO", @"ADSP", @"SWEET AUDIO"])];
+        }
+
+        // 7. Bluetooth
+        {
+            pid_t bt = SWFindPid(@"btmonitor");
+            SWHealthState st = bt > 0 ? SWHealthGreen : SWHealthRed;
+            NSString *sum = bt > 0 ? [NSString stringWithFormat:@"btmonitor ON (%d)", (int)bt] : @"btmonitor not running";
+            NSString *info = [NSString stringWithFormat:@"btmonitor PID: %d", (int)bt];
+            [list addObject:makeItem(@"Bluetooth", st, sum, info, @[@"BT", @"BLUETOOTH", @"btmonitor"])];
+        }
+
+        // 8. Fingerprint (FOD)
+        {
+            pid_t fpd = SWFindPid(@"fpd");
+            long long seq = -1;
+            BOOL hasFod = [SWSysctl getInteger:&seq name:@"kern.sweet_fod_seq" errnoOut:nil];
+            SWHealthState st = (fpd > 0 && hasFod) ? SWHealthGreen : ((fpd > 0 || hasFod) ? SWHealthYellow : SWHealthRed);
+            NSString *sum = fpd > 0 ? [NSString stringWithFormat:@"fpd ON (%d), presses=%lld", (int)fpd, seq] : (hasFod ? @"Kernel FOD ready, fpd off" : @"Unavailable");
+            NSString *info = [NSString stringWithFormat:@"fpd PID: %d\nkern.sweet_fod_seq: %@", (int)fpd, hasFod ? [@(seq) stringValue] : @"N/A"];
+            [list addObject:makeItem(@"Fingerprint (FOD)", st, sum, info, @[@"FOD", @"QSEE", @"fingerprint"])];
+        }
+
+        // 9. Haptics & Vibration
+        {
+            pid_t vib = SWFindPid(@"vibd");
+            SWHealthState st = vib > 0 ? SWHealthGreen : SWHealthRed;
+            NSString *sum = vib > 0 ? [NSString stringWithFormat:@"vibd ON (%d)", (int)vib] : @"vibd not running";
+            NSString *info = [NSString stringWithFormat:@"vibd PID: %d", (int)vib];
+            [list addObject:makeItem(@"Haptics & Vibration", st, sum, info, @[@"VIB", @"HAPTIC"])];
+        }
+
+        // 10. Thermal & Sensors
+        {
+            pid_t th = SWFindPid(@"thermald");
+            pid_t sn = SWFindPid(@"sensord");
+            SWHealthState st = (th > 0 && sn > 0) ? SWHealthGreen : ((th > 0 || sn > 0) ? SWHealthYellow : SWHealthRed);
+            NSString *sum = [NSString stringWithFormat:@"thermald: %@, sensord: %@", th > 0 ? @"ON" : @"off", sn > 0 ? @"ON" : @"off"];
+            NSString *info = [NSString stringWithFormat:@"thermald PID: %d\nsensord PID: %d", (int)th, (int)sn];
+            [list addObject:makeItem(@"Thermal & Sensors", st, sum, info, @[@"THERMAL", @"SENSOR"])];
+        }
+
+        // 11. SSH & Jailbreak
+        {
+            pid_t ssh = SWFindPid(@"sshd");
+            if (ssh <= 0) ssh = SWFindPid(@"dropbear");
+            BOOL hasJB = (access("/var/jb", F_OK) == 0);
+            SWHealthState st = (hasJB && ssh > 0) ? SWHealthGreen : (hasJB ? SWHealthYellow : SWHealthRed);
+            NSString *sum = hasJB ? (ssh > 0 ? [NSString stringWithFormat:@"JB OK, SSH ON (%d)", (int)ssh] : @"JB OK, SSH off") : @"No /var/jb";
+            NSString *info = [NSString stringWithFormat:@"/var/jb: %@\nSSH PID: %d\nuid=%d euid=%d",
+                              hasJB ? @"Present" : @"Missing", (int)ssh, (int)getuid(), (int)geteuid()];
+            [list addObject:makeItem(@"SSH & Jailbreak", st, sum, info, @[@"sshd", @"dropbear", @"jb", @"ElleKit"])];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ws.items = list;
+            [ws.table reloadData];
+        });
+    });
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 1; }
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return (NSInteger)self.items.count; }
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s { return @"iOS Subsystem Health"; }
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    return @"Green = OK • Yellow = Warning / Partial • Red = Off / Error. Tap any row to view diagnostics and kernel logs.";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    static NSString *cid = @"SWHealthCell";
+    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:cid];
+    if (!cell) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:cid];
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:13];
+        cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+    }
+    SWHealthItem *it = self.items[(NSUInteger)ip.row];
+    cell.textLabel.text = it.name;
+    cell.detailTextLabel.text = it.summary;
+
+    UIColor *dotColor = it.state == SWHealthGreen ? UIColor.systemGreenColor
+                      : (it.state == SWHealthYellow ? UIColor.systemYellowColor : UIColor.systemRedColor);
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(16, 16)];
+    cell.imageView.image = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [dotColor setFill];
+        [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(1, 1, 14, 14)] fill];
+    }];
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    SWHealthDetailViewController *vc = [[SWHealthDetailViewController alloc] init];
+    vc.item = self.items[(NSUInteger)ip.row];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+@end
+
 #pragma mark - App delegate / main
 
 @interface SWAppDelegate : UIResponder <UIApplicationDelegate>
@@ -1597,10 +1900,24 @@ static BOOL SWFlagOn(NSArray<NSString *> *tokens, NSString *key) {
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
-    SWMainViewController *root = [[SWMainViewController alloc] init];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:root];
-    nav.navigationBar.prefersLargeTitles = YES;
-    self.window.rootViewController = nav;
+
+    SWMainViewController *controls = [[SWMainViewController alloc] init];
+    UINavigationController *nav1 = [[UINavigationController alloc] initWithRootViewController:controls];
+    nav1.navigationBar.prefersLargeTitles = YES;
+    nav1.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Controls"
+                                                    image:[UIImage systemImageNamed:@"slider.horizontal.3"]
+                                                      tag:0];
+
+    SWHealthViewController *health = [[SWHealthViewController alloc] init];
+    UINavigationController *nav2 = [[UINavigationController alloc] initWithRootViewController:health];
+    nav2.navigationBar.prefersLargeTitles = YES;
+    nav2.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"System Check"
+                                                    image:[UIImage systemImageNamed:@"checkmark.shield"]
+                                                      tag:1];
+
+    UITabBarController *tabs = [[UITabBarController alloc] init];
+    tabs.viewControllers = @[nav1, nav2];
+    self.window.rootViewController = tabs;
     [self.window makeKeyAndVisible];
     return YES;
 }
