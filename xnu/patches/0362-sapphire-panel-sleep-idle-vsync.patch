@@ -47,7 +47,7 @@ index a1b2c3d..d4e5f60 100644
  			return;
  		}
  		if (fb->fFadeOrig != NULL) {
-@@ -2018,6 +2033,16 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -2018,5 +2033,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  				sweet_fb_panel_off_abs = mach_absolute_time();  /* 0324: tap to wake */
  				sweet_fb_panel_off = off ? 1 : 0;
  				fFB->fFadeStep = 0;
@@ -63,7 +63,7 @@ index a1b2c3d..d4e5f60 100644
 +				}
  				if (off) {
  					fFB->fDirty = true;
-@@ -2434,6 +2459,8 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_hz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOC
+@@ -2434,5 +2459,7 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_hz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOC
      NULL, 0, sweet_fb_hz_sysctl, "I", "0360: live display vsync/CoreAnimation rate (60, 90, 120, 180, 240 Hz)");
  SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_dcs, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_dcs, 0,
      "0361: 1 = send DCS 0x51 brightness in setPanelLevel even when sweetbl=0");
@@ -71,4 +71,3 @@ index a1b2c3d..d4e5f60 100644
 +    "0362: panel-off power saving: 0=off, 1=4Hz idle vsync, 2=+MDP border-color unstage");
  SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flipflush, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flipflush, 0,
      "sapphire 0304: 1 = flush the whole flip buffer after each 2x GPU copy (as before)");
- SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_await, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
