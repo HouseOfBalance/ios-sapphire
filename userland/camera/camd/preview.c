@@ -225,9 +225,25 @@ void pv_render_rows(const uint8_t *raw, const PvRaw *r, const PvParams *p, int b
 			default:  ox = bx;         oy = by; break;
 			}
 			uint8_t *o = dst + (size_t)dst_stride * oy + 4 * (size_t)ox;
-			o[0] = enc(Bc);
-			o[1] = enc(G);
-			o[2] = enc(R);
+			uint8_t new_b = enc(Bc);
+			uint8_t new_g = enc(G);
+			uint8_t new_r = enc(R);
+
+			/* Adaptive Temporal Noise Reduction (TNR):
+			 * Blend with previous frame at output buffer to filter temporal shot noise.
+			 * If difference is small (|diff| < 24), apply 70% current + 30% previous frame.
+			 * If difference is large (motion), keep 100% current frame to avoid ghosting. */
+			uint8_t old_b = o[0], old_g = o[1], old_r = o[2];
+			int diff = abs((int)new_g - (int)old_g);
+			if (diff < 24 && o[3] == 255) {
+				o[0] = (uint8_t)((new_b * 7 + old_b * 3) / 10);
+				o[1] = (uint8_t)((new_g * 7 + old_g * 3) / 10);
+				o[2] = (uint8_t)((new_r * 7 + old_r * 3) / 10);
+			} else {
+				o[0] = new_b;
+				o[1] = new_g;
+				o[2] = new_r;
+			}
 			o[3] = 255;
 		}
 	}

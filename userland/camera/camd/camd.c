@@ -785,10 +785,14 @@ ae_update(const PvStats *st)
 	ae.have_stats = true;
 	if (!ae.wb_manual && st->n > 200 && st->mean[0] > 1e-4 && st->mean[2] > 1e-4) {
 		double gr = st->mean[1] / st->mean[0], gb = st->mean[1] / st->mean[2];
-		gr = gr < 0.8 ? 0.8 : gr > 3.5 ? 3.5 : gr;
-		gb = gb < 0.8 ? 0.8 : gb > 3.5 ? 3.5 : gb;
-		ae.wb[0] = (float)(0.85 * ae.wb[0] + 0.15 * gr);
-		ae.wb[2] = (float)(0.85 * ae.wb[2] + 0.15 * gb);
+		/* Bound WB gains to daylight / Planckian realistic locus:
+		 * S5KHM6 & OV16A1Q valid gamut: R gain [1.2, 2.8], B gain [1.1, 2.5]
+		 * Prevents sickly green / bluish casts in low light */
+		gr = gr < 1.2 ? 1.2 : gr > 2.8 ? 2.8 : gr;
+		gb = gb < 1.1 ? 1.1 : gb > 2.5 ? 2.5 : gb;
+		/* Heavy exponential smoothing (0.94 / 0.06) to eliminate color fluttering */
+		ae.wb[0] = (float)(0.94 * ae.wb[0] + 0.06 * gr);
+		ae.wb[2] = (float)(0.94 * ae.wb[2] + 0.06 * gb);
 		ae.wb[1] = 1;
 	}
 	if (ae.manual || Eapplied <= 0) return;
