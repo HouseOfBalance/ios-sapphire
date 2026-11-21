@@ -348,7 +348,7 @@ static struct {
 	double gplain, gmean, E_at_stats;
 	bool have_stats, wb_manual;
 	float wb[3];
-} ae = { .E = 8000, .gain = 1, .mx = -1, .my = -1, .wb = { 1.9f, 1.0f, 1.6f } };
+} ae = { .E = 8000, .gain = 1, .mx = -1, .my = -1, .wb = { 1.48f, 1.0f, 1.77f } };
 
 static int
 mode_rot(int m)

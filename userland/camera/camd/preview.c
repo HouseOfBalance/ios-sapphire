@@ -7,8 +7,9 @@
 #include <arm_neon.h>
 #endif
 
-/* Tuned sRGB CCM for S5KHM6/OV16A1Q/S5K4H7: richer greens/blues, natural skin tones */
-const float pv_ccm[9] = { 1.66f, -0.50f, -0.16f, -0.22f, 1.50f, -0.28f, -0.05f, -0.54f, 1.59f };
+/* Calibrated sRGB CCM from hardware DNG (S5KHM6 ColorMatrix2 D65 inverted):
+ * Eliminates artificial red/green casts and delivers true-to-life skin tones */
+const float pv_ccm[9] = { 1.1869f, -0.0159f, -0.1710f, -0.6129f, 2.3214f, -0.7085f, -0.0082f, -0.2589f, 1.2671f };
 
 /* linear 0..1 -> filmic S-curve + sRGB byte, 4096 steps (zero runtime cost) */
 static uint8_t srgb_lut[4097];
