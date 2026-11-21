@@ -45,6 +45,7 @@
 
 #define N_BLANKED       "com.apple.springboard.hasBlankedScreen"
 #define N_PROX          "com.sapphire.sensor.prox"
+#define N_LUX           "com.sapphire.sensor.lux"
 #define N_PICKUP        "com.sapphire.sensor.pickup"
 #define N_MOTION        "com.sapphire.sensor.motion"
 
@@ -315,7 +316,7 @@ static bool screen_on, have_orient_cand;
 static int prox_near = -1, orient = -1, orient_cand = -1;
 static double orient_since, als_last_t, pickup_last, motion_last;
 static float als_last = -1;
-static int tok_blank = -1, tok_prox = -1;
+static int tok_blank = -1, tok_prox = -1, tok_lux = -1;
 static unsigned hid_errors;
 
 static void
@@ -438,6 +439,10 @@ handle_event(int si, uint32_t msg_id, const uint8_t *d, uint32_t n)
 			if (als_last < 0 || fabsf(lux - als_last) > 0.1f * (als_last + 1) || t - als_last_t > 5) {
 				if (t - als_last_t >= 0.5) {
 					push(K_ALS, (int32_t)lrintf(lux), 0, 0, 0);
+					if (tok_lux >= 0) {
+						notify_set_state(tok_lux, (uint64_t)lrintf(lux * 100.0f));
+						notify_post(N_LUX);
+					}
 					als_last = lux;
 					als_last_t = t;
 				}
@@ -680,6 +685,8 @@ main(void)
 	notify_register_check(N_BLANKED, &tok_blank);
 	notify_register_check(N_PROX, &tok_prox);
 	notify_set_state(tok_prox, 0);
+	notify_register_check(N_LUX, &tok_lux);
+	notify_set_state(tok_lux, 0);
 
 	/* the sensors appear once the PD has read its registry */
 	for (int tries = 0; tries < 60 && !sn[S_ACCEL].have; tries++) {

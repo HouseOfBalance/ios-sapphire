@@ -121,10 +121,25 @@ jobs:
 
           # 6. Build standalone brightness bridge for backboardd (sweetmetal=2)
           echo "Building SapphireBrightness..."
-          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -dynamiclib -install_name /redwood/lib/SapphireBrightness.dylib -o obj/SapphireBrightness.dylib brightness/SapphireBrightness.c -framework CoreFoundation -framework IOKit -lobjc
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -dynamiclib -install_name /redwood/lib/SapphireBrightness.dylib -o obj/SapphireBrightness.dylib brightness/SapphireBrightness.c -framework CoreFoundation -framework IOKit -lobjc -lm
           codesign --force --sign - obj/SapphireBrightness.dylib
           clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/bkstart brightness/bkstart.c
           codesign --force --sign - obj/bkstart
+
+          # 7. Build third-party AVFoundation virtual camera tweak (NV12 + BGRA + Vision QR + Photo)
+          echo "Building SapphireAVCamera.dylib..."
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -fobjc-arc -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireAVCamera.dylib \
+            -o obj/SapphireAVCamera.dylib tweaks/avcamera/SapphireAVCamera.m \
+            -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Foundation \
+            -framework IOSurface -framework QuartzCore -framework UIKit -framework Vision -lobjc
+          codesign --force --sign - obj/SapphireAVCamera.dylib
+          cp tweaks/avcamera/SapphireAVCamera.plist obj/
+
+          # 8. Build QMI LOC GNSS client/daemon
+          echo "Building sapphire-gpsd..."
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/sapphire-gpsd gps/sapphire-gpsd.c
+          codesign --force --sign - obj/sapphire-gpsd
 
           ls -la obj/
 

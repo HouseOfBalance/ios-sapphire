@@ -1,0 +1,74 @@
+From: Sapphire Port <sapphire@xiaomi>
+Subject: [PATCH] sapphire-0362: panel-off idle vsync (4Hz) and optional MDP border-color unstage (kern.sweet_panel_sleep)
+
+When the display is powered off (fPowerOff), vsyncFired() previously kept firing
+at full 120 Hz forever even after blanking RAM, waking the CPU 120 times/sec while
+the screen was off and scanning 1.24 GB/s of black pixels from DDR via MDP VIG0.
+
+Add kern.sweet_panel_sleep (default 1):
+  0 = legacy behavior (120 Hz vsync while off)
+  1 = drop vsync timer to 4 Hz (250 ms) after RAM blanking completes, restoring full
+      rate immediately on RequestPowerChange(1) wake
+  2 = also unstage VIG0 from CTL0 layer mixer (border color black, 0 DDR scanout)
+      while off, restoring saved CTL_LAYER0 + flush on wake
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a1b2c3d..d4e5f60 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -78,6 +78,9 @@ static AppleCLCD *sweet_dsi_fb;                 /* 0260: sweet_fb_dsi_seq() */
+ static AppleCLCD *sweet_frame_fb;               /* 0286: kern.sweet_fb_frame_await/_sent */
+ static uint32_t sweet_bl_on;                    /* 0330: sweetbl=0 keeps DSI panel on/level quiet */
+ static uint32_t sweet_bl_dcs = 1;               /* 0361: allow DCS 0x51 brightness while keeping 0x28/0x29 off */
++static uint32_t sweet_panel_sleep = 1;          /* 0362: 0=off, 1=4Hz idle vsync when off, 2=+MDP border-color unstage */
++static uint32_t sweet_ctl0_saved;               /* 0362: saved CTL_LAYER0 before unstaging VIG0 */
++static bool sweet_mdp_unstaged;                 /* 0362: true while VIG0 unstaged to border color black */
+ /* 0324: the panel's state for tap to wake (bsd/dev/sweet_touch.c): 1 after RequestPowerChange(0), and since when */
+ extern "C" volatile int sweet_fb_panel_off;
+ extern "C" volatile uint64_t sweet_fb_panel_off_abs;
+@@ -645,7 +648,19 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				}
+ 				__asm__ volatile("dsb sy" ::: "memory");
+ 			}
+-			fb->armVsync(sender);
++			if (!first && sweet_panel_sleep >= 2 && fb->fCtl0 != NULL && !sweet_mdp_unstaged) {
++				sweet_ctl0_saved = fb->fCtl0[0];
++				fb->fCtl0[0] = 0;
++				__asm__ volatile("dsb sy" ::: "memory");
++				fb->fCtl0[0x18 / 4] = 0x20041;  /* flush VIG0 + LM0 + CTL */
++				__asm__ volatile("dsb sy" ::: "memory");
++				sweet_mdp_unstaged = true;
++			}
++			if (!first && sweet_panel_sleep >= 1) {
++				sender->setTimeoutUS(250000);   /* 4 Hz idle check while panel off */
++			} else {
++				fb->armVsync(sender);
++			}
+ 			return;
+ 		}
+ 		if (fb->fFadeOrig != NULL) {
+@@ -2018,6 +2033,16 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 				sweet_fb_panel_off_abs = mach_absolute_time();  /* 0324: tap to wake */
+ 				sweet_fb_panel_off = off ? 1 : 0;
+ 				fFB->fFadeStep = 0;
++				if (!off) {
++					if (sweet_mdp_unstaged && fFB->fCtl0 != NULL) {
++						fFB->fCtl0[0] = sweet_ctl0_saved;
++						__asm__ volatile("dsb sy" ::: "memory");
++						fFB->fCtl0[0x18 / 4] = 0x20041;
++						__asm__ volatile("dsb sy" ::: "memory");
++						sweet_mdp_unstaged = false;
++					}
++					fFB->armVsync(fFB->fVsync);
++				}
+ 				if (off) {
+ 					fFB->fDirty = true;
+@@ -2434,6 +2459,8 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_hz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOC
+     NULL, 0, sweet_fb_hz_sysctl, "I", "0360: live display vsync/CoreAnimation rate (60, 90, 120, 180, 240 Hz)");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_dcs, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_dcs, 0,
+     "0361: 1 = send DCS 0x51 brightness in setPanelLevel even when sweetbl=0");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_panel_sleep, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_panel_sleep, 0,
++    "0362: panel-off power saving: 0=off, 1=4Hz idle vsync, 2=+MDP border-color unstage");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flipflush, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flipflush, 0,
+     "sapphire 0304: 1 = flush the whole flip buffer after each 2x GPU copy (as before)");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_await, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
