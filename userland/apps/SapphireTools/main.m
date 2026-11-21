@@ -1001,6 +1001,10 @@ static NSString *SWFindSSHPlist(void) {
 // Bat/tat SSH. Co plist -> launchctl load -w / unload. Khong co plist -> chay thang daemon (best-effort).
 // Tra ve YES neu lenh chay khong loi (trang thai thuc te phai kiem tra lai bang SWDetectSSHPort).
 static BOOL SWSSHSetEnabled(BOOL on, NSString **msg) {
+    int derr = 0;
+    if (SWToolsdCall(on ? @"SSH_START\n" : @"SSH_STOP\n", &derr)) {
+        return YES;
+    }
     NSString *plist = SWFindSSHPlist();
     NSString *out = nil;
     int e = 0, rc = -1;

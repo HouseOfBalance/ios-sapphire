@@ -120,6 +120,37 @@ static void handle_client(int fd) {
             }
         }
         write(fd, "OK\n", 3);
+    } else if (strcmp(buf, "SSH_START") == 0) {
+        const char *bins[] = { "/var/jb/usr/sbin/sshd", "/usr/sbin/sshd", "/usr/local/sbin/sshd", NULL };
+        int started = 0;
+        for (int i = 0; bins[i]; i++) {
+            if (access(bins[i], X_OK) != 0) continue;
+            pid_t pid = 0;
+            char *argv[] = { (char *)bins[i], NULL };
+            if (posix_spawn(&pid, bins[i], NULL, NULL, argv, environ) == 0) {
+                int st = 0;
+                waitpid(pid, &st, 0);
+                started = 1;
+                break;
+            }
+        }
+        if (started) write(fd, "OK\n", 3);
+        else write(fd, "ERR sshd not found\n", 19);
+    } else if (strcmp(buf, "SSH_STOP") == 0) {
+        const char *bins[] = { "/usr/bin/killall", "/var/jb/usr/bin/killall", "/bin/killall", NULL };
+        const char *targets[] = { "sshd", "dropbear", NULL };
+        for (int t = 0; targets[t]; t++) {
+            for (int i = 0; bins[i]; i++) {
+                if (access(bins[i], X_OK) != 0) continue;
+                pid_t pid = 0;
+                char *argv[] = { "killall", "-9", (char *)targets[t], NULL };
+                if (posix_spawn(&pid, bins[i], NULL, NULL, argv, environ) == 0) {
+                    int st = 0;
+                    waitpid(pid, &st, 0);
+                }
+            }
+        }
+        write(fd, "OK\n", 3);
     } else if (strcmp(buf, "REBOOT") == 0) {
         write(fd, "OK\n", 3);
         sync();
