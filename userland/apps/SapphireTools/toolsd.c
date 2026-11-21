@@ -50,6 +50,26 @@ static int allowed_proc(const char *name) {
     return 0;
 }
 
+static void kill_by_name(const char *target) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t sz = 0;
+    if (sysctl(mib, 4, NULL, &sz, NULL, 0) != 0 || sz == 0) return;
+    struct kinfo_proc *procs = malloc(sz);
+    if (!procs) return;
+    if (sysctl(mib, 4, procs, &sz, NULL, 0) == 0) {
+        size_t n = sz / sizeof(struct kinfo_proc);
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(procs[i].kp_proc.p_comm, target) == 0 ||
+                strncmp(procs[i].kp_proc.p_comm, target, strlen(target)) == 0) {
+                if (procs[i].kp_proc.p_pid > 1 && procs[i].kp_proc.p_pid != getpid()) {
+                    kill(procs[i].kp_proc.p_pid, SIGKILL);
+                }
+            }
+        }
+    }
+    free(procs);
+}
+
 static void handle_client(int fd) {
     char buf[4096];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
@@ -108,16 +128,7 @@ static void handle_client(int fd) {
         while ((tok = strsep(&p, " ")) != NULL) {
             if (*tok == '\0') continue;
             if (!allowed_proc(tok)) continue;
-            const char *bins[] = { "/usr/bin/killall", "/var/jb/usr/bin/killall", "/bin/killall", NULL };
-            for (int i = 0; bins[i]; i++) {
-                if (access(bins[i], X_OK) != 0) continue;
-                pid_t pid = 0;
-                char *argv[] = { "killall", "-9", tok, NULL };
-                if (posix_spawn(&pid, bins[i], NULL, NULL, argv, environ) == 0) {
-                    int st = 0;
-                    waitpid(pid, &st, 0);
-                }
-            }
+            kill_by_name(tok);
         }
         write(fd, "OK\n", 3);
     } else if (strcmp(buf, "SSH_START") == 0) {
@@ -137,19 +148,8 @@ static void handle_client(int fd) {
         if (started) write(fd, "OK\n", 3);
         else write(fd, "ERR sshd not found\n", 19);
     } else if (strcmp(buf, "SSH_STOP") == 0) {
-        const char *bins[] = { "/usr/bin/killall", "/var/jb/usr/bin/killall", "/bin/killall", NULL };
-        const char *targets[] = { "sshd", "dropbear", NULL };
-        for (int t = 0; targets[t]; t++) {
-            for (int i = 0; bins[i]; i++) {
-                if (access(bins[i], X_OK) != 0) continue;
-                pid_t pid = 0;
-                char *argv[] = { "killall", "-9", (char *)targets[t], NULL };
-                if (posix_spawn(&pid, bins[i], NULL, NULL, argv, environ) == 0) {
-                    int st = 0;
-                    waitpid(pid, &st, 0);
-                }
-            }
-        }
+        kill_by_name("sshd");
+        kill_by_name("dropbear");
         write(fd, "OK\n", 3);
     } else if (strcmp(buf, "REBOOT") == 0) {
         write(fd, "OK\n", 3);
