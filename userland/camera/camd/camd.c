@@ -1645,14 +1645,7 @@ handle_line(struct client *c, char *line)
 		}
 		int m = atoi(args);
 		bool face = (strstr(args, "FACE") != NULL);
-		if (face) {
-			for (struct client *o = clients; o; o = o->next) {
-				if (!o->gone && o->wants_preview && !o->is_face) {
-					reply(c, "ERR busy");
-					return;
-				}
-			}
-		} else {
+		if (!face) {
 			for (struct client *o = clients; o; o = o->next) {
 				if (!o->gone && o->wants_preview && o->is_face) {
 					o->wants_preview = false;
