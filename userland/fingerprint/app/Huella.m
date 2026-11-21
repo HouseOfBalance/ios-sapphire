@@ -1321,166 +1321,12 @@ faced_rpc(const char *cmd, void (^onLine)(NSString *line))
 	return last;
 }
 
-@interface FaceUnlockVC : UITableViewController {
-	int _enrolled;
-	BOOL _online;
-	BOOL _busy;
-	NSString *_statusText;
-}
+/* Forward declaration */
+@interface FaceEnrollSheetVC : UIViewController
+@property (nonatomic, copy) void (^completion)(BOOL success, NSString *detail);
 @end
 
-@implementation FaceUnlockVC
-
-- (instancetype)init
-{
-	if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) {
-		self.title = @"Face Unlock (2D)";
-		_statusText = @"Checking...";
-	}
-	return self;
-}
-
-- (NSMutableDictionary *)loadFacePrefs
-{
-	NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@FACE_PREFS];
-	return d ? [d mutableCopy] : [NSMutableDictionary dictionary];
-}
-
-- (BOOL)facePrefBool:(NSString *)key dflt:(BOOL)dflt
-{
-	NSDictionary *d = [self loadFacePrefs];
-	return d[key] != nil ? [d[key] boolValue] : dflt;
-}
-
-- (void)setFacePrefBool:(BOOL)val key:(NSString *)key
-{
-	NSMutableDictionary *d = [self loadFacePrefs];
-	d[key] = @(val);
-	[d writeToFile:@FACE_PREFS atomically:YES];
-}
-
-- (void)viewDidLoad
-{
-	[super viewDidLoad];
-	self.navigationController.navigationBar.prefersLargeTitles = YES;
-	UIRefreshControl *rc = [UIRefreshControl new];
-	[rc addTarget:self action:@selector(refreshStatus) forControlEvents:UIControlEventValueChanged];
-	self.refreshControl = rc;
-}
-
-- (void)viewWillAppear:(BOOL)animated
-{
-	[super viewWillAppear:animated];
-	[self refreshStatus];
-}
-
-- (void)refreshStatus
-{
-	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-		NSString *rep = faced_rpc("STATUS\n", nil);
-		BOOL online = (rep != nil && [rep hasPrefix:@"OK"]);
-		int enrolled = 0;
-		if (online) {
-			NSRange r = [rep rangeOfString:@"enrolled="];
-			if (r.location != NSNotFound) {
-				enrolled = [[rep substringFromIndex:r.location + r.length] intValue];
-			}
-		}
-		dispatch_async(dispatch_get_main_queue(), ^{
-			self->_online = online;
-			self->_enrolled = enrolled;
-			if (!online) {
-				self->_statusText = @"Service Offline (faced)";
-			} else if (enrolled > 0) {
-				self->_statusText = [NSString stringWithFormat:@"Enrolled (%d samples)", enrolled];
-			} else {
-				self->_statusText = @"Not Enrolled";
-			}
-			[self.refreshControl endRefreshing];
-			[self.tableView reloadData];
-		});
-	});
-}
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { (void)tv; return 2; }
-
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s
-{
-	(void)tv;
-	if (s == 0) return _enrolled > 0 ? 4 : 2;
-	return 3;
-}
-
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s
-{
-	(void)tv;
-	return s == 0 ? @"Face Recognition (Front Camera)" : @"Behavior & Permissions";
-}
-
-- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s
-{
-	(void)tv;
-	if (s == 0) {
-		return @"Look directly at the front camera in good lighting while enrolling. 5 samples are captured automatically.";
-	}
-	return @"2D Face Unlock uses the front camera and shares the 5-attempt lockout with Fingerprint. When 'Apps and Purchases' is enabled, supported apps and App Store authenticate seamlessly with either Face or Fingerprint.";
-}
-
-- (void)onSwitchChanged:(UISwitch *)sw
-{
-	if (sw.tag == 1) [self setFacePrefBool:sw.on key:@"faceUnlockEnabled"];
-	else if (sw.tag == 2) [self setFacePrefBool:sw.on key:@"faceStayOnLock"];
-	else if (sw.tag == 3) [self setFacePrefBool:sw.on key:@"faceAppsEnabled"];
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip
-{
-	(void)tv;
-	if (ip.section == 0) {
-		if (ip.row == 0) {
-			UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
-			c.selectionStyle = UITableViewCellSelectionStyleNone;
-			c.textLabel.text = @"Status";
-			c.detailTextLabel.text = _statusText;
-			c.detailTextLabel.textColor = (_online && _enrolled > 0) ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
-			return c;
-		}
-		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-		if (ip.row == 1) {
-			c.textLabel.text = _enrolled > 0 ? @"Re-Enroll Face…" : @"Enroll Face…";
-			c.textLabel.textColor = (_online && !_busy) ? self.view.tintColor : [UIColor secondaryLabelColor];
-		} else if (ip.row == 2) {
-			c.textLabel.text = @"Test Face Recognition";
-			c.textLabel.textColor = (_online && !_busy) ? self.view.tintColor : [UIColor secondaryLabelColor];
-		} else {
-			c.textLabel.text = @"Delete Face Data";
-			c.textLabel.textColor = [UIColor systemRedColor];
-		}
-		return c;
-	}
-
-	UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-	c.selectionStyle = UITableViewCellSelectionStyleNone;
-	UISwitch *sw = [UISwitch new];
-	if (ip.row == 0) {
-		c.textLabel.text = @"Unlock Lock Screen with Face";
-		sw.tag = 1;
-		sw.on = [self facePrefBool:@"faceUnlockEnabled" dflt:YES];
-	} else if (ip.row == 1) {
-		c.textLabel.text = @"Stay on Lock Screen (iPhone X)";
-		sw.tag = 2;
-		sw.on = [self facePrefBool:@"faceStayOnLock" dflt:YES];
-	} else {
-		c.textLabel.text = @"Use Face ID for Apps & Purchases";
-		sw.tag = 3;
-		sw.on = [self facePrefBool:@"faceAppsEnabled" dflt:YES];
-	}
-	[sw addTarget:self action:@selector(onSwitchChanged:) forControlEvents:UIControlEventValueChanged];
-	c.accessoryView = sw;
-	return c;
-}
-
-@interface FaceEnrollSheetVC : UIViewController {
+@interface FaceEnrollSheetVC () {
 	UIImageView *_previewView;
 	CAShapeLayer *_ovalLayer;
 	UILabel *_statusLabel;
@@ -1493,7 +1339,6 @@ faced_rpc(const char *cmd, void (^onLine)(NSString *line))
 	NSTimer *_timer;
 	BOOL _done;
 }
-@property (nonatomic, copy) void (^completion)(BOOL success, NSString *detail);
 @end
 
 @implementation FaceEnrollSheetVC
@@ -1669,6 +1514,165 @@ faced_rpc(const char *cmd, void (^onLine)(NSString *line))
 	});
 }
 @end
+
+@interface FaceUnlockVC : UITableViewController {
+	int _enrolled;
+	BOOL _online;
+	BOOL _busy;
+	NSString *_statusText;
+}
+@end
+
+@implementation FaceUnlockVC
+
+- (instancetype)init
+{
+	if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) {
+		self.title = @"Face Unlock (2D)";
+		_statusText = @"Checking...";
+	}
+	return self;
+}
+
+- (NSMutableDictionary *)loadFacePrefs
+{
+	NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@FACE_PREFS];
+	return d ? [d mutableCopy] : [NSMutableDictionary dictionary];
+}
+
+- (BOOL)facePrefBool:(NSString *)key dflt:(BOOL)dflt
+{
+	NSDictionary *d = [self loadFacePrefs];
+	return d[key] != nil ? [d[key] boolValue] : dflt;
+}
+
+- (void)setFacePrefBool:(BOOL)val key:(NSString *)key
+{
+	NSMutableDictionary *d = [self loadFacePrefs];
+	d[key] = @(val);
+	[d writeToFile:@FACE_PREFS atomically:YES];
+}
+
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.navigationController.navigationBar.prefersLargeTitles = YES;
+	UIRefreshControl *rc = [UIRefreshControl new];
+	[rc addTarget:self action:@selector(refreshStatus) forControlEvents:UIControlEventValueChanged];
+	self.refreshControl = rc;
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+	[super viewWillAppear:animated];
+	[self refreshStatus];
+}
+
+- (void)refreshStatus
+{
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		NSString *rep = faced_rpc("STATUS\n", nil);
+		BOOL online = (rep != nil && [rep hasPrefix:@"OK"]);
+		int enrolled = 0;
+		if (online) {
+			NSRange r = [rep rangeOfString:@"enrolled="];
+			if (r.location != NSNotFound) {
+				enrolled = [[rep substringFromIndex:r.location + r.length] intValue];
+			}
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			self->_online = online;
+			self->_enrolled = enrolled;
+			if (!online) {
+				self->_statusText = @"Service Offline (faced)";
+			} else if (enrolled > 0) {
+				self->_statusText = [NSString stringWithFormat:@"Enrolled (%d samples)", enrolled];
+			} else {
+				self->_statusText = @"Not Enrolled";
+			}
+			[self.refreshControl endRefreshing];
+			[self.tableView reloadData];
+		});
+	});
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { (void)tv; return 2; }
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s
+{
+	(void)tv;
+	if (s == 0) return _enrolled > 0 ? 4 : 2;
+	return 3;
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s
+{
+	(void)tv;
+	return s == 0 ? @"Face Recognition (Front Camera)" : @"Behavior & Permissions";
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s
+{
+	(void)tv;
+	if (s == 0) {
+		return @"Look directly at the front camera in good lighting while enrolling. 5 samples are captured automatically.";
+	}
+	return @"2D Face Unlock uses the front camera and shares the 5-attempt lockout with Fingerprint. When 'Apps and Purchases' is enabled, supported apps and App Store authenticate seamlessly with either Face or Fingerprint.";
+}
+
+- (void)onSwitchChanged:(UISwitch *)sw
+{
+	if (sw.tag == 1) [self setFacePrefBool:sw.on key:@"faceUnlockEnabled"];
+	else if (sw.tag == 2) [self setFacePrefBool:sw.on key:@"faceStayOnLock"];
+	else if (sw.tag == 3) [self setFacePrefBool:sw.on key:@"faceAppsEnabled"];
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip
+{
+	(void)tv;
+	if (ip.section == 0) {
+		if (ip.row == 0) {
+			UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+			c.selectionStyle = UITableViewCellSelectionStyleNone;
+			c.textLabel.text = @"Status";
+			c.detailTextLabel.text = _statusText;
+			c.detailTextLabel.textColor = (_online && _enrolled > 0) ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+			return c;
+		}
+		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+		if (ip.row == 1) {
+			c.textLabel.text = _enrolled > 0 ? @"Re-Enroll Face…" : @"Enroll Face…";
+			c.textLabel.textColor = (_online && !_busy) ? self.view.tintColor : [UIColor secondaryLabelColor];
+		} else if (ip.row == 2) {
+			c.textLabel.text = @"Test Face Recognition";
+			c.textLabel.textColor = (_online && !_busy) ? self.view.tintColor : [UIColor secondaryLabelColor];
+		} else {
+			c.textLabel.text = @"Delete Face Data";
+			c.textLabel.textColor = [UIColor systemRedColor];
+		}
+		return c;
+	}
+
+	UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+	c.selectionStyle = UITableViewCellSelectionStyleNone;
+	UISwitch *sw = [UISwitch new];
+	if (ip.row == 0) {
+		c.textLabel.text = @"Unlock Lock Screen with Face";
+		sw.tag = 1;
+		sw.on = [self facePrefBool:@"faceUnlockEnabled" dflt:YES];
+	} else if (ip.row == 1) {
+		c.textLabel.text = @"Stay on Lock Screen (iPhone X)";
+		sw.tag = 2;
+		sw.on = [self facePrefBool:@"faceStayOnLock" dflt:YES];
+	} else {
+		c.textLabel.text = @"Use Face ID for Apps & Purchases";
+		sw.tag = 3;
+		sw.on = [self facePrefBool:@"faceAppsEnabled" dflt:YES];
+	}
+	[sw addTarget:self action:@selector(onSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+	c.accessoryView = sw;
+	return c;
+}
 
 - (void)startEnroll
 {
