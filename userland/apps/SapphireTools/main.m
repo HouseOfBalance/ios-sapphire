@@ -2312,7 +2312,7 @@ static NSString *SWCamdCommand(NSString *cmd, double timeoutSec) {
     UIColor *blue = UIColor.systemBlueColor;
 
     // ---------- Graphics & Metal ----------
-    [self addCell:[self buttonCell:@"Preset A: 60Hz Locked (0% Cà giật, Nét 100%)" color:UIColor.systemGreenColor]
+    [self addCell:[self buttonCellWithTitle:@"Preset A: 60Hz Locked (0% Cà giật, Nét 100%)" color:UIColor.systemGreenColor]
         toSection:SecGraphics action:^{
             SWSysctlSetInt(@"kern.sweet_fb_hz", 60, nil);
             SWSysctlSetInt(kSysRScale, 1000, nil);
@@ -2325,7 +2325,7 @@ static NSString *SWCamdCommand(NSString *cmd, double timeoutSec) {
             });
         }];
 
-    [self addCell:[self buttonCell:@"Preset B: 120Hz Smooth (Scale 75%, Siêu mượt)" color:blue]
+    [self addCell:[self buttonCellWithTitle:@"Preset B: 120Hz Smooth (Scale 75%, Siêu mượt)" color:blue]
         toSection:SecGraphics action:^{
             SWSysctlSetInt(@"kern.sweet_fb_hz", 120, nil);
             SWSysctlSetInt(kSysRScale, 750, nil);
