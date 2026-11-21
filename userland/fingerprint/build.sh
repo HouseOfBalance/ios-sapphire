@@ -21,12 +21,12 @@ $CC -framework CoreFoundation -o "$out/fpd" fpd.c
 $CC -o "$out/fpload" fpload.c
 $CC -o "$out/fpsave" fpsave.c
 $CC -o "$out/fpctl" fpctl.c
-for t in SapphireFingerprint SapphireFingerprintSettings; do
+for t in SapphireFingerprint SapphireFingerprintSettings SapphireBiometry; do
 	$CC -fobjc-arc -dynamiclib -install_name /var/jb/usr/lib/TweakInject/$t.dylib \
 		-lobjc -framework Foundation -framework UIKit -framework QuartzCore -framework CoreGraphics -o "$out/$t.dylib" $t.m
 	cp $t.plist "$out/"
 done
-for f in fpd fpload fpsave fpctl SapphireFingerprint.dylib SapphireFingerprintSettings.dylib; do "$LDID" -S "$out/$f"; done
+for f in fpd fpload fpsave fpctl SapphireFingerprint.dylib SapphireFingerprintSettings.dylib SapphireBiometry.dylib; do "$LDID" -S "$out/$f"; done
 cp com.sapphire.fpd.plist "$out/"
 
 # the app

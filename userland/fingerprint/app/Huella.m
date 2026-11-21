@@ -1075,7 +1075,7 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 		if (r == 0) {
 			return [self switchCell:T(@"Desbloquear el iPhone", @"Unlock iPhone") key:@"unlockEnabled" dflt:YES enabled:YES];
 		}
-		return [self switchCell:T(@"Apps y compras (próximamente)", @"Apps and Purchases (coming soon)") key:@"appsEnabled" dflt:NO enabled:NO];
+		return [self switchCell:T(@"Apps y compras", @"Apps and Purchases") key:@"appsEnabled" dflt:YES enabled:YES];
 	case S_LOOK:
 		switch (r) {
 		case 0: return [self valueCell:T(@"Estilo", @"Style") value:option_label(style_options(), pref_string(@"glyphStyle", @"touchid")) link:YES];
