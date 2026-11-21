@@ -1273,6 +1273,291 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 }
 @end
 
+/* ================================================================== Face Unlock (2D) tab */
+
+#define FACED_SOCK "/var/run/faced.sock"
+#define FACE_PREFS "/var/mobile/Library/Preferences/com.sapphire.faceid.plist"
+
+static NSString *
+faced_rpc(const char *cmd, void (^onLine)(NSString *line))
+{
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) return nil;
+	struct timeval tv = { .tv_sec = 18, .tv_usec = 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	struct sockaddr_un sa = { .sun_family = AF_UNIX };
+	snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", FACED_SOCK);
+	if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+		close(fd);
+		return nil;
+	}
+	if (write(fd, cmd, strlen(cmd)) != (ssize_t)strlen(cmd)) {
+		close(fd);
+		return nil;
+	}
+	FILE *fp = fdopen(fd, "r");
+	if (!fp) { close(fd); return nil; }
+	char buf[256];
+	NSString *last = nil;
+	while (fgets(buf, sizeof(buf), fp)) {
+		NSString *line = [[NSString stringWithUTF8String:buf] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+		if (line.length == 0) continue;
+		last = line;
+		if (onLine) {
+			dispatch_async(dispatch_get_main_queue(), ^{ onLine(line); });
+		}
+		if ([line hasPrefix:@"OK"] || [line hasPrefix:@"DONE"] || [line hasPrefix:@"ERR"] ||
+		    [line hasPrefix:@"MATCH"] || [line hasPrefix:@"NOMATCH"] || [line hasPrefix:@"NOFACE"] ||
+		    [line hasPrefix:@"BUSY"] || [line hasPrefix:@"CANCELLED"]) {
+			break;
+		}
+	}
+	fclose(fp);
+	return last;
+}
+
+@interface FaceUnlockVC : UITableViewController {
+	int _enrolled;
+	BOOL _online;
+	BOOL _busy;
+	NSString *_statusText;
+}
+@end
+
+@implementation FaceUnlockVC
+
+- (instancetype)init
+{
+	if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) {
+		self.title = @"Face Unlock (2D)";
+		_statusText = @"Checking...";
+	}
+	return self;
+}
+
+- (NSMutableDictionary *)loadFacePrefs
+{
+	NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@FACE_PREFS];
+	return d ? [d mutableCopy] : [NSMutableDictionary dictionary];
+}
+
+- (BOOL)facePrefBool:(NSString *)key dflt:(BOOL)dflt
+{
+	NSDictionary *d = [self loadFacePrefs];
+	return d[key] != nil ? [d[key] boolValue] : dflt;
+}
+
+- (void)setFacePrefBool:(BOOL)val key:(NSString *)key
+{
+	NSMutableDictionary *d = [self loadFacePrefs];
+	d[key] = @(val);
+	[d writeToFile:@FACE_PREFS atomically:YES];
+}
+
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.navigationController.navigationBar.prefersLargeTitles = YES;
+	UIRefreshControl *rc = [UIRefreshControl new];
+	[rc addTarget:self action:@selector(refreshStatus) forControlEvents:UIControlEventValueChanged];
+	self.refreshControl = rc;
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+	[super viewWillAppear:animated];
+	[self refreshStatus];
+}
+
+- (void)refreshStatus
+{
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		NSString *rep = faced_rpc("STATUS\n", nil);
+		BOOL online = (rep != nil && [rep hasPrefix:@"OK"]);
+		int enrolled = 0;
+		if (online) {
+			NSRange r = [rep rangeOfString:@"enrolled="];
+			if (r.location != NSNotFound) {
+				enrolled = [[rep substringFromIndex:r.location + r.length] intValue];
+			}
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			self->_online = online;
+			self->_enrolled = enrolled;
+			if (!online) {
+				self->_statusText = @"Service Offline (faced)";
+			} else if (enrolled > 0) {
+				self->_statusText = [NSString stringWithFormat:@"Enrolled (%d samples)", enrolled];
+			} else {
+				self->_statusText = @"Not Enrolled";
+			}
+			[self.refreshControl endRefreshing];
+			[self.tableView reloadData];
+		});
+	});
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { (void)tv; return 2; }
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s
+{
+	(void)tv;
+	if (s == 0) return _enrolled > 0 ? 4 : 2;
+	return 2;
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s
+{
+	(void)tv;
+	return s == 0 ? @"Face Recognition (Front Camera)" : @"Lock Screen Behavior";
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s
+{
+	(void)tv;
+	if (s == 0) {
+		return @"Look directly at the front camera in good lighting while enrolling. 5 samples are captured automatically.";
+	}
+	return @"2D Face Unlock is for Lock Screen convenience only and shares the 5-attempt lockout with Fingerprint. Apps and Purchases always require Fingerprint.";
+}
+
+- (void)onSwitchChanged:(UISwitch *)sw
+{
+	if (sw.tag == 1) [self setFacePrefBool:sw.on key:@"faceUnlockEnabled"];
+	else if (sw.tag == 2) [self setFacePrefBool:sw.on key:@"faceStayOnLock"];
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip
+{
+	(void)tv;
+	if (ip.section == 0) {
+		if (ip.row == 0) {
+			UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+			c.selectionStyle = UITableViewCellSelectionStyleNone;
+			c.textLabel.text = @"Status";
+			c.detailTextLabel.text = _statusText;
+			c.detailTextLabel.textColor = (_online && _enrolled > 0) ? [UIColor systemGreenColor] : [UIColor secondaryLabelColor];
+			return c;
+		}
+		UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+		if (ip.row == 1) {
+			c.textLabel.text = _enrolled > 0 ? @"Re-Enroll Face…" : @"Enroll Face…";
+			c.textLabel.textColor = (_online && !_busy) ? self.view.tintColor : [UIColor secondaryLabelColor];
+		} else if (ip.row == 2) {
+			c.textLabel.text = @"Test Face Recognition";
+			c.textLabel.textColor = (_online && !_busy) ? self.view.tintColor : [UIColor secondaryLabelColor];
+		} else {
+			c.textLabel.text = @"Delete Face Data";
+			c.textLabel.textColor = [UIColor systemRedColor];
+		}
+		return c;
+	}
+
+	UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+	c.selectionStyle = UITableViewCellSelectionStyleNone;
+	UISwitch *sw = [UISwitch new];
+	if (ip.row == 0) {
+		c.textLabel.text = @"Unlock Lock Screen with Face";
+		sw.tag = 1;
+		sw.on = [self facePrefBool:@"faceUnlockEnabled" dflt:YES];
+	} else {
+		c.textLabel.text = @"Stay on Lock Screen (iPhone X)";
+		sw.tag = 2;
+		sw.on = [self facePrefBool:@"faceStayOnLock" dflt:YES];
+	}
+	[sw addTarget:self action:@selector(onSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+	c.accessoryView = sw;
+	return c;
+}
+
+- (void)startEnroll
+{
+	if (_busy || !_online) return;
+	_busy = YES;
+	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Enrolling Face"
+	    message:@"Look at the front camera in good lighting…\n\nStarting camera (0/5)"
+	    preferredStyle:UIAlertControllerStyleAlert];
+	[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+		(void)a;
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+			faced_rpc("STOP\n", nil);
+		});
+	}]];
+	[self presentViewController:alert animated:YES completion:nil];
+
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		NSString *res = faced_rpc("ENROLL\n", ^(NSString *line) {
+			if ([line hasPrefix:@"PROGRESS "]) {
+				NSArray *parts = [line componentsSeparatedByString:@" "];
+				if (parts.count >= 3) {
+					alert.message = [NSString stringWithFormat:@"Keep looking at the front camera…\n\nCaptured %@ / %@ samples", parts[1], parts[2]];
+				}
+			}
+		});
+		dispatch_async(dispatch_get_main_queue(), ^{
+			self->_busy = NO;
+			[alert dismissViewControllerAnimated:YES completion:^{
+				NSString *title = [res hasPrefix:@"DONE"] ? @"Face Enrolled" : @"Enrollment Failed";
+				NSString *msg = [res hasPrefix:@"DONE"] ? @"Your face has been registered for 2D Lock Screen unlock."
+				    : [NSString stringWithFormat:@"Could not complete enrollment (%@). Make sure lighting is good and no other camera app is open.", res ?: @"offline"];
+				UIAlertController *done = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+				[done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+				[self presentViewController:done animated:YES completion:nil];
+				[self refreshStatus];
+			}];
+		});
+	});
+}
+
+- (void)testScan
+{
+	if (_busy || !_online) return;
+	_busy = YES;
+	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Testing Face Unlock"
+	    message:@"Look at the front camera…"
+	    preferredStyle:UIAlertControllerStyleAlert];
+	[self presentViewController:alert animated:YES completion:nil];
+
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		NSString *res = faced_rpc("SCAN\n", nil);
+		dispatch_async(dispatch_get_main_queue(), ^{
+			self->_busy = NO;
+			[alert dismissViewControllerAnimated:YES completion:^{
+				NSString *msg = res ?: @"No response";
+				UIAlertController *done = [UIAlertController alertControllerWithTitle:@"Scan Result" message:msg preferredStyle:UIAlertControllerStyleAlert];
+				[done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+				[self presentViewController:done animated:YES completion:nil];
+			}];
+		});
+	});
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip
+{
+	[tv deselectRowAtIndexPath:ip animated:YES];
+	if (ip.section != 0) return;
+	if (ip.row == 1) {
+		[self startEnroll];
+	} else if (ip.row == 2 && _enrolled > 0) {
+		[self testScan];
+	} else if (ip.row == 3 && _enrolled > 0) {
+		UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Delete Face Data?"
+		    message:@"You will need to enroll your face again to use 2D Face Unlock."
+		    preferredStyle:UIAlertControllerStyleActionSheet];
+		[a addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *x) {
+			(void)x;
+			dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+				faced_rpc("DELETE\n", nil);
+				dispatch_async(dispatch_get_main_queue(), ^{ [self refreshStatus]; });
+			});
+		}]];
+		[a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+		[self presentViewController:a animated:YES completion:nil];
+	}
+}
+@end
+
 /* ================================================================== app */
 
 @interface HuellaAppDelegate : UIResponder <UIApplicationDelegate>
@@ -1285,7 +1570,16 @@ enum { S_FINGERS, S_USE, S_LOOK, S_OFF, S_VIB, S_SENSORS, S_STATUS, S_COUNT };
 	(void)app;
 	(void)opts;
 	self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-	self.window.rootViewController = [[UINavigationController alloc] initWithRootViewController:[MainVC new]];
+
+	UINavigationController *fpNav = [[UINavigationController alloc] initWithRootViewController:[MainVC new]];
+	fpNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Fingerprint" image:[UIImage systemImageNamed:@"touchid"] tag:0];
+
+	UINavigationController *faceNav = [[UINavigationController alloc] initWithRootViewController:[FaceUnlockVC new]];
+	faceNav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"Face Unlock" image:[UIImage systemImageNamed:@"faceid"] tag:1];
+
+	UITabBarController *tabs = [UITabBarController new];
+	tabs.viewControllers = @[ fpNav, faceNav ];
+	self.window.rootViewController = tabs;
 	[self.window makeKeyAndVisible];
 	return YES;
 }
