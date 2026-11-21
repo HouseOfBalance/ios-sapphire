@@ -40,14 +40,14 @@ index a1b2c3d..d4e5f60 100644
 +				sweet_mdp_unstaged = true;
 +			}
 +			if (!first && sweet_panel_sleep >= 1) {
-+				sender->setTimeoutUS(250000);   /* 4 Hz idle check while panel off */
++				sender->setTimeoutUS(50000);    /* 20 Hz idle check while panel off (50 ms max wake latency) */
 +			} else {
 +				fb->armVsync(sender);
 +			}
  			return;
  		}
  		if (fb->fFadeOrig != NULL) {
-@@ -2018,5 +2033,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+@@ -2018,5 +2033,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  				sweet_fb_panel_off_abs = mach_absolute_time();  /* 0324: tap to wake */
  				sweet_fb_panel_off = off ? 1 : 0;
  				fFB->fFadeStep = 0;
@@ -59,7 +59,6 @@ index a1b2c3d..d4e5f60 100644
 +						__asm__ volatile("dsb sy" ::: "memory");
 +						sweet_mdp_unstaged = false;
 +					}
-+					fFB->armVsync(fFB->fVsync);
 +				}
  				if (off) {
  					fFB->fDirty = true;
