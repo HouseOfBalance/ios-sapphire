@@ -1,0 +1,97 @@
+From: Sapphire Port <sapphire@xiaomi>
+Subject: [PATCH] sapphire-0360: live kern.sweet_fb_hz sysctl and fix FT5452 keyboard double-taps
+
+1. Expose kern.sweet_fb_hz (60, 90, 120, 180, 240 Hz) in SweetFramebuffer.cpp
+   so SapphireTools can switch between 60 Hz locked (zero 3:2 pulldown judder)
+   and 120 Hz live with a simple backboardd respring instead of reflashing.
+2. Restore IRQ-paced polling on FT5452 in bsd/dev/sweet_touch.c (late_after=12 ms,
+   touch_quiet_ms=45 ms, idle tick divisor 10) to eliminate false mid-frame
+   double-taps while typing on the keyboard.
+---
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 8f2840c..b1a2c3d 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -480,7 +480,7 @@ static int sweet_touch_stale, sweet_touch_same_ms;
+  * kern.sweet_touch_quiet: releases by this rule; kern.sweet_touch_irq_gap_ms: the longest time
+  * without IRQ seen inside an identical run that ended on its own (a held finger: should stay small).
+  */
+-static unsigned touch_quiet_ms = 120;     /* 0358: > 58 ms max IRQ gap on FT5452 to prevent false mid-touch releases */
++static unsigned touch_quiet_ms = 45;      /* 0360: balanced quiet release without holding taps or double-tapping */
+ static int sweet_touch_quiet, sweet_touch_irq_gap_ms;
+ static uint64_t touch_irq_last;         /* when the IRQ line was last seen low */
+ static uint64_t touch_rate_down_abs;
+@@ -1104,10 +1104,10 @@ touch_thread(void *arg, wait_result_t result)
+ 	 * With no finger down, 10 ms as before.
+ 	 */
+ 	nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &period_down);
+-	nanoseconds_to_absolutetime(8 * NSEC_PER_MSEC, &period_up);
++	nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &period_up);
+ 	uint64_t period_fast, late_after, last_read = 0;
+ 	nanoseconds_to_absolutetime(500 * NSEC_PER_USEC, &period_fast);
+-	nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &late_after);
++	nanoseconds_to_absolutetime(12 * NSEC_PER_MSEC, &late_after);
+ 	while (!st.dead) {
+ 		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
+ 			panic("SWEET TOUCH stats: frames=%u errs=%u lasterr=%d maxn=%u hid down=%u up=%u last=%d,%d | "
+@@ -1139,7 +1139,7 @@ touch_thread(void *arg, wait_result_t result)
+ 				}
+ 			}
+ 		} else {
+-			want = !st.irq_hint || st.active || irq_low || (++ticks % 2u) == 0;
++			want = !st.irq_hint || st.active || irq_low || (++ticks % 10u) == 0;
+ 		}
+ 		if (want) {
+ 			last_read = mach_absolute_time();
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6ab129c..9c8d7e6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -287,6 +287,7 @@ public:
+ 	bool present(const uint8_t *rec);
+ 	void presentNow(const uint8_t *rec, SweetSurface **held);
+ 	void presentHeld(bool late);
++	void setRateHz(uint32_t hz);
+ 	IOLock       *fPresentLock;   /* 0201: present() from SwapEnd and from the vsync timer */
+ 	bool          fNow;           /* 0201: boot-arg sweetfb_now (default 1): present at SwapEnd */
+ };
+@@ -700,6 +701,18 @@ AppleCLCD::publishModes(void)
+ 	OSSafeReleaseNULL(timing);
+ }
+ 
++void
++AppleCLCD::setRateHz(uint32_t hz)
++{
++	uint32_t clamped = hz >= 240 ? 240 : hz >= 180 ? 180 : hz >= 120 ? 120 : hz >= 90 ? 90 : 60;
++	IOLockLock(fLock);
++	fRateHz = clamped;
++	fNextVsync = 0;
++	IOLockUnlock(fLock);
++	publishModes();
++	IOLog("SWEET FB: kern.sweet_fb_hz -> %u Hz (respring backboardd to apply)\n", clamped);
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -2404,6 +2417,19 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG
+     NULL, 0, sweet_fb_ids_sysctl, "S", "0321: the IOSurface ids swapped onto the panel lately");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_surface, CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     &sweet_fb_surface_id, 0, "0356: the IOSurface id last presented on layer 0");
++static int
++sweet_fb_hz_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	AppleCLCD *fb = sweet_frame_fb;
++	int hz = fb != NULL ? (int)fb->fRateHz : 60;
++	int error = sysctl_handle_int(oidp, &hz, 0, req);
++	if (error == 0 && req->newptr != USER_ADDR_NULL && fb != NULL) {
++		fb->setRateHz((uint32_t)(hz > 0 ? hz : 60));
++	}
++	return error;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_hz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    NULL, 0, sweet_fb_hz_sysctl, "I", "0360: live display vsync/CoreAnimation rate (60, 90, 120, 180, 240 Hz)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flipflush, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flipflush, 0,
+     "sapphire 0304: 1 = flush the whole flip buffer after each 2x GPU copy (as before)");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_await, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,

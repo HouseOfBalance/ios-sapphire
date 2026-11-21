@@ -2312,6 +2312,32 @@ static NSString *SWCamdCommand(NSString *cmd, double timeoutSec) {
     UIColor *blue = UIColor.systemBlueColor;
 
     // ---------- Graphics & Metal ----------
+    [self addCell:[self buttonCell:@"Preset A: 60Hz Locked (0% Cà giật, Nét 100%)" color:UIColor.systemGreenColor]
+        toSection:SecGraphics action:^{
+            SWSysctlSetInt(@"kern.sweet_fb_hz", 60, nil);
+            SWSysctlSetInt(kSysRScale, 1000, nil);
+            SWSysctlSetInt(@"kern.sweet_sched", 5, nil);
+            SWSysctlSetInt(kSysFlipFlush, 0, nil);
+            SWWriteMetalTokens(@[], nil);
+            SWToast(ws.view, @"Đã đặt 60Hz Locked + Nét 100% (đang Respring…)");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                SWKillProcesses(@[@"backboardd", @"SpringBoard"]);
+            });
+        }];
+
+    [self addCell:[self buttonCell:@"Preset B: 120Hz Smooth (Scale 75%, Siêu mượt)" color:blue]
+        toSection:SecGraphics action:^{
+            SWSysctlSetInt(@"kern.sweet_fb_hz", 120, nil);
+            SWSysctlSetInt(kSysRScale, 750, nil);
+            SWSysctlSetInt(@"kern.sweet_sched", 5, nil);
+            SWSysctlSetInt(kSysFlipFlush, 0, nil);
+            SWWriteMetalTokens(@[], nil);
+            SWToast(ws.view, @"Đã đặt 120Hz + Scale 75% (đang Respring…)");
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                SWKillProcesses(@[@"backboardd", @"SpringBoard"]);
+            });
+        }];
+
     self.metalSeg = [[UISegmentedControl alloc] initWithItems:@[@"Off", @"SapphireMetal", @"HakiosMetal"]];
     [self.metalSeg addTarget:self action:@selector(metalChanged:) forControlEvents:UIControlEventValueChanged];
     self.metalValue = SWValueLabel();
