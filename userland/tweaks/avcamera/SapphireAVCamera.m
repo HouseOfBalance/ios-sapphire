@@ -491,11 +491,27 @@ vision_symbology_to_av(VNBarcodeSymbology sym)
 	IOSurfaceRef surf = (surfId != 0) ? IOSurfaceLookup(surfId) : NULL;
 	const uint8_t *shmPixels = (const uint8_t *)self.shm + self.shm->header_size + (size_t)slot * self.shm->slot_size;
 
-	/* 1. Update all attached AVCaptureVideoPreviewLayers on main thread (zero-copy) */
-	if (surf != NULL) {
-		NSArray *layers = self.previewLayers.allObjects;
-		if (layers.count > 0) {
+	/* 1. Update all attached AVCaptureVideoPreviewLayers on main thread */
+	NSArray *layers = self.previewLayers.allObjects;
+	if (layers.count > 0) {
+		id layerContent = nil;
+		CGImageRef cgImg = NULL;
+		if (surf != NULL) {
 			CFRetain(surf);
+			layerContent = (__bridge id)surf;
+		} else {
+			NSData *copyData = [NSData dataWithBytes:shmPixels length:(size_t)stride * h];
+			CGDataProviderRef prov = CGDataProviderCreateWithCFData((__bridge CFDataRef)copyData);
+			CGColorSpaceRef csRef = CGColorSpaceCreateDeviceRGB();
+			if (prov && csRef) {
+				cgImg = CGImageCreate(w, h, 8, 32, stride, csRef,
+				    kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst, prov, NULL, false, kCGRenderingIntentDefault);
+				layerContent = (__bridge id)cgImg;
+			}
+			if (prov) CGDataProviderRelease(prov);
+			if (csRef) CGColorSpaceRelease(csRef);
+		}
+		if (layerContent != nil) {
 			dispatch_async(dispatch_get_main_queue(), ^{
 				[CATransaction begin];
 				[CATransaction setDisableActions:YES];
@@ -510,10 +526,11 @@ vision_symbology_to_av(VNBarcodeSymbology sym)
 					}
 					child.frame = pl.bounds;
 					child.contentsGravity = map_video_gravity(pl.videoGravity);
-					child.contents = (__bridge id)surf;
+					child.contents = layerContent;
 				}
 				[CATransaction commit];
-				CFRelease(surf);
+				if (surf != NULL) CFRelease(surf);
+				if (cgImg != NULL) CGImageRelease(cgImg);
 			});
 		}
 	}

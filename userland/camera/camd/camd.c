@@ -30,8 +30,6 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
-#include <CoreFoundation/CoreFoundation.h>
-#include <IOSurface/IOSurfaceRef.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -850,46 +848,6 @@ shm_slot(unsigned i)
 
 /* ================================================================== preview (camq) */
 #define RENDER_CHUNKS 4
-static IOSurfaceRef pv_surf[CAMD_SHM_SLOTS];
-static uint32_t pv_surf_w[CAMD_SHM_SLOTS], pv_surf_h[CAMD_SHM_SLOTS];
-
-static IOSurfaceRef
-ensure_pv_surface(unsigned slot, int ow, int oh, long stride)
-{
-	if (pv_surf[slot] != NULL && pv_surf_w[slot] == (uint32_t)ow && pv_surf_h[slot] == (uint32_t)oh) {
-		return pv_surf[slot];
-	}
-	if (pv_surf[slot] != NULL) {
-		CFRelease(pv_surf[slot]);
-		pv_surf[slot] = NULL;
-	}
-	int w = ow, h = oh, bpe = 4, bpr = (int)stride, pf = 0x42475241; /* 'BGRA' */
-	CFNumberRef nW = CFNumberCreate(NULL, kCFNumberIntType, &w);
-	CFNumberRef nH = CFNumberCreate(NULL, kCFNumberIntType, &h);
-	CFNumberRef nBPE = CFNumberCreate(NULL, kCFNumberIntType, &bpe);
-	CFNumberRef nBPR = CFNumberCreate(NULL, kCFNumberIntType, &bpr);
-	CFNumberRef nPF = CFNumberCreate(NULL, kCFNumberIntType, &pf);
-	const void *keys[6] = {
-		kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement,
-		kIOSurfaceBytesPerRow, kIOSurfacePixelFormat, CFSTR("IOSurfaceIsGlobal")
-	};
-	const void *vals[6] = { nW, nH, nBPE, nBPR, nPF, kCFBooleanTrue };
-	CFDictionaryRef props = CFDictionaryCreate(NULL, keys, vals, 6, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	IOSurfaceRef s = props ? IOSurfaceCreate(props) : NULL;
-	if (props) CFRelease(props);
-	if (nW) CFRelease(nW);
-	if (nH) CFRelease(nH);
-	if (nBPE) CFRelease(nBPE);
-	if (nBPR) CFRelease(nBPR);
-	if (nPF) CFRelease(nPF);
-	if (s != NULL) {
-		pv_surf[slot] = s;
-		pv_surf_w[slot] = (uint32_t)ow;
-		pv_surf_h[slot] = (uint32_t)oh;
-		shm->reserved[slot] = (uint32_t)IOSurfaceGetID(s);
-	}
-	return s;
-}
 
 typedef struct {
 	const uint8_t *raw;
@@ -920,26 +878,14 @@ render_frame(const uint8_t *raw, int mode, uint64_t ts_ns, PvStats *out)
 	pv_geometry(&j.r, &j.p, &B, &S, &ow, &oh);
 	if (ow > CAMD_SHM_MAXDIM || oh > CAMD_SHM_MAXDIM) return false;
 	unsigned slot = (shm->latest + 1) % CAMD_SHM_SLOTS;
+	j.dst = shm_slot(slot);
 	j.dst_stride = ((long)ow * 4 + 63) & ~63L;
-	IOSurfaceRef surf = ensure_pv_surface(slot, ow, oh, j.dst_stride);
-	if (surf != NULL && IOSurfaceLock(surf, 0, NULL) == 0) {
-		j.dst = (uint8_t *)IOSurfaceGetBaseAddress(surf);
-		j.dst_stride = (long)IOSurfaceGetBytesPerRow(surf);
-	} else {
-		surf = NULL;
-		j.dst = shm_slot(slot);
-	}
+	shm->reserved[slot] = 0;
 	j.rows = (j.r.h - B) / S + 1;
 	dispatch_apply(RENDER_CHUNKS, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t k) {
 		int a = (int)((long)j.rows * (long)k / RENDER_CHUNKS), b = (int)((long)j.rows * (long)(k + 1) / RENDER_CHUNKS);
 		pv_render_rows(j.raw, &j.r, &j.p, a, b, j.dst, j.dst_stride, &j.st[k]);
 	});
-	if (surf != NULL) {
-		/* Keep shm copy updated for legacy clients (af_frame / SapphireTools) */
-		size_t bytes = (size_t)j.dst_stride * (size_t)oh;
-		if (bytes <= CAMD_SHM_SLOT_SIZE) memcpy(shm_slot(slot), j.dst, bytes);
-		IOSurfaceUnlock(surf, 0, NULL);
-	}
 	PvStats st;
 	memset(&st, 0, sizeof st);
 	for (int k = 0; k < RENDER_CHUNKS; k++) pv_stats_merge(&st, &j.st[k]);

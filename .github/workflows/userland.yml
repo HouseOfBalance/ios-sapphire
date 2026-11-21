@@ -131,7 +131,7 @@ jobs:
           clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -fobjc-arc -dynamiclib \
             -install_name /var/jb/usr/lib/TweakInject/SapphireAVCamera.dylib \
             -o obj/SapphireAVCamera.dylib tweaks/avcamera/SapphireAVCamera.m \
-            -framework AVFoundation -framework CoreMedia -framework CoreVideo -framework Foundation \
+            -framework AVFoundation -framework CoreGraphics -framework CoreMedia -framework CoreVideo -framework Foundation \
             -framework IOSurface -framework QuartzCore -framework UIKit -framework Vision -lobjc
           codesign --force --sign - obj/SapphireAVCamera.dylib
           cp tweaks/avcamera/SapphireAVCamera.plist obj/
