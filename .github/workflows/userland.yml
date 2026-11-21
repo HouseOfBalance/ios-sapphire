@@ -149,7 +149,7 @@ jobs:
           clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -fobjc-arc -dynamiclib \
             -install_name /var/jb/usr/lib/TweakInject/SapphireFaceID.dylib \
             -o obj/SapphireFaceID.dylib faceid/SapphireFaceID.m \
-            -framework Foundation -framework UIKit -lobjc
+            -framework Foundation -framework UIKit -framework CoreGraphics -framework QuartzCore -lobjc
           codesign --force --sign - obj/SapphireFaceID.dylib
           cp faceid/SapphireFaceID.plist obj/
 

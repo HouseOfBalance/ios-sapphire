@@ -76,14 +76,6 @@ faced_has_enrolled_face(void)
 }
 
 static BOOL
-bio_any_enrolled_and_enabled(void)
-{
-	if (bio_apps_enabled() && fpd_has_enrolled_fingers()) return YES;
-	if (face_apps_enabled() && faced_has_enrolled_face()) return YES;
-	return NO;
-}
-
-static BOOL
 fpd_has_enrolled_fingers(void)
 {
 	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -112,6 +104,14 @@ fpd_has_enrolled_fingers(void)
 	}
 	close(fd);
 	return ok;
+}
+
+static BOOL
+bio_any_enrolled_and_enabled(void)
+{
+	if (bio_apps_enabled() && fpd_has_enrolled_fingers()) return YES;
+	if (face_apps_enabled() && faced_has_enrolled_face()) return YES;
+	return NO;
 }
 
 static UIWindow *
