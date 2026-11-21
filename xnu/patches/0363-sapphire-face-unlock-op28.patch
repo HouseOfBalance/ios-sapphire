@@ -11,7 +11,7 @@ diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
 index a2b3c4d..e5f6a7b 100644
 --- a/iokit/Kernel/arm/SweetQsee.cpp
 +++ b/iokit/Kernel/arm/SweetQsee.cpp
-@@ -2640,6 +2640,29 @@ fp_bio_unlock(void)
+@@ -2640,5 +2640,31 @@ fp_bio_unlock(void)
  	return r;
  }
  
@@ -44,7 +44,7 @@ index a2b3c4d..e5f6a7b 100644
  /* op 12: AUTH_CANCEL, sensor off */
  static int
  fp_stop(void)
-@@ -2730,6 +2753,12 @@ sweet_qsee_op(int op)
+@@ -2730,6 +2756,12 @@ sweet_qsee_op(int op)
  	case 27:
  		r = fp_bio_unlock();
  		break;
