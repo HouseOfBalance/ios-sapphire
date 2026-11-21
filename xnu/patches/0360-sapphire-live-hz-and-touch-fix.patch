@@ -57,10 +57,12 @@ index 6ab129c..9c8d7e6 100644
  	IOLock       *fPresentLock;   /* 0201: present() from SwapEnd and from the vsync timer */
  	bool          fNow;           /* 0201: boot-arg sweetfb_now (default 1): present at SwapEnd */
  };
-@@ -700,6 +701,18 @@ AppleCLCD::publishModes(void)
- 	OSSafeReleaseNULL(timing);
+@@ -2402,8 +2403,33 @@ sweet_fb_ids_sysctl SYSCTL_HANDLER_ARGS
  }
- 
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_ids_sysctl, "S", "0321: the IOSurface ids swapped onto the panel lately");
+ SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_surface, CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     &sweet_fb_surface_id, 0, "0356: the IOSurface id last presented on layer 0");
 +void
 +AppleCLCD::setRateHz(uint32_t hz)
 +{
@@ -72,16 +74,6 @@ index 6ab129c..9c8d7e6 100644
 +	publishModes();
 +	IOLog("SWEET FB: kern.sweet_fb_hz -> %u Hz (respring backboardd to apply)\n", clamped);
 +}
-+
- void
- AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
- {
-@@ -2402,8 +2415,22 @@ sweet_fb_ids_sysctl SYSCTL_HANDLER_ARGS
- }
- SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
-     NULL, 0, sweet_fb_ids_sysctl, "S", "0321: the IOSurface ids swapped onto the panel lately");
- SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_surface, CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
-     &sweet_fb_surface_id, 0, "0356: the IOSurface id last presented on layer 0");
 +static int
 +sweet_fb_hz_sysctl SYSCTL_HANDLER_ARGS
 +{
