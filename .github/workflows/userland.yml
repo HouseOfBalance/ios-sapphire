@@ -119,6 +119,13 @@ jobs:
           cp com.sapphire.toolsd.plist ../../obj/
           cd ../..
 
+          # 6. Build standalone brightness bridge for backboardd (sweetmetal=2)
+          echo "Building SapphireBrightness..."
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -dynamiclib -install_name /redwood/lib/SapphireBrightness.dylib -o obj/SapphireBrightness.dylib brightness/SapphireBrightness.c -framework CoreFoundation -framework IOKit -lobjc
+          codesign --force --sign - obj/SapphireBrightness.dylib
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/bkstart brightness/bkstart.c
+          codesign --force --sign - obj/bkstart
+
           ls -la obj/
 
       - uses: actions/upload-artifact@v4
