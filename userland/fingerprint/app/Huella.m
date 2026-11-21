@@ -1689,14 +1689,16 @@ faced_rpc(const char *cmd, void (^onLine)(NSString *line))
 	}
 	__weak typeof(self) ws = self;
 	vc.completion = ^(BOOL success, NSString *detail) {
-		ws->_busy = NO;
+		typeof(self) strongSelf = ws;
+		if (!strongSelf) return;
+		strongSelf->_busy = NO;
 		NSString *title = success ? @"Face Enrolled" : @"Enrollment Failed";
 		NSString *msg = success ? @"Your face has been registered for 2D Face Unlock and Apps & Purchases."
 		    : [NSString stringWithFormat:@"Could not complete enrollment (%@). Ensure good lighting and look straight ahead.", detail ?: @"error"];
 		UIAlertController *done = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
 		[done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-		[ws presentViewController:done animated:YES completion:nil];
-		[ws refreshStatus];
+		[strongSelf presentViewController:done animated:YES completion:nil];
+		[strongSelf refreshStatus];
 	};
 	[self presentViewController:vc animated:YES completion:nil];
 }
