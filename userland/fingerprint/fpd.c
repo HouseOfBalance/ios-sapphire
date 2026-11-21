@@ -96,6 +96,8 @@
 #define OP_AUTH_ARG     20
 #define OP_AUTH         26
 #define OP_UNLOCK       27
+#define OP_FACE_UNLOCK  28
+#define OP_FACE_FAIL    29
 #define ARG_SPOT        0x100           /* kern.sweet_qsee_arg bit 8: the spot lit by local HBM */
 #define GF_NOT_MATCH    (-1008)
 #define GF_LIFTED       (-4)
@@ -1521,6 +1523,22 @@ handle_line(struct client *c, char *line)
 		prefs_load();
 		reevaluate("prefs");
 		send_line(c, "OK");
+	} else if (strcmp(line, "FACE_UNLOCK") == 0) {
+		int ur = qsee_write(OP_FACE_UNLOCK);
+		if (ur == 0) {
+			notify_post("com.sapphire.face.unlocked");
+			send_line(c, "OK");
+		} else {
+			send_line(c, "ERR %d", ur);
+		}
+	} else if (strcmp(line, "FACE_FAIL") == 0) {
+		int fr = qsee_write(OP_FACE_FAIL);
+		if (fr == EPERM) {
+			notify_post(N_LOCKED_OUT);
+			send_line(c, "LOCKED_OUT");
+		} else {
+			send_line(c, "OK");
+		}
 	} else if (line[0] != 0) {
 		send_line(c, "ERR unknown");
 	}

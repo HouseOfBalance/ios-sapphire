@@ -1,0 +1,59 @@
+From: Sapphire Port <sapphire@xiaomi>
+Subject: [PATCH] sapphire-0363: add QSEE op 28 (2D face unlock) and op 29 (shared failure count)
+
+Adds kern.sweet_qsee op 28 for external lock-screen unlock (faced -> fpd) and
+op 29 to increment the shared 5-attempt lockout counter (q_fod_fails).
+Op 28 enforces the shared lockout limit (q_fod_fails < 5) and delegates to
+sweet_aks_biometric_unlock() (requires passcode set, unlocked since boot, and
+currently locked). Keeps op 27 strictly bound to QSEE TA fingerprint matches.
+---
+diff --git a/iokit/Kernel/arm/SweetQsee.cpp b/iokit/Kernel/arm/SweetQsee.cpp
+index a2b3c4d..e5f6a7b 100644
+--- a/iokit/Kernel/arm/SweetQsee.cpp
++++ b/iokit/Kernel/arm/SweetQsee.cpp
+@@ -2640,6 +2640,29 @@ fp_bio_unlock(void)
+ 	return r;
+ }
+ 
++/* op 28: lock-screen unlock from external verifier (2D Face Unlock via fpd), sharing q_fod_fails */
++static int
++fp_face_unlock(void)
++{
++	if (q_fod_fails >= 5) {
++		LOGA("op 28: face unlock refused (locked out: %u failed attempts)", q_fod_fails);
++		return EPERM;
++	}
++	q_match_fid = 0xFA0E2D01u;
++	q_match_abs = mach_absolute_time();
++	int r = sweet_aks_biometric_unlock();
++	if (r == 0) {
++		q_fod_fails = 0;
++	}
++	LOGA("op 28: face unlock: %s", r == 0 ? "UNLOCKED" : "refused (see SWEET AKS)");
++	return r;
++}
++
++static int
++fp_face_fail(void)
++{
++	q_fod_fails++;
++	LOGA("op 29: face unlock fail (%u failed attempts)", q_fod_fails);
++	return q_fod_fails >= 5 ? EPERM : 0;
++}
++
+ /* op 12: AUTH_CANCEL, sensor off */
+ static int
+ fp_stop(void)
+@@ -2730,6 +2753,12 @@ sweet_qsee_op(int op)
+ 	case 27:
+ 		r = fp_bio_unlock();
+ 		break;
++	case 28:
++		r = fp_face_unlock();
++		break;
++	case 29:
++		r = fp_face_fail();
++		break;
+ 	case 12:
+ 		r = fp_stop();
+ 		break;

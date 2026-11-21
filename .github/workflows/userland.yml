@@ -141,6 +141,18 @@ jobs:
           clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/sapphire-gpsd gps/sapphire-gpsd.c
           codesign --force --sign - obj/sapphire-gpsd
 
+          # 9. Build 2D Face Unlock daemon (faced) + SpringBoard tweak (SapphireFaceID)
+          echo "Building faced + SapphireFaceID..."
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -o obj/faced faceid/faced.c -lm -lpthread
+          codesign --force --sign - obj/faced
+          cp faceid/com.sapphire.faced.plist obj/
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK_PATH" -O2 -Wall -fobjc-arc -dynamiclib \
+            -install_name /var/jb/usr/lib/TweakInject/SapphireFaceID.dylib \
+            -o obj/SapphireFaceID.dylib faceid/SapphireFaceID.m \
+            -framework Foundation -framework UIKit -lobjc
+          codesign --force --sign - obj/SapphireFaceID.dylib
+          cp faceid/SapphireFaceID.plist obj/
+
           ls -la obj/
 
       - uses: actions/upload-artifact@v4

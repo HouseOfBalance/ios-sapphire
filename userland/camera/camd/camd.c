@@ -249,7 +249,7 @@ struct client {
 	dispatch_source_t rs;
 	char buf[1024];
 	size_t n;
-	bool gone, wants_preview;
+	bool gone, wants_preview, is_face;
 	int mode;
 	double want_at;
 	struct client *next;
@@ -1698,8 +1698,25 @@ handle_line(struct client *c, char *line)
 			return;
 		}
 		int m = atoi(args);
+		bool face = (strstr(args, "FACE") != NULL);
+		if (face) {
+			for (struct client *o = clients; o; o = o->next) {
+				if (!o->gone && o->wants_preview && !o->is_face) {
+					reply(c, "ERR busy");
+					return;
+				}
+			}
+		} else {
+			for (struct client *o = clients; o; o = o->next) {
+				if (!o->gone && o->wants_preview && o->is_face) {
+					o->wants_preview = false;
+					reply(o, "PREEMPTED");
+				}
+			}
+		}
 		if (m != 1 && m != 3 && m != 4 && !(m >= 11 && m <= 13 && camk.ring)) m = default_preview_mode();
 		if (m == 3 && !camk.ring) m = 1;
+		c->is_face = face;
 		c->wants_preview = true;
 		c->mode = m;
 		c->want_at = now_s();
