@@ -27,8 +27,10 @@ static int g_tok_prox = -1;
 static BOOL g_enabled = YES;
 static BOOL g_stay_on_lock = YES;
 static BOOL g_scanning = NO;
-static UIWindow *g_pill_win = nil;
+static UIWindow *g_lock_win = nil;
+static UIImageView *g_lock_icon = nil;
 static UILabel *g_pill_lbl = nil;
+static UIVisualEffectView *g_blur = nil;
 
 static void
 load_prefs(void)
@@ -82,39 +84,93 @@ faced_send_async(const char *cmd, void (^completion)(NSString *reply))
 }
 
 static void
+ensure_lock_ui(void)
+{
+	if (g_lock_win) return;
+	CGRect sb = [UIScreen mainScreen].bounds;
+	/* Native iPhone X Face ID padlock at top center: y=50, w=150, h=34 */
+	g_lock_win = [[UIWindow alloc] initWithFrame:CGRectMake((sb.size.width - 150) / 2.0, 50, 150, 34)];
+	g_lock_win.windowLevel = UIWindowLevelAlert + 50;
+	g_lock_win.backgroundColor = [UIColor clearColor];
+	g_lock_win.userInteractionEnabled = NO;
+
+	g_blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+	g_blur.frame = g_lock_win.bounds;
+	g_blur.layer.cornerRadius = 17;
+	g_blur.clipsToBounds = YES;
+	[g_lock_win addSubview:g_blur];
+
+	/* Center Lock Icon */
+	g_lock_icon = [[UIImageView alloc] initWithFrame:CGRectMake((150 - 20) / 2.0, (34 - 24) / 2.0, 20, 24)];
+	g_lock_icon.contentMode = UIViewContentModeScaleAspectFit;
+	g_lock_icon.tintColor = [UIColor whiteColor];
+	g_lock_icon.image = [UIImage systemImageNamed:@"lock.fill"];
+	[g_blur.contentView addSubview:g_lock_icon];
+
+	/* Pill Status Label (for Face Not Recognized or Face ID...) */
+	g_pill_lbl = [[UILabel alloc] initWithFrame:g_blur.bounds];
+	g_pill_lbl.textAlignment = NSTextAlignmentCenter;
+	g_pill_lbl.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+	g_pill_lbl.textColor = [UIColor whiteColor];
+	g_pill_lbl.hidden = YES;
+	[g_blur.contentView addSubview:g_pill_lbl];
+}
+
+static void
+show_locked_icon(void)
+{
+	dispatch_async(dispatch_get_main_queue(), ^{
+		ensure_lock_ui();
+		g_lock_icon.hidden = NO;
+		g_lock_icon.image = [UIImage systemImageNamed:@"lock.fill"];
+		g_lock_icon.tintColor = [UIColor whiteColor];
+		g_lock_icon.transform = CGAffineTransformIdentity;
+		g_pill_lbl.hidden = YES;
+		g_lock_win.alpha = 1.0;
+		g_lock_win.hidden = NO;
+	});
+}
+
+static void
+animate_unlocked_icon(void)
+{
+	dispatch_async(dispatch_get_main_queue(), ^{
+		ensure_lock_ui();
+		g_lock_icon.hidden = NO;
+		g_pill_lbl.hidden = YES;
+		g_lock_icon.tintColor = [UIColor systemGreenColor];
+		g_lock_icon.image = [UIImage systemImageNamed:@"lock.open.fill"];
+
+		/* iPhone X style pop spring animation */
+		g_lock_icon.transform = CGAffineTransformMakeScale(0.7, 0.7);
+		[UIView animateWithDuration:0.45 delay:0 usingSpringWithDamping:0.45 initialSpringVelocity:6.0 options:UIViewAnimationOptionCurveEaseInOut animations:^{
+			g_lock_icon.transform = CGAffineTransformMakeScale(1.15, 1.15);
+		} completion:^(BOOL finished) {
+			[UIView animateWithDuration:0.2 animations:^{
+				g_lock_icon.transform = CGAffineTransformIdentity;
+			}];
+		}];
+	});
+}
+
+static void
 show_pill(NSString *text, UIColor *tint, NSTimeInterval autoHide)
 {
 	dispatch_async(dispatch_get_main_queue(), ^{
-		if (!g_pill_win) {
-			CGRect sb = [UIScreen mainScreen].bounds;
-			g_pill_win = [[UIWindow alloc] initWithFrame:CGRectMake((sb.size.width - 170) / 2.0, 52, 170, 32)];
-			g_pill_win.windowLevel = UIWindowLevelAlert + 50;
-			g_pill_win.backgroundColor = [UIColor clearColor];
-			g_pill_win.userInteractionEnabled = NO;
-
-			UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
-			blur.frame = g_pill_win.bounds;
-			blur.layer.cornerRadius = 16;
-			blur.clipsToBounds = YES;
-			[g_pill_win addSubview:blur];
-
-			g_pill_lbl = [[UILabel alloc] initWithFrame:blur.bounds];
-			g_pill_lbl.textAlignment = NSTextAlignmentCenter;
-			g_pill_lbl.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-			[blur.contentView addSubview:g_pill_lbl];
-		}
+		ensure_lock_ui();
+		g_lock_icon.hidden = YES;
+		g_pill_lbl.hidden = NO;
 		g_pill_lbl.text = text;
 		g_pill_lbl.textColor = tint ?: [UIColor whiteColor];
-		g_pill_win.alpha = 1.0;
-		g_pill_win.hidden = NO;
+		g_lock_win.alpha = 1.0;
+		g_lock_win.hidden = NO;
 
 		if (autoHide > 0) {
 			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(autoHide * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
 				[UIView animateWithDuration:0.25 animations:^{
-					g_pill_win.alpha = 0.0;
+					g_lock_win.alpha = 0.0;
 				} completion:^(BOOL finished) {
-					(void)finished;
-					if (g_pill_win.alpha == 0.0) g_pill_win.hidden = YES;
+					if (g_lock_win.alpha == 0.0) g_lock_win.hidden = YES;
 				}];
 			});
 		}
@@ -122,10 +178,16 @@ show_pill(NSString *text, UIColor *tint, NSTimeInterval autoHide)
 }
 
 static void
-hide_pill(void)
+hide_lock_ui(void)
 {
 	dispatch_async(dispatch_get_main_queue(), ^{
-		if (g_pill_win) g_pill_win.hidden = YES;
+		if (g_lock_win) {
+			[UIView animateWithDuration:0.2 animations:^{
+				g_lock_win.alpha = 0.0;
+			} completion:^(BOOL finished) {
+				g_lock_win.hidden = YES;
+			}];
+		}
 	});
 }
 
@@ -149,22 +211,33 @@ static void
 maybe_start_face_scan(void)
 {
 	load_prefs();
-	if (!g_enabled || g_scanning) return;
 	if (get_notify_state(g_tok_blank) != 0) return;  /* screen off */
 	if (get_notify_state(g_tok_lock) == 0) return;   /* already unlocked */
 	if (get_notify_state(g_tok_state) == 0) return;  /* not enrolled */
+
+	/* Always show locked padlock icon on Lock Screen */
+	show_locked_icon();
+
+	if (!g_enabled || g_scanning) return;
 	if (get_notify_state(g_tok_prox) != 0) return;   /* pocket / near */
 
 	g_scanning = YES;
-	show_pill(@"Face ID...", [UIColor whiteColor], 0);
 	faced_send_async("SCAN\n", ^(NSString *reply) {
 		g_scanning = NO;
 		if ([reply hasPrefix:@"MATCH"]) {
-			show_pill(@"Unlocked", [UIColor systemGreenColor], 1.2);
+			animate_unlocked_icon();
+			notify_post("com.sapphire.vib.success");
+			if (!g_stay_on_lock) {
+				dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(350 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+					hide_lock_ui();
+				});
+			}
 		} else if ([reply hasPrefix:@"NOMATCH"]) {
-			show_pill(@"Face Not Recognized", [UIColor systemOrangeColor], 1.2);
-		} else {
-			hide_pill();
+			show_pill(@"Face Not Recognized", [UIColor systemOrangeColor], 1.5);
+			notify_post("com.sapphire.vib.error");
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1600 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+				if (get_notify_state(g_tok_lock) != 0) show_locked_icon();
+			});
 		}
 	});
 }
@@ -185,7 +258,7 @@ sapphire_faceid_init(void)
 		uint64_t blanked = 0;
 		notify_get_state(token, &blanked);
 		if (blanked == 0) {
-			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(100 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
 				maybe_start_face_scan();
 			});
 		} else {
@@ -193,23 +266,28 @@ sapphire_faceid_init(void)
 				faced_send_async("STOP\n", nil);
 				g_scanning = NO;
 			}
-			hide_pill();
+			hide_lock_ui();
 		}
 	});
 
 	notify_register_dispatch("com.apple.springboard.lockstate", &t2, dispatch_get_main_queue(), ^(int token) {
 		uint64_t locked = 0;
 		notify_get_state(token, &locked);
-		if (locked == 0 && g_scanning) {
-			faced_send_async("STOP\n", nil);
-			g_scanning = NO;
-			hide_pill();
+		if (locked == 0) {
+			if (g_scanning) {
+				faced_send_async("STOP\n", nil);
+				g_scanning = NO;
+			}
+			hide_lock_ui();
+		} else {
+			maybe_start_face_scan();
 		}
 	});
 
 	notify_register_dispatch("com.sapphire.face.unlocked", &t3, dispatch_get_main_queue(), ^(int token) {
 		(void)token;
 		load_prefs();
+		animate_unlocked_icon();
 		unlock_lockscreen_ui();
 	});
 }

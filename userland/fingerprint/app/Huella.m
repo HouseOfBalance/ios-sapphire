@@ -8,10 +8,14 @@
  */
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <notify.h>
+#include "../../camera/camd/camd_proto.h"
 
 #define SOCK_PATH   "/var/run/fpd.sock"
 #define PREFS_PATH  @"/var/mobile/Library/Preferences/com.sapphire.fingerprint.plist"
@@ -1404,13 +1408,13 @@ faced_rpc(const char *cmd, void (^onLine)(NSString *line))
 {
 	(void)tv;
 	if (s == 0) return _enrolled > 0 ? 4 : 2;
-	return 2;
+	return 3;
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s
 {
 	(void)tv;
-	return s == 0 ? @"Face Recognition (Front Camera)" : @"Lock Screen Behavior";
+	return s == 0 ? @"Face Recognition (Front Camera)" : @"Behavior & Permissions";
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s
@@ -1419,13 +1423,14 @@ faced_rpc(const char *cmd, void (^onLine)(NSString *line))
 	if (s == 0) {
 		return @"Look directly at the front camera in good lighting while enrolling. 5 samples are captured automatically.";
 	}
-	return @"2D Face Unlock is for Lock Screen convenience only and shares the 5-attempt lockout with Fingerprint. Apps and Purchases always require Fingerprint.";
+	return @"2D Face Unlock uses the front camera and shares the 5-attempt lockout with Fingerprint. When 'Apps and Purchases' is enabled, supported apps and App Store authenticate seamlessly with either Face or Fingerprint.";
 }
 
 - (void)onSwitchChanged:(UISwitch *)sw
 {
 	if (sw.tag == 1) [self setFacePrefBool:sw.on key:@"faceUnlockEnabled"];
 	else if (sw.tag == 2) [self setFacePrefBool:sw.on key:@"faceStayOnLock"];
+	else if (sw.tag == 3) [self setFacePrefBool:sw.on key:@"faceAppsEnabled"];
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip
@@ -1461,53 +1466,235 @@ faced_rpc(const char *cmd, void (^onLine)(NSString *line))
 		c.textLabel.text = @"Unlock Lock Screen with Face";
 		sw.tag = 1;
 		sw.on = [self facePrefBool:@"faceUnlockEnabled" dflt:YES];
-	} else {
+	} else if (ip.row == 1) {
 		c.textLabel.text = @"Stay on Lock Screen (iPhone X)";
 		sw.tag = 2;
 		sw.on = [self facePrefBool:@"faceStayOnLock" dflt:YES];
+	} else {
+		c.textLabel.text = @"Use Face ID for Apps & Purchases";
+		sw.tag = 3;
+		sw.on = [self facePrefBool:@"faceAppsEnabled" dflt:YES];
 	}
 	[sw addTarget:self action:@selector(onSwitchChanged:) forControlEvents:UIControlEventValueChanged];
 	c.accessoryView = sw;
 	return c;
 }
 
-- (void)startEnroll
-{
-	if (_busy || !_online) return;
-	_busy = YES;
-	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Enrolling Face"
-	    message:@"Look at the front camera in good lighting…\n\nStarting camera (0/5)"
-	    preferredStyle:UIAlertControllerStyleAlert];
-	[alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
-		(void)a;
-		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-			faced_rpc("STOP\n", nil);
-		});
-	}]];
-	[self presentViewController:alert animated:YES completion:nil];
+@interface FaceEnrollSheetVC : UIViewController {
+	UIImageView *_previewView;
+	CAShapeLayer *_ovalLayer;
+	UILabel *_statusLabel;
+	UIProgressView *_progressBar;
+	UIButton *_cancelBtn;
+	int _shmFd;
+	void *_shmPtr;
+	size_t _shmLen;
+	uint64_t _lastSeq;
+	NSTimer *_timer;
+	BOOL _done;
+}
+@property (nonatomic, copy) void (^completion)(BOOL success, NSString *detail);
+@end
 
+@implementation FaceEnrollSheetVC
+
+- (void)viewDidLoad
+{
+	[super viewDidLoad];
+	self.view.backgroundColor = [UIColor systemBackgroundColor];
+	_shmFd = -1;
+	_shmPtr = MAP_FAILED;
+	_done = NO;
+
+	CGFloat w = self.view.bounds.size.width;
+	UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 20, w - 40, 28)];
+	title.text = @"Enroll Face (2D)";
+	title.font = [UIFont boldSystemFontOfSize:20];
+	title.textAlignment = NSTextAlignmentCenter;
+	[self.view addSubview:title];
+
+	_statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 52, w - 40, 40)];
+	_statusLabel.text = @"Position your face in the camera frame…";
+	_statusLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+	_statusLabel.textColor = [UIColor secondaryLabelColor];
+	_statusLabel.textAlignment = NSTextAlignmentCenter;
+	_statusLabel.numberOfLines = 2;
+	[self.view addSubview:_statusLabel];
+
+	/* Live Camera Viewport (Half-screen: 260x260 circle/oval frame) */
+	CGFloat camSize = MIN(w - 60, 260);
+	_previewView = [[UIImageView alloc] initWithFrame:CGRectMake((w - camSize) / 2.0, 100, camSize, camSize)];
+	_previewView.backgroundColor = [UIColor blackColor];
+	_previewView.layer.cornerRadius = camSize / 2.0;
+	_previewView.clipsToBounds = YES;
+	_previewView.contentMode = UIViewContentModeScaleAspectFill;
+	[self.view addSubview:_previewView];
+
+	/* Face ID Oval Guide Ring */
+	_ovalLayer = [CAShapeLayer layer];
+	_ovalLayer.path = [UIBezierPath bezierPathWithOvalInRect:CGRectInset(_previewView.bounds, 12, 6)].CGPath;
+	_ovalLayer.strokeColor = [UIColor systemGreenColor].CGColor;
+	_ovalLayer.fillColor = [UIColor clearColor].CGColor;
+	_ovalLayer.lineWidth = 3.5;
+	_ovalLayer.lineDashPattern = @[@10, @6];
+	[_previewView.layer addSublayer:_ovalLayer];
+
+	_progressBar = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
+	_progressBar.frame = CGRectMake((w - 240) / 2.0, 100 + camSize + 20, 240, 6);
+	_progressBar.progressTintColor = [UIColor systemGreenColor];
+	_progressBar.progress = 0.0;
+	[self.view addSubview:_progressBar];
+
+	_cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+	_cancelBtn.frame = CGRectMake((w - 140) / 2.0, 100 + camSize + 40, 140, 44);
+	[_cancelBtn setTitle:@"Cancel" forState:UIControlStateNormal];
+	[_cancelBtn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+	_cancelBtn.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+	[_cancelBtn addTarget:self action:@selector(cancelEnroll) forControlEvents:UIControlEventTouchUpInside];
+	[self.view addSubview:_cancelBtn];
+
+	[self startLiveStream];
+	[self runEnrollWorker];
+}
+
+- (void)openShmIfNeeded
+{
+	if (_shmPtr && _shmPtr != MAP_FAILED) return;
+	int fd = open(CAMD_SHM_PATH, O_RDONLY);
+	if (fd < 0) return;
+	struct stat st;
+	if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(CamdShm)) {
+		close(fd);
+		return;
+	}
+	void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+	if (p == MAP_FAILED) {
+		close(fd);
+		return;
+	}
+	_shmFd = fd;
+	_shmPtr = p;
+	_shmLen = (size_t)st.st_size;
+}
+
+- (void)renderFrame
+{
+	[self openShmIfNeeded];
+	if (!_shmPtr || _shmPtr == MAP_FAILED) return;
+	const CamdShm *shm = (const CamdShm *)_shmPtr;
+	if (shm->magic != CAMD_SHM_MAGIC || shm->nslots == 0) return;
+	uint32_t idx = shm->latest;
+	if (idx >= shm->nslots || idx >= CAMD_SHM_SLOTS) return;
+	CamdSlot slot = shm->slot[idx];
+	if (slot.seq == 0 || slot.seq == _lastSeq || slot.width == 0 || slot.height == 0) return;
+	size_t off = (size_t)shm->header_size + (size_t)idx * (size_t)shm->slot_size;
+	size_t need = (size_t)slot.stride * (size_t)slot.height;
+	if (off + need > _shmLen) return;
+	_lastSeq = slot.seq;
+
+	const uint8_t *pixels = (const uint8_t *)_shmPtr + off;
+	CFDataRef data = CFDataCreate(NULL, pixels, (CFIndex)need);
+	if (!data) return;
+	CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+	CGDataProviderRef prov = CGDataProviderCreateWithCFData(data);
+	CGBitmapInfo bi = (CGBitmapInfo)kCGImageAlphaNoneSkipFirst | (CGBitmapInfo)kCGBitmapByteOrder32Little;
+	CGImageRef cg = CGImageCreate(slot.width, slot.height, 8, 32, slot.stride, cs, bi, prov, NULL, false, kCGRenderingIntentDefault);
+	if (cg) {
+		_previewView.image = [UIImage imageWithCGImage:cg];
+		CGImageRelease(cg);
+	}
+	CGDataProviderRelease(prov);
+	CGColorSpaceRelease(cs);
+	CFRelease(data);
+}
+
+- (void)startLiveStream
+{
+	_timer = [NSTimer scheduledTimerWithTimeInterval:0.04 target:self selector:@selector(renderFrame) userInfo:nil repeats:YES];
+}
+
+- (void)stopLiveStream
+{
+	if (_timer) {
+		[_timer invalidate];
+		_timer = nil;
+	}
+	if (_shmPtr && _shmPtr != MAP_FAILED) {
+		munmap(_shmPtr, _shmLen);
+		_shmPtr = MAP_FAILED;
+	}
+	if (_shmFd >= 0) {
+		close(_shmFd);
+		_shmFd = -1;
+	}
+}
+
+- (void)cancelEnroll
+{
+	_done = YES;
+	[self stopLiveStream];
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		faced_rpc("STOP\n", nil);
+	});
+	if (self.completion) self.completion(NO, @"Cancelled by user");
+	[self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)runEnrollWorker
+{
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
 		NSString *res = faced_rpc("ENROLL\n", ^(NSString *line) {
 			if ([line hasPrefix:@"PROGRESS "]) {
 				NSArray *parts = [line componentsSeparatedByString:@" "];
 				if (parts.count >= 3) {
-					alert.message = [NSString stringWithFormat:@"Keep looking at the front camera…\n\nCaptured %@ / %@ samples", parts[1], parts[2]];
+					int cur = [parts[1] intValue];
+					int tot = [parts[2] intValue];
+					dispatch_async(dispatch_get_main_queue(), ^{
+						if (self->_done) return;
+						self->_progressBar.progress = (float)cur / (float)tot;
+						self->_statusLabel.text = [NSString stringWithFormat:@"Looking good! Capturing samples… (%d/%d)", cur, tot];
+					});
 				}
 			}
 		});
 		dispatch_async(dispatch_get_main_queue(), ^{
-			self->_busy = NO;
-			[alert dismissViewControllerAnimated:YES completion:^{
-				NSString *title = [res hasPrefix:@"DONE"] ? @"Face Enrolled" : @"Enrollment Failed";
-				NSString *msg = [res hasPrefix:@"DONE"] ? @"Your face has been registered for 2D Lock Screen unlock."
-				    : [NSString stringWithFormat:@"Could not complete enrollment (%@). Make sure lighting is good and no other camera app is open.", res ?: @"offline"];
-				UIAlertController *done = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
-				[done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-				[self presentViewController:done animated:YES completion:nil];
-				[self refreshStatus];
+			if (self->_done) return;
+			self->_done = YES;
+			[self stopLiveStream];
+			BOOL ok = [res hasPrefix:@"DONE"];
+			[self dismissViewControllerAnimated:YES completion:^{
+				if (self.completion) self.completion(ok, res);
 			}];
 		});
 	});
+}
+@end
+
+- (void)startEnroll
+{
+	if (_busy || !_online) return;
+	_busy = YES;
+
+	FaceEnrollSheetVC *vc = [FaceEnrollSheetVC new];
+	if (@available(iOS 15.0, *)) {
+		UISheetPresentationController *sheet = vc.sheetPresentationController;
+		if (sheet) {
+			sheet.detents = @[ [UISheetPresentationControllerDetent mediumDetent] ];
+			sheet.prefersGrabberVisible = YES;
+		}
+	}
+	__weak typeof(self) ws = self;
+	vc.completion = ^(BOOL success, NSString *detail) {
+		ws->_busy = NO;
+		NSString *title = success ? @"Face Enrolled" : @"Enrollment Failed";
+		NSString *msg = success ? @"Your face has been registered for 2D Face Unlock and Apps & Purchases."
+		    : [NSString stringWithFormat:@"Could not complete enrollment (%@). Ensure good lighting and look straight ahead.", detail ?: @"error"];
+		UIAlertController *done = [UIAlertController alertControllerWithTitle:title message:msg preferredStyle:UIAlertControllerStyleAlert];
+		[done addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+		[ws presentViewController:done animated:YES completion:nil];
+		[ws refreshStatus];
+	};
+	[self presentViewController:vc animated:YES completion:nil];
 }
 
 - (void)testScan

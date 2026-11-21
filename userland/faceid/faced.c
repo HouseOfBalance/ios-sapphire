@@ -588,7 +588,7 @@ client_thread(void *arg)
 			send_str(cfd, "OK\n");
 		} else if (strcmp(buf, "ENROLL") == 0) {
 			handle_enroll(cfd);
-		} else if (strcmp(buf, "SCAN") == 0) {
+		} else if (strcmp(buf, "SCAN") == 0 || strcmp(buf, "SCAN_BIO") == 0) {
 			handle_scan(cfd);
 		} else {
 			send_str(cfd, "ERR unknown\n");

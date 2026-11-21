@@ -18,11 +18,13 @@
 #include <unistd.h>
 #include <notify.h>
 
-#define FPD_SOCK_PATH  "/var/run/fpd.sock"
-#define FP_PREFS_PATH  @"/var/mobile/Library/Preferences/com.sapphire.fingerprint.plist"
-#define SENSOR_X       (540.0 / 1080.0)
-#define SENSOR_Y       (2109.0 / 2400.0)
-#define SENSOR_R       (105.0 / 1080.0)
+#define FPD_SOCK_PATH   "/var/run/fpd.sock"
+#define FACED_SOCK_PATH "/var/run/faced.sock"
+#define FP_PREFS_PATH   @"/var/mobile/Library/Preferences/com.sapphire.fingerprint.plist"
+#define FACE_PREFS_PATH @"/var/mobile/Library/Preferences/com.sapphire.faceid.plist"
+#define SENSOR_X        (540.0 / 1080.0)
+#define SENSOR_Y        (2109.0 / 2400.0)
+#define SENSOR_R        (105.0 / 1080.0)
 
 static BOOL
 bio_apps_enabled(void)
@@ -31,6 +33,54 @@ bio_apps_enabled(void)
 	if (d == nil) return YES; /* default ON once installed */
 	id v = d[@"appsEnabled"];
 	return v ? [v boolValue] : YES;
+}
+
+static BOOL
+face_apps_enabled(void)
+{
+	NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:FACE_PREFS_PATH];
+	if (d == nil) return YES;
+	id v = d[@"faceAppsEnabled"];
+	return v ? [v boolValue] : YES;
+}
+
+static BOOL
+faced_has_enrolled_face(void)
+{
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0) return NO;
+	struct timeval tv = { 1, 0 };
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	struct sockaddr_un a;
+	memset(&a, 0, sizeof(a));
+	a.sun_family = AF_UNIX;
+	strlcpy(a.sun_path, FACED_SOCK_PATH, sizeof(a.sun_path));
+	if (connect(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+		close(fd);
+		return NO;
+	}
+	const char *cmd = "STATUS\n";
+	BOOL ok = NO;
+	if (write(fd, cmd, strlen(cmd)) == (ssize_t)strlen(cmd)) {
+		char buf[512];
+		ssize_t n = read(fd, buf, sizeof(buf) - 1);
+		if (n > 0) {
+			buf[n] = '\0';
+			const char *f = strstr(buf, "enrolled=");
+			if (f && atoi(f + 9) > 0) ok = YES;
+		}
+	}
+	close(fd);
+	return ok;
+}
+
+static BOOL
+bio_any_enrolled_and_enabled(void)
+{
+	if (bio_apps_enabled() && fpd_has_enrolled_fingers()) return YES;
+	if (face_apps_enabled() && faced_has_enrolled_face()) return YES;
+	return NO;
 }
 
 static BOOL
@@ -86,6 +136,7 @@ bio_key_window(void)
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UIView *sensorSpot;
 @property (nonatomic, assign) int sockFd;
+@property (nonatomic, assign) int faceSockFd;
 @property (nonatomic, assign) BOOL finished;
 @property (nonatomic, assign) int attempts;
 @end
@@ -98,6 +149,9 @@ bio_key_window(void)
 	if (!self) return nil;
 	_replyBlock = [reply copy];
 	_sockFd = -1;
+	_faceSockFd = -1;
+	_finished = NO;
+	_attempts = 0;
 	self.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
 
 	CGFloat w = frame.size.width;
@@ -111,21 +165,25 @@ bio_key_window(void)
 	card.clipsToBounds = YES;
 	[self addSubview:card];
 
-	UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"touchid"]];
-	icon.tintColor = [UIColor systemRedColor];
+	BOOL hasFace = (face_apps_enabled() && faced_has_enrolled_face());
+	BOOL hasFP = (bio_apps_enabled() && fpd_has_enrolled_fingers());
+	NSString *glyphName = (hasFace && !hasFP) ? @"faceid" : (hasFace ? @"person.badge.shield.checkmark" : @"touchid");
+
+	UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:glyphName]];
+	icon.tintColor = [UIColor systemBlueColor];
 	icon.contentMode = UIViewContentModeScaleAspectFit;
 	icon.frame = CGRectMake((card.bounds.size.width - 44) / 2.0, 18, 44, 44);
 	[card.contentView addSubview:icon];
 
 	_titleLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 68, card.bounds.size.width - 32, 24)];
-	_titleLabel.text = @"Touch ID (Huella)";
+	_titleLabel.text = (hasFace && !hasFP) ? @"Face ID (Huella)" : (hasFace ? @"Face ID / Touch ID" : @"Touch ID (Huella)");
 	_titleLabel.textColor = [UIColor whiteColor];
 	_titleLabel.font = [UIFont boldSystemFontOfSize:17];
 	_titleLabel.textAlignment = NSTextAlignmentCenter;
 	[card.contentView addSubview:_titleLabel];
 
 	_reasonLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 94, card.bounds.size.width - 32, 38)];
-	_reasonLabel.text = reason.length ? reason : @"Authenticate with your fingerprint";
+	_reasonLabel.text = reason.length ? reason : (hasFace ? @"Look at front camera or use fingerprint" : @"Authenticate with your fingerprint");
 	_reasonLabel.textColor = [[UIColor whiteColor] colorWithAlphaComponent:0.85];
 	_reasonLabel.font = [UIFont systemFontOfSize:13];
 	_reasonLabel.textAlignment = NSTextAlignmentCenter;
@@ -133,7 +191,7 @@ bio_key_window(void)
 	[card.contentView addSubview:_reasonLabel];
 
 	_statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 134, card.bounds.size.width - 32, 20)];
-	_statusLabel.text = @"Place finger on sensor";
+	_statusLabel.text = hasFace ? @"Scanning face / Touch sensor" : @"Place finger on sensor";
 	_statusLabel.textColor = [UIColor systemTealColor];
 	_statusLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
 	_statusLabel.textAlignment = NSTextAlignmentCenter;
@@ -148,20 +206,22 @@ bio_key_window(void)
 	[card.contentView addSubview:cancel];
 
 	/* Optical FOD sensor target ring at exact hardware position */
-	CGFloat sx = w * SENSOR_X;
-	CGFloat sy = h * SENSOR_Y;
-	CGFloat sr = w * SENSOR_R;
-	_sensorSpot = [[UIView alloc] initWithFrame:CGRectMake(sx - sr, sy - sr, sr * 2.0, sr * 2.0)];
-	_sensorSpot.layer.cornerRadius = sr;
-	_sensorSpot.layer.borderWidth = 3.0;
-	_sensorSpot.layer.borderColor = [UIColor systemGreenColor].CGColor;
-	_sensorSpot.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18];
-	UIImageView *fp = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"touchid"]];
-	fp.tintColor = [UIColor whiteColor];
-	fp.contentMode = UIViewContentModeScaleAspectFit;
-	fp.frame = CGRectInset(_sensorSpot.bounds, 14, 14);
-	[_sensorSpot addSubview:fp];
-	[self addSubview:_sensorSpot];
+	if (hasFP) {
+		CGFloat sx = w * SENSOR_X;
+		CGFloat sy = h * SENSOR_Y;
+		CGFloat sr = w * SENSOR_R;
+		_sensorSpot = [[UIView alloc] initWithFrame:CGRectMake(sx - sr, sy - sr, sr * 2.0, sr * 2.0)];
+		_sensorSpot.layer.cornerRadius = sr;
+		_sensorSpot.layer.borderWidth = 3.0;
+		_sensorSpot.layer.borderColor = [UIColor systemGreenColor].CGColor;
+		_sensorSpot.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.18];
+		UIImageView *fp = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:@"touchid"]];
+		fp.tintColor = [UIColor whiteColor];
+		fp.contentMode = UIViewContentModeScaleAspectFit;
+		fp.frame = CGRectInset(_sensorSpot.bounds, 14, 14);
+		[_sensorSpot addSubview:fp];
+		[self addSubview:_sensorSpot];
+	}
 
 	[self startTest];
 	return self;
@@ -176,6 +236,14 @@ bio_key_window(void)
 		}
 		close(_sockFd);
 		_sockFd = -1;
+	}
+	if (_faceSockFd >= 0) {
+		if (sendCancel) {
+			const char *c = "STOP\n";
+			(void)write(_faceSockFd, c, strlen(c));
+		}
+		close(_faceSockFd);
+		_faceSockFd = -1;
 	}
 }
 
@@ -205,10 +273,57 @@ bio_key_window(void)
 	[self finishWithSuccess:NO code:-2]; /* LAErrorUserCancel */
 }
 
+- (void)startFaceScan
+{
+	if (_finished || !face_apps_enabled() || !faced_has_enrolled_face()) return;
+	__weak typeof(self) ws = self;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (fd < 0) return;
+		struct sockaddr_un sa;
+		memset(&sa, 0, sizeof(sa));
+		sa.sun_family = AF_UNIX;
+		strlcpy(sa.sun_path, FACED_SOCK_PATH, sizeof(sa.sun_path));
+		if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
+			close(fd);
+			return;
+		}
+		ws.faceSockFd = fd;
+		const char *cmd = "SCAN_BIO\n";
+		if (write(fd, cmd, strlen(cmd)) != (ssize_t)strlen(cmd)) {
+			close(fd);
+			ws.faceSockFd = -1;
+			return;
+		}
+		char buf[256];
+		ssize_t n = read(fd, buf, sizeof(buf) - 1);
+		if (n > 0) {
+			buf[n] = '\0';
+			if (strstr(buf, "MATCH") != NULL && strstr(buf, "NOMATCH") == NULL) {
+				notify_post("com.sapphire.vib.success");
+				dispatch_async(dispatch_get_main_queue(), ^{
+					ws.statusLabel.text = @"Face Verified";
+					ws.statusLabel.textColor = [UIColor systemGreenColor];
+				});
+				[ws finishWithSuccess:YES code:0];
+			}
+		}
+		if (ws.faceSockFd == fd) {
+			close(fd);
+			ws.faceSockFd = -1;
+		}
+	});
+}
+
 - (void)startTest
 {
 	if (_finished) return;
 	[self closeSock:NO];
+
+	[self startFaceScan];
+
+	if (!bio_apps_enabled() || !fpd_has_enrolled_fingers()) return;
+
 	__weak typeof(self) ws = self;
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
 		int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -246,7 +361,7 @@ bio_key_window(void)
 				if (!line) continue;
 				if ([line isEqualToString:@"PRESS"]) {
 					dispatch_async(dispatch_get_main_queue(), ^{
-						ws.statusLabel.text = @"Verifying…";
+						ws.statusLabel.text = @"Verifying Fingerprint…";
 						ws.sensorSpot.backgroundColor = [UIColor whiteColor];
 					});
 				} else if ([line hasPrefix:@"TEST MATCH"]) {
@@ -286,7 +401,7 @@ static BOOL (*orig_can_eval)(id self, SEL sel, NSInteger policy, NSError **error
 static BOOL
 hook_can_eval(id self, SEL sel, NSInteger policy, NSError **error)
 {
-	if ((policy == 1 || policy == 2) && bio_apps_enabled() && fpd_has_enrolled_fingers()) {
+	if ((policy == 1 || policy == 2) && bio_any_enrolled_and_enabled()) {
 		if (error) *error = nil;
 		return YES;
 	}
@@ -297,7 +412,10 @@ static NSInteger (*orig_bio_type)(id self, SEL sel);
 static NSInteger
 hook_bio_type(id self, SEL sel)
 {
-	if (bio_apps_enabled() && fpd_has_enrolled_fingers()) {
+	if (bio_any_enrolled_and_enabled()) {
+		if (face_apps_enabled() && faced_has_enrolled_face() && (!bio_apps_enabled() || !fpd_has_enrolled_fingers())) {
+			return 2; /* LABiometryTypeFaceID */
+		}
 		return 1; /* LABiometryTypeTouchID */
 	}
 	return orig_bio_type ? orig_bio_type(self, sel) : 0;
@@ -307,9 +425,9 @@ static NSData *(*orig_domain_state)(id self, SEL sel);
 static NSData *
 hook_domain_state(id self, SEL sel)
 {
-	if (bio_apps_enabled() && fpd_has_enrolled_fingers()) {
+	if (bio_any_enrolled_and_enabled()) {
 		static NSData *tok = nil;
-		if (!tok) tok = [@"sapphire-fpd-v2" dataUsingEncoding:NSUTF8StringEncoding];
+		if (!tok) tok = [@"sapphire-bio-v3" dataUsingEncoding:NSUTF8StringEncoding];
 		return tok;
 	}
 	return orig_domain_state ? orig_domain_state(self, sel) : nil;
@@ -319,7 +437,7 @@ static void (*orig_eval_policy)(id self, SEL sel, NSInteger policy, NSString *re
 static void
 hook_eval_policy(id self, SEL sel, NSInteger policy, NSString *reason, void (^reply)(BOOL, NSError *))
 {
-	if ((policy == 1 || policy == 2) && bio_apps_enabled() && fpd_has_enrolled_fingers()) {
+	if ((policy == 1 || policy == 2) && bio_any_enrolled_and_enabled()) {
 		dispatch_async(dispatch_get_main_queue(), ^{
 			UIWindow *w = bio_key_window();
 			if (!w) {
