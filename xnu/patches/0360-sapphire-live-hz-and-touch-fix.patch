@@ -76,7 +76,7 @@ index 6ab129c..9c8d7e6 100644
  void
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
-@@ -2402,9 +2415,22 @@ sweet_fb_ids_sysctl SYSCTL_HANDLER_ARGS
+@@ -2402,8 +2415,22 @@ sweet_fb_ids_sysctl SYSCTL_HANDLER_ARGS
  }
  SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
      NULL, 0, sweet_fb_ids_sysctl, "S", "0321: the IOSurface ids swapped onto the panel lately");
