@@ -1,0 +1,46 @@
+From: Sapphire Port <sapphire@xiaomi>
+Subject: [PATCH] sapphire-0361: allow DCS 0x51 brightness in setPanelLevel while keeping setPanelOn quiet (kern.sweet_bl_dcs)
+
+Patch 0330 skipped both setPanelOn (0x28/0x29) and setPanelLevel (0x51) when
+sweetbl=0, breaking the Settings & Control Center brightness sliders even
+though eagl.c's BrightnessSystem bridge already updates IOMFBBrightnessLevel
+with CoreBrightness digital dimming disabled.
+
+Split setPanelLevel() onto its own toggle kern.sweet_bl_dcs (default 1),
+never sending DCS 0x51 0 when sweetbl=0 (vsyncFired blanks RAM on display off),
+while keeping setPanelOn() (0x28/0x29) skipped when sweetbl=0.
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 9c8d7e6..a1b2c3d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -77,6 +77,7 @@ static AppleCLCD *sweet_cons_fb;
+ static AppleCLCD *sweet_dsi_fb;                 /* 0260: sweet_fb_dsi_seq() */
+ static AppleCLCD *sweet_frame_fb;               /* 0286: kern.sweet_fb_frame_await/_sent */
+ static uint32_t sweet_bl_on;                    /* 0330: sweetbl=0 keeps DSI panel on/level quiet */
++static uint32_t sweet_bl_dcs = 1;               /* 0361: allow DCS 0x51 brightness while keeping 0x28/0x29 off */
+ /* 0324: the panel's state for tap to wake (bsd/dev/sweet_touch.c): 1 after RequestPowerChange(0), and since when */
+ extern "C" volatile int sweet_fb_panel_off;
+ extern "C" volatile uint64_t sweet_fb_panel_off_abs;
+@@ -1183,8 +1184,11 @@ AppleCLCD::setPanelOn(bool on)
+ void
+ AppleCLCD::setPanelLevel(uint32_t level)
+ {
+-	if (!sweet_bl_on) {
++	if (!sweet_bl_on && !sweet_bl_dcs) {
++		return;
++	}
++	if (!sweet_bl_on && level == 0) {
+ 		return;
+ 	}
+ 	uint8_t cmd[3] = { 0x51, (uint8_t)(level >> 8), (uint8_t)level };   /* MSB first */
+ 	IOLockLock(fBlLock);
+@@ -2428,6 +2432,8 @@ sweet_fb_hz_sysctl SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_hz, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     NULL, 0, sweet_fb_hz_sysctl, "I", "0360: live display vsync/CoreAnimation rate (60, 90, 120, 180, 240 Hz)");
++SYSCTL_UINT(_kern, OID_AUTO, sweet_bl_dcs, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_bl_dcs, 0,
++    "0361: 1 = send DCS 0x51 brightness in setPanelLevel even when sweetbl=0");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_flipflush, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_flipflush, 0,
+     "sapphire 0304: 1 = flush the whole flip buffer after each 2x GPU copy (as before)");
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_frame_await, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
