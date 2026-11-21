@@ -1,12 +1,14 @@
 From: Sapphire Port <sapphire@xiaomi>
-Subject: [PATCH] sapphire-0360: live kern.sweet_fb_hz sysctl and fix FT5452 keyboard double-taps
+Subject: [PATCH] sapphire-0360: live kern.sweet_fb_hz sysctl and fix FT5452 double-tap/swipe-to-tap
 
 1. Expose kern.sweet_fb_hz (60, 90, 120, 180, 240 Hz) in SweetFramebuffer.cpp
    so SapphireTools can switch between 60 Hz locked (zero 3:2 pulldown judder)
-   and 120 Hz live with a simple backboardd respring instead of reflashing.
-2. Restore IRQ-paced polling on FT5452 in bsd/dev/sweet_touch.c (late_after=12 ms,
-   touch_quiet_ms=45 ms, idle tick divisor 10) to eliminate false mid-frame
-   double-taps while typing on the keyboard.
+   and 120 Hz live with a simple backboardd respring.
+2. Fix FT5452 double-taps and swipe-turning-into-tap in bsd/dev/sweet_touch.c:
+   - Measured on hardware: 14,332 late blind reads vs 5,451 IRQ reads at 76 Hz
+     because late_after=4 ms polled FT5452 mid-frame when IRQ was high.
+   - Raise late_after to 25 ms so active touches are strictly IRQ-paced,
+     disable false quiet-release (touch_quiet_ms = 0), and restore idle poll.
 ---
 diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
 index 8f2840c..b1a2c3d 100644
@@ -17,7 +19,7 @@ index 8f2840c..b1a2c3d 100644
   * without IRQ seen inside an identical run that ended on its own (a held finger: should stay small).
   */
 -static unsigned touch_quiet_ms = 120;     /* 0358: > 58 ms max IRQ gap on FT5452 to prevent false mid-touch releases */
-+static unsigned touch_quiet_ms = 45;      /* 0360: balanced quiet release without holding taps or double-tapping */
++static unsigned touch_quiet_ms = 0;       /* 0360: off (irq_gap_ms > 1000 ms seen on held fingers on FT5452) */
  static int sweet_touch_quiet, sweet_touch_irq_gap_ms;
  static uint64_t touch_irq_last;         /* when the IRQ line was last seen low */
  static uint64_t touch_rate_down_abs;
@@ -30,7 +32,7 @@ index 8f2840c..b1a2c3d 100644
  	uint64_t period_fast, late_after, last_read = 0;
  	nanoseconds_to_absolutetime(500 * NSEC_PER_USEC, &period_fast);
 -	nanoseconds_to_absolutetime(4 * NSEC_PER_MSEC, &late_after);
-+	nanoseconds_to_absolutetime(12 * NSEC_PER_MSEC, &late_after);
++	nanoseconds_to_absolutetime(25 * NSEC_PER_MSEC, &late_after);
  	while (!st.dead) {
  		if (st.diag == 2 && ++polls == 3000) {  /* ~30 s at 10 ms */
  			panic("SWEET TOUCH stats: frames=%u errs=%u lasterr=%d maxn=%u hid down=%u up=%u last=%d,%d | "
@@ -74,7 +76,9 @@ index 6ab129c..9c8d7e6 100644
  void
  AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  {
-@@ -2404,6 +2417,19 @@ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG
+@@ -2402,9 +2415,22 @@ sweet_fb_ids_sysctl SYSCTL_HANDLER_ARGS
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_ids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
      NULL, 0, sweet_fb_ids_sysctl, "S", "0321: the IOSurface ids swapped onto the panel lately");
  SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_surface, CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
      &sweet_fb_surface_id, 0, "0356: the IOSurface id last presented on layer 0");
